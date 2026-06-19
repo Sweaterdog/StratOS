@@ -1,0 +1,311 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Memory Manager — Physical and virtual memory management
+// kernel/memory/manager.lx
+//
+// Implements:
+//   - Physical frame allocator (bitmap-based)
+//   - Virtual memory mapping (page table management)
+//   - Kernel heap allocator (simple free-list)
+// ============================================================================
+
+import "kernel/core/bootinfo.lx";
+
+int PAGE_SIZE = 4096;            # 4KB pages
+int FRAME_BITMAP_SIZE = 32768;   # Tracks up to 1GB of physical memory (32768 * 32 * 4096)
+
+# Physical memory state
+long totalPhysicalMemory = 0;
+long freePhysicalMemory = 0;
+long usedPhysicalMemory = 0;
+
+# Frame bitmap: 1 bit per 4KB frame. 0 = free, 1 = used.
+# Stored in kernel BSS
+list frameBitmap = [];
+int totalFrames = 0;
+
+# Kernel heap
+long heapBase = 0;
+long heapEnd = 0;
+long heapCurrent = 0;
+int KERNEL_HEAP_SIZE = 16777216;  # 16MB initial kernel heap
+
+export class MemoryManager {
+
+    # Initialize from bootloader memory map
+    # Multiboot 1 mmap entries have format:
+    #   uint32_t size       (at offset 0, NOT included in size value)
+    #   uint64_t base_addr  (at offset 4)
+    #   uint64_t length     (at offset 12)
+    #   uint32_t type       (at offset 20)
+    # Total per entry: size + 4 bytes. Usually size=20, so 24 bytes total.
+    public static func init(long memoryMapAddr, int mapSize, int descSize) -> void {
+        unsafe {
+            byte* map = (byte*) memoryMapAddr;
+            int offset = 0;
+
+            while (offset < mapSize) {
+                # Read the entry size field (first 4 bytes)
+                int* sizePtr = (int*)(map + offset);
+                int entrySize = *sizePtr;
+
+                # Read base address (8 bytes at offset + 4)
+                long* basePtr = (long*)(map + offset + 4);
+                long base = *basePtr;
+
+                # Read length (8 bytes at offset + 12)
+                long* lenPtr = (long*)(map + offset + 12);
+                long length = *lenPtr;
+
+                # Read type (4 bytes at offset + 20)
+                int* typePtr = (int*)(map + offset + 20);
+                int type = *typePtr;
+
+                totalPhysicalMemory += length;
+
+                if (type == 1) {
+                    # Usable memory
+                    freePhysicalMemory += length;
+                    markFrameRange(base, length, false);
+                } else {
+                    usedPhysicalMemory += length;
+                    markFrameRange(base, length, true);
+                }
+
+                # Advance to next entry (size + 4 for the size field itself)
+                offset += entrySize + 4;
+            }
+        }
+
+        # Calculate total frames
+        totalFrames = (int)(totalPhysicalMemory / PAGE_SIZE);
+
+        # Initialize kernel heap at a fixed address past the kernel
+        heapBase = 0x400000;      # 4MB mark
+        heapEnd = heapBase + KERNEL_HEAP_SIZE;
+        heapCurrent = heapBase;
+
+        # Mark kernel heap region as used
+        markFrameRange(heapBase, KERNEL_HEAP_SIZE, true);
+    }
+
+    # Mark a range of physical frames as used or free
+    private static func markFrameRange(long base, long length, bool used) -> void {
+        long startFrame = base / PAGE_SIZE;
+        long frameCount = length / PAGE_SIZE;
+
+        for (long i = 0; i < frameCount; i++) {
+            long frame = startFrame + i;
+            setBitmapBit(frame, used);
+        }
+    }
+
+    # Set a bit in the frame bitmap
+    private static func setBitmapBit(long frame, bool value) -> void {
+        int index = (int)(frame / 32);
+        int bit = (int)(frame % 32);
+
+        if (index >= FRAME_BITMAP_SIZE) return;
+
+        # Ensure bitmap is large enough
+        while (frameBitmap.length <= index) {
+            frameBitmap.add(0);
+        }
+
+        if (value) {
+            frameBitmap[index] = (int) frameBitmap[index] | (1 << bit);
+        } else {
+            frameBitmap[index] = (int) frameBitmap[index] & ~(1 << bit);
+        }
+    }
+
+    # Check if a frame is used
+    private static func isFrameUsed(long frame) -> bool {
+        int index = (int)(frame / 32);
+        int bit = (int)(frame % 32);
+
+        if (index >= frameBitmap.length) return true;  # Assume used if out of range
+
+        return ((int) frameBitmap[index] & (1 << bit)) != 0;
+    }
+
+    # Allocate a single physical frame (4KB)
+    public static func allocFrame() -> long {
+        for (long i = 0; i < totalFrames; i++) {
+            if (!isFrameUsed(i)) {
+                setBitmapBit(i, true);
+                freePhysicalMemory -= PAGE_SIZE;
+                usedPhysicalMemory += PAGE_SIZE;
+                return i * PAGE_SIZE;
+            }
+        }
+        panic("Out of physical memory — no free frames");
+        return 0;
+    }
+
+    # Free a physical frame
+    public static func freeFrame(long physAddr) -> void {
+        long frame = physAddr / PAGE_SIZE;
+        if (isFrameUsed(frame)) {
+            setBitmapBit(frame, false);
+            freePhysicalMemory += PAGE_SIZE;
+            usedPhysicalMemory -= PAGE_SIZE;
+        }
+    }
+
+    # Allocate contiguous physical frames
+    public static func allocFrames(int count) -> long {
+        int consecutive = 0;
+        long startFrame = 0;
+
+        for (long i = 0; i < totalFrames; i++) {
+            if (!isFrameUsed(i)) {
+                if (consecutive == 0) {
+                    startFrame = i;
+                }
+                consecutive++;
+                if (consecutive >= count) {
+                    # Mark all frames as used
+                    for (int j = 0; j < count; j++) {
+                        setBitmapBit(startFrame + j, true);
+                    }
+                    freePhysicalMemory -= count * PAGE_SIZE;
+                    usedPhysicalMemory += count * PAGE_SIZE;
+                    return startFrame * PAGE_SIZE;
+                }
+            } else {
+                consecutive = 0;
+            }
+        }
+        panic("Out of physical memory — cannot allocate $count contiguous frames");
+        return 0;
+    }
+
+    # ========================================================================
+    # Kernel Heap Allocator (bump allocator with alignment)
+    # ========================================================================
+
+    # Allocate memory from kernel heap
+    public static func kmalloc(int size) -> long {
+        # Align to 8 bytes
+        int alignedSize = (size + 7) & ~7;
+
+        if (heapCurrent + alignedSize > heapEnd) {
+            # Expand heap by allocating more frames
+            int framesNeeded = (alignedSize / PAGE_SIZE) + 1;
+            long newFrames = allocFrames(framesNeeded);
+            heapEnd += framesNeeded * PAGE_SIZE;
+        }
+
+        long addr = heapCurrent;
+        heapCurrent += alignedSize;
+        return addr;
+    }
+
+    # Free kernel heap memory (no-op for bump allocator)
+    # A proper implementation would use a free-list
+    public static func kfree(long addr) -> void {
+        # TODO: Implement free-list allocator
+    }
+
+    # ========================================================================
+    # Virtual Memory (Page Table Management)
+    # ========================================================================
+
+    # Map a virtual address to a physical address
+    public static func mapPage(long virtualAddr, long physicalAddr, int flags) -> void {
+        unsafe {
+            # Extract page table indices
+            int pml4Index = (int)((virtualAddr >> 39) & 0x1FF);
+            int pdptIndex = (int)((virtualAddr >> 30) & 0x1FF);
+            int pdIndex   = (int)((virtualAddr >> 21) & 0x1FF);
+            int ptIndex   = (int)((virtualAddr >> 12) & 0x1FF);
+
+            # Intermediate table flags: Present + Writable + User (if user page)
+            # The USER bit must be set at EVERY level for user-mode access
+            int tableFlags = 0x03;  # Present + Writable
+            if (flags & 0x04) {
+                tableFlags = tableFlags | 0x04;  # Add USER bit
+            }
+
+            # Get current PML4
+            long* pml4 = (long*) getCR3();
+
+            # Walk/create page table hierarchy (propagate user bit)
+            long* pdpt = getOrCreateTable(pml4, pml4Index, tableFlags);
+            long* pd   = getOrCreateTable(pdpt, pdptIndex, tableFlags);
+            long* pt   = getOrCreateTable(pd, pdIndex, tableFlags);
+
+            # Set the page table entry
+            pt[ptIndex] = physicalAddr | flags;
+
+            # Invalidate TLB for this address
+            invlpg(virtualAddr);
+        }
+    }
+
+    # Get or create next-level page table
+    # If the entry exists but has fewer permissions, upgrade it
+    private static func getOrCreateTable(long* table, int index, int flags) -> long* {
+        unsafe {
+            if (table[index] & 1) {   # Present bit
+                # If we need USER access but the existing entry doesn't have it, add it
+                if ((flags & 0x04) && !(table[index] & 0x04)) {
+                    table[index] = table[index] | 0x04;
+                }
+                return (long*)(table[index] & 0xFFFFFFFFF000);
+            }
+
+            # Allocate new table
+            long newTable = allocFrame();
+            # Zero it out
+            byte* p = (byte*) newTable;
+            for (int i = 0; i < PAGE_SIZE; i++) {
+                p[i] = 0;
+            }
+
+            table[index] = newTable | flags;
+            return (long*) newTable;
+        }
+    }
+
+    # Get CR3 (current page table base)
+    private static func getCR3() -> long {
+        unsafe {
+            long cr3;
+            asm("mov %%cr3, %0" : "=r"(cr3));
+            return cr3;
+        }
+    }
+
+    # Invalidate TLB entry
+    private static func invlpg(long addr) -> void {
+        unsafe {
+            asm("invlpg (%0)" : : "r"(addr));
+        }
+    }
+
+    # ========================================================================
+    # Memory Statistics
+    # ========================================================================
+
+    public static func getTotalMemory() -> long {
+        return totalPhysicalMemory;
+    }
+
+    public static func getFreeMemory() -> long {
+        return freePhysicalMemory;
+    }
+
+    public static func getUsedMemory() -> long {
+        return usedPhysicalMemory;
+    }
+
+    public static func getHeapUsed() -> long {
+        return heapCurrent - heapBase;
+    }
+
+    public static func getHeapFree() -> long {
+        return heapEnd - heapCurrent;
+    }
+}

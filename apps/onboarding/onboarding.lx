@@ -1,0 +1,301 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Onboarding Wizard — First-run setup wizard for StratOS
+// apps/onboarding/onboarding.lx
+//
+// Features:
+//   - Multi-step welcome flow
+//   - Wallpaper selection
+//   - App overview tour
+//   - Keyboard shortcuts reference
+//   - Click-through navigation
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/windowing/desktop.lx";
+
+# Wizard state
+int obStep = 0;
+int OB_TOTAL_STEPS = 5;
+bool obCompleted = false;
+int obWallpaperChoice = 0;
+
+export class OnboardingApp {
+    public static func init() -> void {
+        obStep = 0;
+        obCompleted = false;
+        obWallpaperChoice = 0;
+    }
+
+    public static func isCompleted() -> bool {
+        return obCompleted;
+    }
+
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Enter or Right arrow — next step
+        if (event.scancode == 28 || event.scancode == KEY_RIGHT) {
+            obStep = obStep + 1;
+            if (obStep >= OB_TOTAL_STEPS) {
+                obCompleted = true;
+                Desktop.setWallpaper(obWallpaperChoice);
+            }
+            return;
+        }
+
+        # Left arrow or Backspace — previous step
+        if (event.scancode == KEY_LEFT || event.scancode == 14) {
+            if (obStep > 0) obStep = obStep - 1;
+            return;
+        }
+
+        # Escape — skip wizard
+        if (event.scancode == 1) {
+            obCompleted = true;
+            return;
+        }
+
+        # On wallpaper step, Up/Down to select
+        if (obStep == 2) {
+            if (event.scancode == KEY_UP && obWallpaperChoice > 0) {
+                obWallpaperChoice = obWallpaperChoice - 1;
+                Desktop.setWallpaper(obWallpaperChoice);
+            } elif (event.scancode == KEY_DOWN && obWallpaperChoice < 3) {
+                obWallpaperChoice = obWallpaperChoice + 1;
+                Desktop.setWallpaper(obWallpaperChoice);
+            }
+        }
+    }
+
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int btnW = 100;
+        int btnH = 32;
+        int btnY = contentH - 60;
+
+        # Next button (right side)
+        int nextX = contentW - btnW - 30;
+        if (relX >= nextX && relX < nextX + btnW && relY >= btnY && relY < btnY + btnH) {
+            obStep = obStep + 1;
+            if (obStep >= OB_TOTAL_STEPS) {
+                obCompleted = true;
+                Desktop.setWallpaper(obWallpaperChoice);
+            }
+            return;
+        }
+
+        # Back button (left side, not on first step)
+        if (obStep > 0) {
+            int backX = 30;
+            if (relX >= backX && relX < backX + btnW && relY >= btnY && relY < btnY + btnH) {
+                obStep = obStep - 1;
+                return;
+            }
+        }
+
+        # Skip button (top right)
+        int skipX = contentW - 60;
+        if (relX >= skipX && relX < skipX + 50 && relY >= 8 && relY < 28) {
+            obCompleted = true;
+            return;
+        }
+
+        # Wallpaper selection clicks (step 2)
+        if (obStep == 2) {
+            int centerX = contentW / 2;
+            int startY = 100;
+            int itemH = 48;
+            for (int i = 0; i < 4; i++) {
+                int itemY = startY + i * (itemH + 8);
+                if (relX >= centerX - 140 && relX < centerX + 140 &&
+                    relY >= itemY && relY < itemY + itemH) {
+                    obWallpaperChoice = i;
+                    Desktop.setWallpaper(obWallpaperChoice);
+                    return;
+                }
+            }
+        }
+    }
+
+    public static func draw(int x, int y, int w, int h) -> void {
+        # Background with gradient overlay
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        # Step indicator dots at top
+        int dotsX = x + w / 2 - (OB_TOTAL_STEPS * 16) / 2;
+        int dotsY = y + h - 30;
+        for (int i = 0; i < OB_TOTAL_STEPS; i++) {
+            color32 dotColor = (i == obStep) ? Theme.textAccent : 0x30363DFF;
+            int dotR = (i == obStep) ? 5 : 3;
+            Framebuffer.fillCircle(dotsX + i * 16 + 8, dotsY, dotR, dotColor);
+        }
+
+        # Skip button
+        TextRender.drawText("Skip", x + w - 52, y + 12, 0x6B7280FF);
+
+        # Next/Back buttons
+        int btnW = 100;
+        int btnH = 32;
+        int btnY = y + h - 60;
+
+        # Next button
+        int nextX = x + w - btnW - 30;
+        string nextLabel = (obStep == OB_TOTAL_STEPS - 1) ? "Finish" : "Next >";
+        Framebuffer.fillRoundedRect(nextX, btnY, btnW, btnH, 6, Theme.textAccent);
+        int labelW = nextLabel.length * 8;
+        TextRender.drawText(nextLabel, nextX + (btnW - labelW) / 2, btnY + 8, 0x0D1117FF);
+
+        # Back button
+        if (obStep > 0) {
+            int backX = x + 30;
+            Framebuffer.fillRoundedRect(backX, btnY, btnW, btnH, 6, 0x21262DFF);
+            Framebuffer.drawRoundedRect(backX, btnY, btnW, btnH, 6, 0x30363DFF);
+            TextRender.drawText("< Back", backX + 24, btnY + 8, 0xC9D1D9FF);
+        }
+
+        # Content for current step
+        switch (obStep) {
+            case 0: drawWelcome(x, y, w, h);      break;
+            case 1: drawAppTour(x, y, w, h);       break;
+            case 2: drawWallpaperPick(x, y, w, h);  break;
+            case 3: drawShortcuts(x, y, w, h);      break;
+            case 4: drawReady(x, y, w, h);           break;
+        }
+    }
+
+    # ========================================================================
+    # Step content
+    # ========================================================================
+
+    private static func drawWelcome(int x, int y, int w, int h) -> void {
+        int cx = x + w / 2;
+        int cy = y + 60;
+
+        # Large StratOS logo (circle + text)
+        Framebuffer.fillCircle(cx, cy + 30, 40, Theme.textAccent);
+        Framebuffer.fillCircle(cx, cy + 30, 34, 0x0D1117FF);
+        Framebuffer.fillCircle(cx, cy + 30, 28, 0x1F6FEBFF);
+        TextRender.drawText("S", cx - 4, cy + 24, 0xFFFFFFFF);
+
+        int textY = cy + 85;
+        string title = "Welcome to StratOS";
+        int titleW = title.length * 8;
+        TextRender.drawText(title, cx - titleW / 2, textY, 0xE6EDF3FF);
+
+        textY = textY + 30;
+        string sub = "A cosmic desktop experience";
+        int subW = sub.length * 8;
+        TextRender.drawText(sub, cx - subW / 2, textY, 0x8B949EFF);
+
+        textY = textY + 40;
+        string info = "Let's set up your desktop in a few quick steps.";
+        int infoW = info.length * 8;
+        TextRender.drawText(info, cx - infoW / 2, textY, 0x6B7280FF);
+    }
+
+    private static func drawAppTour(int x, int y, int w, int h) -> void {
+        int cx = x + w / 2;
+        TextRender.drawText("Your Apps", cx - 36, y + 30, 0xE6EDF3FF);
+        TextRender.drawText("StratOS comes with these built-in apps:", cx - 156, y + 55, 0x8B949EFF);
+
+        int startY = y + 85;
+        int lineH = 28;
+        drawAppEntry(x + 40, startY,              w - 80, "Terminal",   "Command line shell",       0x58A6FFFF);
+        drawAppEntry(x + 40, startY + lineH,       w - 80, "Calculator", "Basic arithmetic",         0xFF9F0AFF);
+        drawAppEntry(x + 40, startY + lineH * 2,   w - 80, "Files",      "Browse your file system",  0x7EE787FF);
+        drawAppEntry(x + 40, startY + lineH * 3,   w - 80, "Editor",     "Text editing with VFS",    0xD2A8FFFF);
+        drawAppEntry(x + 40, startY + lineH * 4,   w - 80, "Browser",    "Internal stratos:// pages",0x79C0FFFF);
+        drawAppEntry(x + 40, startY + lineH * 5,   w - 80, "Music",      "Demo music player",        0xFF7B72FF);
+        drawAppEntry(x + 40, startY + lineH * 6,   w - 80, "Notes",      "Quick notepad",            0xFFA657FF);
+        drawAppEntry(x + 40, startY + lineH * 7,   w - 80, "Settings",   "Customize your desktop",   0x56D364FF);
+    }
+
+    private static func drawAppEntry(int x, int y, int w, string name, string desc, color32 accentColor) -> void {
+        Framebuffer.fillCircle(x + 8, y + 8, 6, accentColor);
+        TextRender.drawText(name, x + 24, y + 1, 0xE6EDF3FF);
+        int nameW = name.length * 8;
+        TextRender.drawText(desc, x + 24 + nameW + 16, y + 1, 0x6B7280FF);
+    }
+
+    private static func drawWallpaperPick(int x, int y, int w, int h) -> void {
+        int cx = x + w / 2;
+        TextRender.drawText("Choose Your Wallpaper", cx - 84, y + 30, 0xE6EDF3FF);
+
+        int startY = y + 100;
+        int itemH = 48;
+        int itemW = 280;
+        int itemX = cx - itemW / 2;
+
+        for (int i = 0; i < 4; i++) {
+            int iy = startY + i * (itemH + 8);
+            bool selected = (i == obWallpaperChoice);
+
+            color32 bg = selected ? 0x1F6FEBFF : 0x161B22FF;
+            Framebuffer.fillRoundedRect(itemX, iy, itemW, itemH, 6, bg);
+
+            # Swatch color
+            color32 swatch = 0x0A0E1AFF;
+            string name = "Void";
+            if (i == 1) { swatch = 0x2D1B4EFF; name = "Nebula"; }
+            elif (i == 2) { swatch = 0x0A2A1BFF; name = "Aurora"; }
+            elif (i == 3) { swatch = 0x1A2030FF; name = "Mountain"; }
+            Framebuffer.fillRoundedRect(itemX + 8, iy + 8, 60, itemH - 16, 4, swatch);
+
+            color32 textColor = selected ? 0xFFFFFFFF : 0xC9D1D9FF;
+            TextRender.drawText(name, itemX + 80, iy + 16, textColor);
+
+            if (selected) {
+                Framebuffer.fillCircle(itemX + itemW - 20, iy + itemH / 2, 5, 0xFFFFFFFF);
+            }
+        }
+    }
+
+    private static func drawShortcuts(int x, int y, int w, int h) -> void {
+        int cx = x + w / 2;
+        TextRender.drawText("Keyboard Shortcuts", cx - 76, y + 30, 0xE6EDF3FF);
+
+        int col1 = x + 40;
+        int col2 = x + 200;
+        int startY = y + 70;
+        int lineH = 24;
+
+        drawShortcutRow(col1, col2, startY,              "Alt+F4",       "Close window");
+        drawShortcutRow(col1, col2, startY + lineH,       "Alt+Tab",      "Cycle windows");
+        drawShortcutRow(col1, col2, startY + lineH * 2,   "Alt+Left",     "Snap left");
+        drawShortcutRow(col1, col2, startY + lineH * 3,   "Alt+Right",    "Snap right");
+        drawShortcutRow(col1, col2, startY + lineH * 4,   "Alt+Up",       "Maximize");
+        drawShortcutRow(col1, col2, startY + lineH * 5,   "Ctrl+T",       "New terminal");
+        drawShortcutRow(col1, col2, startY + lineH * 6,   "Super",        "App launcher");
+        drawShortcutRow(col1, col2, startY + lineH * 7,   "Right-click",  "Context menu");
+        drawShortcutRow(col1, col2, startY + lineH * 8,   "Dbl-click",    "Maximize toggle");
+        drawShortcutRow(col1, col2, startY + lineH * 9,   "Edge drag",    "Resize window");
+    }
+
+    private static func drawShortcutRow(int keyX, int descX, int y, string key, string desc) -> void {
+        Framebuffer.fillRoundedRect(keyX, y, 120, 20, 3, 0x21262DFF);
+        int keyW = key.length * 8;
+        TextRender.drawText(key, keyX + (120 - keyW) / 2, y + 2, Theme.textAccent);
+        TextRender.drawText(desc, descX, y + 2, 0xC9D1D9FF);
+    }
+
+    private static func drawReady(int x, int y, int w, int h) -> void {
+        int cx = x + w / 2;
+
+        # Checkmark circle
+        Framebuffer.fillCircle(cx, y + 100, 35, 0x56D364FF);
+        TextRender.drawText("OK", cx - 8, y + 93, 0x0D1117FF);
+
+        TextRender.drawText("You're all set!", cx - 60, y + 155, 0xE6EDF3FF);
+
+        string sub = "Click Finish to start using StratOS.";
+        int subW = sub.length * 8;
+        TextRender.drawText(sub, cx - subW / 2, y + 185, 0x8B949EFF);
+
+        string hint = "Tip: Click desktop icons or use the app launcher (Super key)";
+        int hintW = hint.length * 8;
+        TextRender.drawText(hint, cx - hintW / 2, y + 225, 0x6B7280FF);
+    }
+}

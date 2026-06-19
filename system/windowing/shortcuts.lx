@@ -1,0 +1,211 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Keyboard Shortcuts Overlay — Full-screen help showing all keybindings
+// system/windowing/shortcuts.lx
+//
+// Features:
+//   - Full-screen semi-transparent overlay
+//   - Organized by category (Desktop, Windows, Apps, System)
+//   - Toggle with Ctrl+/ or F1
+//   - Dismiss with Escape or any key
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Overlay state
+bool shortcutsVisible = false;
+
+export class ShortcutsOverlay {
+
+    # Toggle the shortcuts overlay
+    public static func toggle() -> void {
+        shortcutsVisible = !shortcutsVisible;
+    }
+
+    # Check if overlay is currently showing
+    public static func isVisible() -> bool {
+        return shortcutsVisible;
+    }
+
+    # Close the overlay
+    public static func close() -> void {
+        shortcutsVisible = false;
+    }
+
+    # Process key input — any key closes the overlay
+    public static func processKey(KeyEvent event) -> void {
+        if (!shortcutsVisible) return;
+        if (!event.pressed) return;
+        # Any keypress closes the overlay
+        shortcutsVisible = false;
+    }
+
+    # Draw the full-screen shortcuts overlay
+    public static func draw(int screenW, int screenH) -> void {
+        if (!shortcutsVisible) return;
+
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+
+        # Semi-transparent dark backdrop
+        for (int row = 0; row < screenH; row++) {
+            for (int col = 0; col < screenW; col++) {
+                Framebuffer.blendPixel(col, row, 0x0D1117D8);
+            }
+        }
+
+        # Panel dimensions
+        int panelW = 720;
+        int panelH = 560;
+        int px = (screenW - panelW) / 2;
+        int py = (screenH - panelH) / 2;
+
+        # Panel background
+        Framebuffer.fillRoundedRect(px, py, panelW, panelH, 12, 0x161B22FF);
+        Framebuffer.drawRoundedRect(px, py, panelW, panelH, 12, 0x30363DFF);
+
+        # Title
+        string title = "Keyboard Shortcuts";
+        int titleW = title.length * charW;
+        TextRender.drawText(title, px + (panelW - titleW) / 2, py + 16, 0xE6EDF3FF);
+
+        # Dismiss hint
+        string hint = "Press any key to close";
+        int hintW = hint.length * charW;
+        TextRender.drawText(hint, px + (panelW - hintW) / 2, py + panelH - 24, 0x484F58FF);
+
+        # Separator under title
+        Framebuffer.drawHLine(px + 20, py + 38, panelW - 40, 0x30363DFF);
+
+        # Two-column layout
+        int col1X = px + 30;
+        int col2X = px + panelW / 2 + 10;
+        int lineH = 22;
+
+        # ====== Column 1: Desktop & Windows ======
+        int cy = py + 52;
+
+        # Desktop section
+        TextRender.drawText("Desktop", col1X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Super", "Open Launcher");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+B", "Cycle Theme");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+N", "Notification Panel");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+F1", "Lock Screen");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+F3", "Drop to TTY Shell");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+/", "This Help Overlay");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+D", "Show Desktop");
+        cy = cy + lineH + 8;
+
+        # Window Management section
+        TextRender.drawText("Window Management", col1X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Alt+Left", "Snap Window Left");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Alt+Right", "Snap Window Right");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Alt+Up", "Maximize Window");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Alt+Down", "Restore Window");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Alt+F4", "Close Window");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Alt+Tab", "Cycle Focus");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+P", "Screenshot");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Ctrl+F4", "Toggle Taskbar Pos");
+        cy = cy + lineH + 8;
+
+        # System Tray section
+        TextRender.drawText("System Tray", col1X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Click Bell", "Toggle Notifications");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Click Lock", "Lock Screen");
+        cy = cy + lineH;
+        drawShortcutRow(col1X, cy, "Click Clock", "Clock Popup");
+
+        # ====== Column 2: Apps ======
+        cy = py + 52;
+
+        # Editor section
+        TextRender.drawText("Text Editor", col2X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+S", "Save File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+O", "Open File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+F", "Find Text");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+G", "Go to Line");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+Z", "Undo");
+        cy = cy + lineH + 8;
+
+        # File Explorer section
+        TextRender.drawText("File Explorer", col2X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "F2", "Rename File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+C", "Copy File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+X", "Cut File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+V", "Paste File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+H", "Toggle Hidden Files");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Delete", "Delete File");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Right-click", "Context Menu");
+        cy = cy + lineH + 8;
+
+        # Browser section
+        TextRender.drawText("Browser", col2X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+L", "Focus URL Bar");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Alt+Left", "Navigate Back");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Alt+Right", "Navigate Forward");
+        cy = cy + lineH + 8;
+
+        # Calculator section
+        TextRender.drawText("Calculator", col2X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "H", "Toggle History");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "C / Esc", "Clear");
+        cy = cy + lineH + 8;
+
+        # Notes section
+        TextRender.drawText("Notes", col2X, cy, 0x58A6FFFF);
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "F2", "Rename Note");
+        cy = cy + lineH;
+        drawShortcutRow(col2X, cy, "Ctrl+N", "New Note");
+    }
+
+    # Draw a single shortcut row: [key] description
+    private static func drawShortcutRow(int x, int y, string key, string desc) -> void {
+        int charW = TextRender.getCharWidth();
+        # Draw key in accent color with box
+        int keyW = key.length * charW + 8;
+        Framebuffer.fillRoundedRect(x, y - 2, keyW, 18, 4, 0x21262DFF);
+        Framebuffer.drawRoundedRect(x, y - 2, keyW, 18, 4, 0x30363DFF);
+        TextRender.drawText(key, x + 4, y, 0xF0883EFF);
+
+        # Draw description
+        TextRender.drawText(desc, x + keyW + 10, y, 0xC9D1D9FF);
+    }
+}

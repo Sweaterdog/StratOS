@@ -1,0 +1,241 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Keyboard Driver — PS/2 keyboard input handler
+// kernel/drivers/keyboard.lx
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+
+int KEYBOARD_DATA_PORT = 0x60;
+int KEYBOARD_STATUS_PORT = 0x64;
+int KEYBOARD_IRQ = 1;
+
+# Key state tracking
+bool keyStates[256];       # True if key is currently pressed
+list<KeyEvent> keyBuffer = [];       # Ring buffer of recent key events
+int BUFFER_SIZE = 256;
+
+# Modifier state
+bool shiftPressed = false;
+bool ctrlPressed = false;
+bool altPressed = false;
+bool capsLockOn = false;
+
+# Key event callback
+func keyCallback = null;
+
+# Scancode → ASCII lookup tables (US QWERTY layout)
+list<int> scancodeToAscii = [
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
+    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
+    '*', 0, ' '
+];
+
+list<int> scancodeToAsciiShift = [
+    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
+    '*', 0, ' '
+];
+
+# Named key constants
+int KEY_ESCAPE = 1;
+int KEY_BACKSPACE = 14;
+int KEY_TAB = 15;
+int KEY_ENTER = 28;
+int KEY_LCTRL = 29;
+int KEY_LSHIFT = 42;
+int KEY_RSHIFT = 54;
+int KEY_LALT = 56;
+int KEY_CAPSLOCK = 58;
+int KEY_F1 = 59;
+int KEY_F2 = 60;
+int KEY_F3 = 61;
+int KEY_F4 = 62;
+int KEY_F5 = 63;
+int KEY_F6 = 64;
+int KEY_F7 = 65;
+int KEY_F8 = 66;
+int KEY_F9 = 67;
+int KEY_F10 = 68;
+int KEY_F11 = 87;
+int KEY_F12 = 88;
+int KEY_UP = 72;
+int KEY_DOWN = 80;
+int KEY_LEFT = 75;
+int KEY_RIGHT = 77;
+int KEY_HOME = 71;
+int KEY_END = 79;
+int KEY_PAGEUP = 73;
+int KEY_PAGEDOWN = 81;
+int KEY_DELETE = 83;
+
+# Extended keys (E0 prefixed — mapped to 128 + scan code)
+int KEY_SUPER_L = 219;    # Left Super/Windows key (E0 + 0x5B)
+int KEY_SUPER_R = 220;    # Right Super/Windows key (E0 + 0x5C)
+
+# E0 prefix tracking for extended scancodes
+bool e0Prefix = false;
+
+# Key event structure
+export struct KeyEvent {
+    int scancode;
+    char ascii;
+    bool pressed;           # true = pressed, false = released
+    bool shift;
+    bool ctrl;
+    bool alt;
+}
+
+export class Keyboard {
+    # Initialize the keyboard driver
+    public static func init() -> void {
+        # Register IRQ1 handler (vector 33 after PIC remap)
+        IDT.registerHandler(33, keyboardInterruptHandler);
+
+        # Clear key states
+        for (int i = 0; i < 256; i++) {
+            keyStates[i] = false;
+        }
+
+        # Enable keyboard IRQ
+        unsafe {
+            byte mask = inb(PIC1_DATA);
+            mask = mask & ~(1 << KEYBOARD_IRQ);  # Clear bit 1
+            outb(PIC1_DATA, mask);
+        }
+    }
+
+    # Register a callback for key events
+    public static func onKeyEvent(func callback) -> void {
+        keyCallback = callback;
+    }
+
+    # Check if a specific key is currently pressed
+    public static func isKeyDown(int scancode) -> bool {
+        if (scancode < 0 || scancode >= 256) return false;
+        return keyStates[scancode];
+    }
+
+    # Get next key event from buffer (non-blocking)
+    # Disables interrupts briefly to prevent ISR from modifying buffer concurrently
+    public static func pollKey() -> KeyEvent {
+        unsafe { asm("cli"); }
+        if (keyBuffer.length == 0) {
+            unsafe { asm("sti"); }
+            return { scancode: 0, ascii: 0, pressed: false, shift: false, ctrl: false, alt: false };
+        }
+
+        KeyEvent event = keyBuffer[0];
+        keyBuffer.removeAt(0);
+        unsafe { asm("sti"); }
+        return event;
+    }
+
+    # Check if any key events are pending
+    # Memory barrier prevents the compiler from caching keyBuffer.length
+    # across iterations of a busy loop (ISR modifies it asynchronously)
+    public static func hasKey() -> bool {
+        asm("" ::: "memory");
+        return keyBuffer.length > 0;
+    }
+
+    # Read a full line of input (blocking)
+    public static func readLine() -> string {
+        string line = "";
+        while (true) {
+            if (!hasKey()) continue;
+
+            KeyEvent event = pollKey();
+            if (!event.pressed) continue;
+
+            if (event.scancode == KEY_ENTER) {
+                return line;
+            } elif (event.scancode == KEY_BACKSPACE) {
+                if (line.length > 0) {
+                    line = line.substring(0, line.length - 1);
+                }
+            } elif (event.ascii != 0 && event.ascii >= 32) {
+                line += (string) event.ascii;
+            }
+        }
+    }
+
+    # Get modifier state
+    public static func isShiftDown() -> bool { return shiftPressed; }
+    public static func isCtrlDown() -> bool { return ctrlPressed; }
+    public static func isAltDown() -> bool { return altPressed; }
+}
+
+# ============================================================================
+# Keyboard Interrupt Handler (IRQ1 → Vector 33)
+# ============================================================================
+func keyboardInterruptHandler(int vector, long errorCode) -> void {
+    # Read scancode from keyboard data port
+    byte scancode = inb(KEYBOARD_DATA_PORT);
+
+    # Handle E0 prefix for extended keys (Super, right Ctrl/Alt, etc.)
+    if (scancode == 0xE0) {
+        e0Prefix = true;
+        return;
+    }
+
+    bool released = (scancode & 0x80) != 0;
+    int key = scancode & 0x7F;
+
+    # If this is an extended key, offset into the 128+ range
+    if (e0Prefix) {
+        key = key + 128;
+        e0Prefix = false;
+    }
+
+    # Update modifier states
+    if (key == KEY_LSHIFT || key == KEY_RSHIFT) {
+        shiftPressed = !released;
+    } elif (key == KEY_LCTRL) {
+        ctrlPressed = !released;
+    } elif (key == KEY_LALT) {
+        altPressed = !released;
+    } elif (key == KEY_CAPSLOCK && !released) {
+        capsLockOn = !capsLockOn;
+    }
+
+    # Update key state
+    keyStates[key] = !released;
+
+    # Convert scancode to ASCII
+    char ascii = 0;
+    if (key < scancodeToAscii.length) {
+        if (shiftPressed || capsLockOn) {
+            ascii = scancodeToAsciiShift[key];
+        } else {
+            ascii = scancodeToAscii[key];
+        }
+    }
+
+    # Create key event
+    KeyEvent event = {
+        scancode: key,
+        ascii: ascii,
+        pressed: !released,
+        shift: shiftPressed,
+        ctrl: ctrlPressed,
+        alt: altPressed
+    };
+
+    # Add to buffer (drop oldest if full)
+    if (keyBuffer.length >= BUFFER_SIZE) {
+        keyBuffer.removeAt(0);
+    }
+    keyBuffer.add(event);
+
+    # Call registered callback
+    if (keyCallback != null) {
+        keyCallback(event);
+    }
+
+    # NOTE: EOI is sent by isr_dispatch — do not send here
+}

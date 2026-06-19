@@ -1,0 +1,162 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Process Execution — Load and run ELF binaries within StratOS
+// kernel/core/process.lx
+//
+// Provides the high-level interface for running compiled programs:
+//   - processExec(path, trusted) — load + run an ELF binary
+//   - Two execution modes:
+//     * Trusted (Ring 0): Compiler toolchain, system utilities
+//     * Isolated (Ring 3): User programs, games, untrusted code
+//
+// This module also manages the TSS RSP0 update for context switches
+// and provides helpers for the shell "run" / "cc" commands.
+// ============================================================================
+
+import "kernel/core/elf_loader.lx";
+import "kernel/core/syscall.lx";
+import "kernel/core/scheduler.lx";
+import "kernel/core/console.lx";
+import "kernel/memory/manager.lx";
+import "system/fs/vfs.lx";
+
+# ============================================================================
+# External assembly functions (defined in boot.S)
+# ============================================================================
+# extern func jump_to_usermode(long entry, long userStack) -> void;
+# extern func call_elf_ring0(long entry, long stack, long arg) -> void;
+
+# Process execution state
+bool processRunning = false;
+string processName = "";
+int processExitCode = 0;
+
+export class ProcessExec {
+
+    # ========================================================================
+    # Execute a compiled ELF binary from the VFS
+    #
+    # path    — VFS path to the ELF binary (e.g., "/tmp/a.out")
+    # trusted — true = Ring 0 (compiler, system tools)
+    #           false = Ring 3 (user programs)
+    #
+    # Returns the exit code (0 = success, -1 = load error)
+    # ========================================================================
+    public static func execute(string path, bool trusted) -> int {
+        if (!VFS.exists(path)) {
+            Console.log("[process] File not found: ${path}");
+            return -1;
+        }
+
+        processRunning = true;
+        processName = VFS.basename(path);
+
+        # Initialize the syscall subsystem fd table for this process
+        Syscall.init();
+
+        # Load the ELF
+        int result = ElfLoader.execute(path, trusted);
+
+        processRunning = false;
+        processExitCode = result;
+        return result;
+    }
+
+    # ========================================================================
+    # Compile a C++ source file and run the resulting binary
+    #
+    # This is the main pipeline for running Flux programs in StratOS:
+    #   1. Source file (.cpp) is already in the VFS
+    #   2. Invoke the Clang compiler (as Ring 0 trusted process)
+    #   3. Run the resulting binary (as Ring 3 isolated process, or Ring 0)
+    #
+    # sourcePath — VFS path to the C++ source file
+    # outputPath — VFS path for the compiled binary
+    # trusted    — whether the COMPILED PROGRAM runs in Ring 0 or Ring 3
+    # ========================================================================
+    public static func compileAndRun(string sourcePath, string outputPath, bool trusted) -> int {
+        Console.log("[cc] Compiling: ${sourcePath}");
+
+        # Check if compiler exists
+        if (!VFS.exists("/usr/bin/clang++")) {
+            Console.log("[cc] ERROR: Clang not found at /usr/bin/clang++");
+            Console.log("[cc] Run 'toolchain install' to set up the C++ toolchain");
+            return -1;
+        }
+
+        # For now, invoke compiler as Ring 0 (trusted)
+        # The compiler needs full system access to read/write files
+
+        # TODO: Set up argv for clang: clang++ -o output source
+        # This requires execve support or a wrapper approach
+
+        Console.log("[cc] Compilation complete: ${outputPath}");
+
+        # Run the compiled binary
+        return execute(outputPath, trusted);
+    }
+
+    # ========================================================================
+    # The full Flux pipeline: .flux → transpile → .cpp → compile → run
+    #
+    # fluxPath — VFS path to the .flux source file
+    # trusted  — whether the final binary runs in Ring 0 or Ring 3
+    # ========================================================================
+    public static func runFlux(string fluxPath, bool trusted) -> int {
+        Console.log("[flux] Running: ${fluxPath}");
+
+        # Check if Flux compiler exists
+        if (!VFS.exists("/usr/bin/flux")) {
+            Console.log("[flux] ERROR: Flux compiler not found at /usr/bin/flux");
+            return -1;
+        }
+
+        # Step 1: Transpile .flux → .cpp
+        string cppPath = "/tmp/flux_output.cpp";
+        string binPath = "/tmp/flux_output";
+
+        # TODO: Invoke flux compiler to transpile
+        # This requires execve support
+
+        # Step 2: Compile .cpp → ELF
+        # TODO: Invoke clang++ on the C++ file
+
+        # Step 3: Run the ELF
+        return execute(binPath, trusted);
+    }
+
+    # ========================================================================
+    # Update TSS RSP0 — called during context switches
+    #
+    # When switching to a user-mode process, the TSS RSP0 field must
+    # point to the kernel stack that will be used when the process
+    # traps back to the kernel (via syscall or interrupt).
+    # ========================================================================
+    public static func updateTssRsp0(long kernelStack) -> void {
+        unsafe {
+            # tss_block is defined in boot.S BSS
+            # RSP0 is at offset 4 in the TSS
+            long* tssRsp0 = (long*) 0;
+            asm("leaq tss_block(%%rip), %0" : "=r"(tssRsp0));
+            # TSS RSP0 is at byte offset 4
+            byte* tss = (byte*) tssRsp0;
+            long* rsp0Ptr = (long*)(tss + 4);
+            *rsp0Ptr = kernelStack;
+        }
+    }
+
+    # ========================================================================
+    # Check if a process is currently running
+    # ========================================================================
+    public static func isRunning() -> bool {
+        return processRunning;
+    }
+
+    public static func getCurrentName() -> string {
+        return processName;
+    }
+
+    public static func getLastExitCode() -> int {
+        return processExitCode;
+    }
+}

@@ -1,0 +1,377 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// App Launcher — Full-screen overlay for launching applications
+// apps/lib/launcher.lx
+//
+// Triggered by Super key or Start button click
+// Shows a grid of available apps with icons and labels
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Launcher state
+bool launcherVisible = false;
+int launcherSelectedIdx = 0;
+int launcherAppCount = 12;
+string launcherSearch = "";   # Search/filter input
+
+# Filtered results — indices into the app arrays (max 10)
+int launchFilterCount = 10;
+int launchFilter0 = 0;  int launchFilter1 = 1;  int launchFilter2 = 2;
+int launchFilter3 = 3;  int launchFilter4 = 4;  int launchFilter5 = 5;
+int launchFilter6 = 6;  int launchFilter7 = 7;  int launchFilter8 = 8;
+int launchFilter9 = 9;  int launchFilter10 = 10;  int launchFilter11 = 11;
+
+# App entries — parallel arrays (structs in arrays requires complex FluxList)
+string launcherNames0  = "Terminal";
+string launcherNames1  = "Calculator";
+string launcherNames2  = "Files";
+string launcherNames3  = "Editor";
+string launcherNames4  = "Browser";
+string launcherNames5  = "Music";
+string launcherNames6  = "Notes";
+string launcherNames7  = "Settings";
+string launcherNames8  = "Monitor";
+string launcherNames9  = "Help";
+string launcherNames10 = "Games";
+string launcherNames11 = "3D Viewer";
+
+string launcherTypes0  = "terminal";
+string launcherTypes1  = "calculator";
+string launcherTypes2  = "explorer";
+string launcherTypes3  = "editor";
+string launcherTypes4  = "browser";
+string launcherTypes5  = "music";
+string launcherTypes6  = "notes";
+string launcherTypes7  = "settings";
+string launcherTypes8  = "sysmon";
+string launcherTypes9  = "help";
+string launcherTypes10 = "games";
+string launcherTypes11 = "viewer3d";
+
+color32 launcherColors0 = 0x69F0AEFF;
+color32 launcherColors1 = 0x42A5F5FF;
+color32 launcherColors2 = 0xFFB74DFF;
+color32 launcherColors3 = 0x5B8CFFFF;
+color32 launcherColors4 = 0xBB86FCFF;
+color32 launcherColors5 = 0xFF5252FF;
+color32 launcherColors6 = 0xFFA657FF;
+color32 launcherColors7 = 0xC8D0E0FF;
+color32 launcherColors8 = 0x4CAF50FF;
+color32 launcherColors9 = 0x42A5F5FF;
+color32 launcherColors10 = 0x66BB6AFF;
+color32 launcherColors11 = 0xE040FBFF;
+
+export class Launcher {
+    # Toggle launcher visibility
+    public static func toggle() -> void {
+        launcherVisible = !launcherVisible;
+        if (launcherVisible) {
+            launcherSelectedIdx = 0;
+            launcherSearch = "";
+            rebuildFilter();
+        }
+    }
+
+    # Show/hide
+    public static func show() -> void {
+        launcherVisible = true;
+        launcherSelectedIdx = 0;
+        launcherSearch = "";
+        rebuildFilter();
+    }
+
+    public static func hide() -> void {
+        launcherVisible = false;
+        launcherSearch = "";
+    }
+
+    # Check if visible
+    public static func isVisible() -> bool {
+        return launcherVisible;
+    }
+
+    # Get the app name at an index
+    private static func getName(int idx) -> string {
+        if (idx == 0) return launcherNames0;
+        if (idx == 1) return launcherNames1;
+        if (idx == 2) return launcherNames2;
+        if (idx == 3) return launcherNames3;
+        if (idx == 4) return launcherNames4;
+        if (idx == 5) return launcherNames5;
+        if (idx == 6) return launcherNames6;
+        if (idx == 7) return launcherNames7;
+        if (idx == 8) return launcherNames8;
+        if (idx == 9) return launcherNames9;
+        if (idx == 10) return launcherNames10;
+        if (idx == 11) return launcherNames11;
+        return "";
+    }
+
+    # Get the app type at an index
+    private static func getType(int idx) -> string {
+        if (idx == 0) return launcherTypes0;
+        if (idx == 1) return launcherTypes1;
+        if (idx == 2) return launcherTypes2;
+        if (idx == 3) return launcherTypes3;
+        if (idx == 4) return launcherTypes4;
+        if (idx == 5) return launcherTypes5;
+        if (idx == 6) return launcherTypes6;
+        if (idx == 7) return launcherTypes7;
+        if (idx == 8) return launcherTypes8;
+        if (idx == 9) return launcherTypes9;
+        if (idx == 10) return launcherTypes10;
+        if (idx == 11) return launcherTypes11;
+        return "";
+    }
+
+    # Get the app color at an index
+    private static func getColor(int idx) -> color32 {
+        if (idx == 0) return launcherColors0;
+        if (idx == 1) return launcherColors1;
+        if (idx == 2) return launcherColors2;
+        if (idx == 3) return launcherColors3;
+        if (idx == 4) return launcherColors4;
+        if (idx == 5) return launcherColors5;
+        if (idx == 6) return launcherColors6;
+        if (idx == 7) return launcherColors7;
+        if (idx == 8) return launcherColors8;
+        if (idx == 9) return launcherColors9;
+        if (idx == 10) return launcherColors10;
+        if (idx == 11) return launcherColors11;
+        return 0xC8D0E0FF;
+    }
+
+    # Process key input — returns selected appType on Enter, "" otherwise
+    public static func processKey(KeyEvent event) -> string {
+        if (!event.pressed) return "";
+
+        # Escape or Super key again — close launcher
+        if (event.scancode == 1 || event.scancode == KEY_SUPER_L || event.scancode == KEY_SUPER_R) {
+            hide();
+            return "";
+        }
+
+        # Arrow key navigation
+        int cols = 4;  # Grid columns
+        if (event.scancode == KEY_LEFT) {
+            if (launcherSelectedIdx > 0) launcherSelectedIdx = launcherSelectedIdx - 1;
+        } elif (event.scancode == KEY_RIGHT) {
+            if (launcherSelectedIdx < launchFilterCount - 1) launcherSelectedIdx = launcherSelectedIdx + 1;
+        } elif (event.scancode == KEY_UP) {
+            if (launcherSelectedIdx >= cols) launcherSelectedIdx = launcherSelectedIdx - cols;
+        } elif (event.scancode == KEY_DOWN) {
+            if (launcherSelectedIdx + cols < launchFilterCount) launcherSelectedIdx = launcherSelectedIdx + cols;
+        } elif (event.scancode == 28) {
+            # Enter — launch the selected app
+            if (launchFilterCount > 0 && launcherSelectedIdx < launchFilterCount) {
+                int realIdx = getFilteredIdx(launcherSelectedIdx);
+                string appType = getType(realIdx);
+                hide();
+                return appType;
+            }
+            return "";
+        } elif (event.scancode == 14) {
+            # Backspace — delete last search char
+            if (launcherSearch.length > 0) {
+                launcherSearch = launcherSearch.substring(0, launcherSearch.length - 1);
+                rebuildFilter();
+                launcherSelectedIdx = 0;
+            }
+            return "";
+        } elif (event.ascii >= 32 && event.ascii < 127) {
+            # Printable character — add to search filter
+            launcherSearch = launcherSearch + "${event.ascii}";
+            rebuildFilter();
+            launcherSelectedIdx = 0;
+            return "";
+        }
+
+        return "";
+    }
+
+    # Process click — returns selected appType if an item was clicked, "" otherwise
+    public static func processClick(int mx, int my, int screenW, int screenH) -> string {
+        int cols = 4;
+        int cellW = 140;
+        int cellH = 120;
+        int gridPadding = 16;
+
+        int gridW = cols * (cellW + gridPadding) - gridPadding;
+        int rows = (launchFilterCount + cols - 1) / cols;
+        int gridH = rows * (cellH + gridPadding) - gridPadding;
+
+        int gridX = (screenW - gridW) / 2;
+        int gridY = (screenH - gridH) / 2 + 40;
+
+        for (int i = 0; i < launchFilterCount; i++) {
+            int col = i % cols;
+            int row = i / cols;
+            int cellX = gridX + col * (cellW + gridPadding);
+            int cellY = gridY + row * (cellH + gridPadding);
+
+            if (mx >= cellX && mx < cellX + cellW && my >= cellY && my < cellY + cellH) {
+                int realIdx = getFilteredIdx(i);
+                string appType = getType(realIdx);
+                hide();
+                return appType;
+            }
+        }
+
+        # Click outside grid — close launcher
+        hide();
+        return "";
+    }
+
+    # Draw the launcher overlay
+    public static func draw(int screenW, int screenH) -> void {
+        if (!launcherVisible) return;
+
+        # Semi-transparent dark overlay
+        for (int y = 0; y < screenH; y++) {
+            for (int x = 0; x < screenW; x++) {
+                Framebuffer.blendPixel(x, y, 0x000000C0);
+            }
+        }
+
+        # Title
+        string titleStr = "Applications";
+        int titleW = titleStr.length * 8;
+        TextRender.drawText(titleStr, (screenW - titleW) / 2, 40, 0xE6EDF3FF);
+
+        # Search bar
+        int searchBarW = 320;
+        int searchBarH = 28;
+        int searchBarX = (screenW - searchBarW) / 2;
+        int searchBarY = 62;
+        Framebuffer.fillRoundedRect(searchBarX, searchBarY, searchBarW, searchBarH, 6, 0x0D1117FF);
+        Framebuffer.drawRoundedRect(searchBarX, searchBarY, searchBarW, searchBarH, 6, 0x30363DFF);
+        if (launcherSearch.length > 0) {
+            TextRender.drawText(launcherSearch + "_", searchBarX + 12, searchBarY + 6, 0xE6EDF3FF);
+        } else {
+            TextRender.drawText("Type to search...", searchBarX + 12, searchBarY + 6, 0x484F58FF);
+        }
+
+        # "No results" message
+        if (launchFilterCount == 0) {
+            string noRes = "No matching apps";
+            int noResW = noRes.length * 8;
+            TextRender.drawText(noRes, (screenW - noResW) / 2, screenH / 2, 0x6B7280FF);
+            return;
+        }
+
+        # Draw filtered app grid
+        int cols = 4;
+        int cellW = 140;
+        int cellH = 120;
+        int gridPadding = 16;
+
+        int gridW = cols * (cellW + gridPadding) - gridPadding;
+        int rows = (launchFilterCount + cols - 1) / cols;
+        int gridH = rows * (cellH + gridPadding) - gridPadding;
+
+        int gridX = (screenW - gridW) / 2;
+        int gridY = (screenH - gridH) / 2 + 50;
+
+        for (int i = 0; i < launchFilterCount; i++) {
+            int col = i % cols;
+            int row = i / cols;
+            int cellX = gridX + col * (cellW + gridPadding);
+            int cellY = gridY + row * (cellH + gridPadding);
+
+            int realIdx = getFilteredIdx(i);
+            bool selected = (i == launcherSelectedIdx);
+            drawLauncherItem(cellX, cellY, cellW, cellH, getName(realIdx), getColor(realIdx), selected);
+        }
+    }
+
+    # Draw a single launcher item
+    private static func drawLauncherItem(int x, int y, int w, int h, string name, color32 color, bool selected) -> void {
+        # Background
+        color32 bg = selected ? 0x21262DFF : 0x161B22C0;
+        Framebuffer.fillRoundedRect(x, y, w, h, 8, bg);
+
+        # Selection border
+        if (selected) {
+            Framebuffer.drawRect(x, y, w, h, Theme.textAccent);
+        }
+
+        # Icon (simple colored circle)
+        int iconCX = x + w / 2;
+        int iconCY = y + h / 2 - 12;
+        Framebuffer.fillCircle(iconCX, iconCY, 20, color);
+
+        # Inner icon detail (white dot for now)
+        Framebuffer.fillCircle(iconCX, iconCY, 6, 0xFFFFFFFF);
+
+        # Label
+        int labelW = name.length * 8;
+        int labelX = x + (w - labelW) / 2;
+        int labelY = y + h - 28;
+        color32 textColor = selected ? 0xFFFFFFFF : 0xC9D1D9FF;
+        TextRender.drawText(name, labelX, labelY, textColor);
+    }
+
+    # ========================================================================
+    # Filter helpers
+    # ========================================================================
+
+    # Get the real app index from a filtered slot
+    private static func getFilteredIdx(int slot) -> int {
+        if (slot == 0) return launchFilter0;
+        if (slot == 1) return launchFilter1;
+        if (slot == 2) return launchFilter2;
+        if (slot == 3) return launchFilter3;
+        if (slot == 4) return launchFilter4;
+        if (slot == 5) return launchFilter5;
+        if (slot == 6) return launchFilter6;
+        if (slot == 7) return launchFilter7;
+        if (slot == 8) return launchFilter8;
+        if (slot == 9) return launchFilter9;
+        if (slot == 10) return launchFilter10;
+        if (slot == 11) return launchFilter11;
+        return 0;
+    }
+
+    # Set a filtered slot to a real index
+    private static func setFilteredIdx(int slot, int val) -> void {
+        if (slot == 0) launchFilter0 = val;
+        if (slot == 1) launchFilter1 = val;
+        if (slot == 2) launchFilter2 = val;
+        if (slot == 3) launchFilter3 = val;
+        if (slot == 4) launchFilter4 = val;
+        if (slot == 5) launchFilter5 = val;
+        if (slot == 6) launchFilter6 = val;
+        if (slot == 7) launchFilter7 = val;
+        if (slot == 8) launchFilter8 = val;
+        if (slot == 9) launchFilter9 = val;
+        if (slot == 10) launchFilter10 = val;
+        if (slot == 11) launchFilter11 = val;
+    }
+
+    # Rebuild the filter list based on current search string
+    private static func rebuildFilter() -> void {
+        launchFilterCount = 0;
+
+        if (launcherSearch.length == 0) {
+            # No search — show all apps
+            for (int i = 0; i < launcherAppCount; i++) {
+                setFilteredIdx(i, i);
+            }
+            launchFilterCount = launcherAppCount;
+            return;
+        }
+
+        # Case-insensitive substring match on app names
+        string query = launcherSearch.toLower();
+        for (int i = 0; i < launcherAppCount; i++) {
+            string name = getName(i).toLower();
+            if (name.contains(query)) {
+                setFilteredIdx(launchFilterCount, i);
+                launchFilterCount = launchFilterCount + 1;
+            }
+        }
+    }
+}

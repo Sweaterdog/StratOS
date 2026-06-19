@@ -1,0 +1,545 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Calculator Application — Simple desktop calculator
+// apps/calculator/calculator.lx
+//
+// Features:
+//   - Basic arithmetic: +, -, ×, ÷
+//   - Percentage, sign toggle, clear
+//   - Keyboard input support
+//   - Visual button grid with hover states
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Calculator state
+string calcDisplay = "0";       # Current display text
+float calcAccum = 0.0;          # Accumulator
+float calcOperand = 0.0;        # Current operand
+string calcOp = "";             # Pending operator
+bool calcNewInput = true;       # Next digit replaces display
+bool calcHasDecimal = false;    # Decimal point entered
+
+# History (parallel string arrays, max 6 entries)
+int calcHistCount = 0;
+string calcHist0 = ""; string calcHist1 = ""; string calcHist2 = "";
+string calcHist3 = ""; string calcHist4 = ""; string calcHist5 = "";
+bool calcShowHist = false;      # Toggle history panel
+
+# Button layout colors
+color32 CALC_BG        = 0x1C1C1EFF;    # Dark background
+color32 CALC_DISPLAY   = 0x000000FF;    # Display background
+color32 CALC_NUM_BTN   = 0x2C2C2EFF;    # Number button background
+color32 CALC_OP_BTN    = 0xFF9F0AFF;    # Operator button (orange)
+color32 CALC_FUNC_BTN  = 0x505050FF;    # Function button (gray)
+color32 CALC_TEXT       = 0xFFFFFFFF;    # Button/display text
+color32 CALC_OP_TEXT    = 0xFFFFFFFF;    # Operator text
+
+export class CalculatorApp {
+
+    public static func init() -> void {
+        calcDisplay = "0";
+        calcAccum = 0.0;
+        calcOperand = 0.0;
+        calcOp = "";
+        calcNewInput = true;
+        calcHasDecimal = false;
+    }
+
+    # Process keyboard input
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        char ch = event.ascii;
+
+        # Number keys
+        if (ch >= '0' && ch <= '9') {
+            inputDigit(ch);
+            return;
+        }
+
+        # Operators
+        if (ch == '+') { inputOperator("+"); return; }
+        if (ch == '-') { inputOperator("-"); return; }
+        if (ch == '*') { inputOperator("*"); return; }
+        if (ch == '/') { inputOperator("/"); return; }
+        if (ch == '%') { inputPercent(); return; }
+        if (ch == '.') { inputDecimal(); return; }
+
+        # Enter/= — evaluate
+        if (event.scancode == 28 || ch == '=') {
+            evaluate();
+            return;
+        }
+
+        # Backspace — delete last digit
+        if (event.scancode == 14) {
+            backspace();
+            return;
+        }
+
+        # Escape / C — clear
+        if (event.scancode == 1 || ch == 'c' || ch == 'C') {
+            init();
+            return;
+        }
+
+        # H — toggle history
+        if (ch == 'h' || ch == 'H') {
+            calcShowHist = !calcShowHist;
+            return;
+        }
+    }
+
+    # Process a mouse click in the content area
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int displayH = 48;
+        int gridY = displayH + 20;
+        int gridX = 8;
+        int btnW = (contentW - 48) / 4;
+        int btnH = (contentH - displayH - 40) / 5;
+        int gap = 4;
+
+        # Check if click is in the button grid area
+        if (relY < gridY) return;
+
+        # Determine which row and column was clicked
+        int row = (relY - gridY) / (btnH + gap);
+        int col = -1;
+
+        # Row 5 special case: "0" button is double-wide
+        if (row == 4) {
+            int zeroW = btnW * 2 + gap;
+            if (relX >= gridX && relX < gridX + zeroW) {
+                # Wide "0" button
+                inputDigit('0');
+                return;
+            }
+            # Adjust col for "." and "=" (columns 2 and 3)
+            if (relX >= gridX + 2 * (btnW + gap) && relX < gridX + 3 * (btnW + gap)) {
+                inputDecimal();
+                return;
+            }
+            if (relX >= gridX + 3 * (btnW + gap) && relX < gridX + 4 * (btnW + gap)) {
+                evaluate();
+                return;
+            }
+            return;
+        }
+
+        col = (relX - gridX) / (btnW + gap);
+        if (col < 0 || col > 3 || row < 0 || row > 3) return;
+
+        # Dispatch based on row and column
+        if (row == 0) {
+            # Row 1: AC, +/-, %, ÷
+            if (col == 0) { init(); return; }
+            if (col == 1) {
+                # Toggle sign
+                float val = parseFloat(calcDisplay);
+                val = -val;
+                calcDisplay = formatFloat(val);
+                return;
+            }
+            if (col == 2) { inputPercent(); return; }
+            if (col == 3) { inputOperator("/"); return; }
+        }
+        elif (row == 1) {
+            # Row 2: 7, 8, 9, ×
+            if (col == 0) { inputDigit('7'); return; }
+            if (col == 1) { inputDigit('8'); return; }
+            if (col == 2) { inputDigit('9'); return; }
+            if (col == 3) { inputOperator("*"); return; }
+        }
+        elif (row == 2) {
+            # Row 3: 4, 5, 6, −
+            if (col == 0) { inputDigit('4'); return; }
+            if (col == 1) { inputDigit('5'); return; }
+            if (col == 2) { inputDigit('6'); return; }
+            if (col == 3) { inputOperator("-"); return; }
+        }
+        elif (row == 3) {
+            # Row 4: 1, 2, 3, +
+            if (col == 0) { inputDigit('1'); return; }
+            if (col == 1) { inputDigit('2'); return; }
+            if (col == 2) { inputDigit('3'); return; }
+            if (col == 3) { inputOperator("+"); return; }
+        }
+    }
+
+    # Draw the calculator UI
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, CALC_BG);
+
+        # Display area (top portion)
+        int displayH = 48;
+        Framebuffer.fillRect(x + 8, y + 8, w - 16, displayH, CALC_DISPLAY);
+
+        # Display text (right-aligned)
+        int textW = calcDisplay.length * charW;
+        int textX = x + w - 16 - textW;
+        int textY = y + 8 + (displayH - charH * 2) / 2;
+        # Draw large text (2x scale simulation using double chars)
+        for (int i = 0; i < calcDisplay.length; i++) {
+            char c = calcDisplay.charAt(i);
+            int cx = textX + i * charW * 2;
+            # Draw at double size by filling 2x2 blocks for each pixel
+            drawLargeChar(c, cx, textY, CALC_TEXT, CALC_DISPLAY);
+        }
+
+        # Button grid
+        int gridY = y + displayH + 20;
+        int gridX = x + 8;
+        int btnW = (w - 48) / 4;
+        int btnH = (h - displayH - 40) / 5;
+        int gap = 4;
+
+        # Row 1: AC, +/-, %, ÷
+        drawButton(gridX, gridY, btnW, btnH, "AC", CALC_FUNC_BTN);
+        drawButton(gridX + (btnW + gap), gridY, btnW, btnH, "+/-", CALC_FUNC_BTN);
+        drawButton(gridX + 2 * (btnW + gap), gridY, btnW, btnH, "%", CALC_FUNC_BTN);
+        drawButton(gridX + 3 * (btnW + gap), gridY, btnW, btnH, "/", CALC_OP_BTN);
+
+        # Row 2: 7, 8, 9, ×
+        int r2y = gridY + btnH + gap;
+        drawButton(gridX, r2y, btnW, btnH, "7", CALC_NUM_BTN);
+        drawButton(gridX + (btnW + gap), r2y, btnW, btnH, "8", CALC_NUM_BTN);
+        drawButton(gridX + 2 * (btnW + gap), r2y, btnW, btnH, "9", CALC_NUM_BTN);
+        drawButton(gridX + 3 * (btnW + gap), r2y, btnW, btnH, "*", CALC_OP_BTN);
+
+        # Row 3: 4, 5, 6, −
+        int r3y = r2y + btnH + gap;
+        drawButton(gridX, r3y, btnW, btnH, "4", CALC_NUM_BTN);
+        drawButton(gridX + (btnW + gap), r3y, btnW, btnH, "5", CALC_NUM_BTN);
+        drawButton(gridX + 2 * (btnW + gap), r3y, btnW, btnH, "6", CALC_NUM_BTN);
+        drawButton(gridX + 3 * (btnW + gap), r3y, btnW, btnH, "-", CALC_OP_BTN);
+
+        # Row 4: 1, 2, 3, +
+        int r4y = r3y + btnH + gap;
+        drawButton(gridX, r4y, btnW, btnH, "1", CALC_NUM_BTN);
+        drawButton(gridX + (btnW + gap), r4y, btnW, btnH, "2", CALC_NUM_BTN);
+        drawButton(gridX + 2 * (btnW + gap), r4y, btnW, btnH, "3", CALC_NUM_BTN);
+        drawButton(gridX + 3 * (btnW + gap), r4y, btnW, btnH, "+", CALC_OP_BTN);
+
+        # Row 5: 0 (wide), ., =
+        int r5y = r4y + btnH + gap;
+        drawButton(gridX, r5y, btnW * 2 + gap, btnH, "0", CALC_NUM_BTN);
+        drawButton(gridX + 2 * (btnW + gap), r5y, btnW, btnH, ".", CALC_NUM_BTN);
+        drawButton(gridX + 3 * (btnW + gap), r5y, btnW, btnH, "=", CALC_OP_BTN);
+
+        # History panel overlay (shown when toggled)
+        if (calcShowHist) {
+            int histPanelW = w - 32;
+            int histPanelH = calcHistCount * 24 + 40;
+            if (histPanelH < 80) histPanelH = 80;
+            int histPanelX = x + 16;
+            int histPanelY = y + displayH + 16;
+
+            Framebuffer.fillRoundedRect(histPanelX, histPanelY, histPanelW, histPanelH, 8, 0x21262DFF);
+            Framebuffer.drawRoundedRect(histPanelX, histPanelY, histPanelW, histPanelH, 8, 0x30363DFF);
+            TextRender.drawText("History (H to close)", histPanelX + 8, histPanelY + 4, 0x8B949EFF);
+            Framebuffer.drawHLine(histPanelX + 4, histPanelY + 22, histPanelW - 8, 0x30363DFF);
+
+            if (calcHistCount == 0) {
+                TextRender.drawText("No calculations yet", histPanelX + 8, histPanelY + 30, 0x484F58FF);
+            } else {
+                for (int i = 0; i < calcHistCount; i++) {
+                    string entry = getHistEntry(i);
+                    TextRender.drawText(entry, histPanelX + 8, histPanelY + 28 + i * 24, 0xC9D1D9FF);
+                }
+            }
+        }
+    }
+
+    # ========================================================================
+    # Internal — Input handling
+    # ========================================================================
+
+    private static func inputDigit(char digit) -> void {
+        string d = (string) digit;
+        if (calcNewInput) {
+            calcDisplay = d;
+            calcNewInput = false;
+            calcHasDecimal = false;
+        } else {
+            if (calcDisplay == "0") {
+                calcDisplay = d;
+            } else {
+                if (calcDisplay.length < 12) {
+                    calcDisplay += d;
+                }
+            }
+        }
+    }
+
+    private static func inputDecimal() -> void {
+        if (calcNewInput) {
+            calcDisplay = "0.";
+            calcNewInput = false;
+            calcHasDecimal = true;
+            return;
+        }
+        if (!calcHasDecimal) {
+            calcDisplay += ".";
+            calcHasDecimal = true;
+        }
+    }
+
+    private static func inputOperator(string op) -> void {
+        if (calcOp != "" && !calcNewInput) {
+            evaluate();
+        }
+        calcAccum = parseFloat(calcDisplay);
+        calcOp = op;
+        calcNewInput = true;
+    }
+
+    private static func inputPercent() -> void {
+        float val = parseFloat(calcDisplay);
+        val = val / 100.0;
+        calcDisplay = formatFloat(val);
+        calcNewInput = true;
+    }
+
+    private static func evaluate() -> void {
+        if (calcOp == "") return;
+
+        float b = parseFloat(calcDisplay);
+        float result = 0.0;
+        string expr = formatFloat(calcAccum) + " " + calcOp + " " + calcDisplay;
+
+        if (calcOp == "+") {
+            result = calcAccum + b;
+        } elif (calcOp == "-") {
+            result = calcAccum - b;
+        } elif (calcOp == "*") {
+            result = calcAccum * b;
+        } elif (calcOp == "/") {
+            if (b == 0.0) {
+                calcDisplay = "Error";
+                calcOp = "";
+                calcNewInput = true;
+                return;
+            }
+            result = calcAccum / b;
+        }
+
+        calcAccum = result;
+        calcDisplay = formatFloat(result);
+        calcOp = "";
+        calcNewInput = true;
+
+        # Record in history
+        string entry = expr + " = " + calcDisplay;
+        addHistory(entry);
+    }
+
+    private static func addHistory(string entry) -> void {
+        # Shift everything down if full
+        if (calcHistCount >= 6) {
+            calcHist0 = calcHist1;
+            calcHist1 = calcHist2;
+            calcHist2 = calcHist3;
+            calcHist3 = calcHist4;
+            calcHist4 = calcHist5;
+            calcHist5 = entry;
+        } else {
+            setHistEntry(calcHistCount, entry);
+            calcHistCount = calcHistCount + 1;
+        }
+    }
+
+    private static func getHistEntry(int i) -> string {
+        switch (i) {
+            case 0: return calcHist0;
+            case 1: return calcHist1;
+            case 2: return calcHist2;
+            case 3: return calcHist3;
+            case 4: return calcHist4;
+            case 5: return calcHist5;
+            default: return "";
+        }
+    }
+
+    private static func setHistEntry(int i, string val) -> void {
+        switch (i) {
+            case 0: calcHist0 = val; break;
+            case 1: calcHist1 = val; break;
+            case 2: calcHist2 = val; break;
+            case 3: calcHist3 = val; break;
+            case 4: calcHist4 = val; break;
+            case 5: calcHist5 = val; break;
+        }
+    }
+
+    private static func backspace() -> void {
+        if (calcNewInput) return;
+        if (calcDisplay.length > 1) {
+            # Check if we're removing a decimal point
+            char last = calcDisplay.charAt(calcDisplay.length - 1);
+            if (last == '.') calcHasDecimal = false;
+            calcDisplay = calcDisplay.substring(0, calcDisplay.length - 1);
+        } else {
+            calcDisplay = "0";
+            calcNewInput = true;
+        }
+    }
+
+    # ========================================================================
+    # Internal — Rendering helpers
+    # ========================================================================
+
+    private static func drawButton(int x, int y, int w, int h, string label, color32 bg) -> void {
+        Framebuffer.fillRoundedRect(x, y, w, h, 6, bg);
+        # Center label
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+        int labelX = x + (w - label.length * charW) / 2;
+        int labelY = y + (h - charH) / 2;
+        TextRender.drawText(label, labelX, labelY, CALC_TEXT);
+    }
+
+    # Draw a character at 2x size (simple pixel doubling)
+    private static func drawLargeChar(char c, int x, int y, color32 fg, color32 bg) -> void {
+        int charIndex = (int) c;
+        if (charIndex < 32 || charIndex > 126) charIndex = '?';
+
+        unsafe {
+            int* fontInts = (int*) BUILTIN_FONT_BASE;
+            int glyphBase = (charIndex - 32) * FONT_HEIGHT;
+
+            for (int row = 0; row < FONT_HEIGHT; row++) {
+                byte bits = (byte) fontInts[glyphBase + row];
+                for (int col = 0; col < FONT_WIDTH; col++) {
+                    int divisor = 1;
+                    switch (col) {
+                        case 0: divisor = 128; break;
+                        case 1: divisor = 64;  break;
+                        case 2: divisor = 32;  break;
+                        case 3: divisor = 16;  break;
+                        case 4: divisor = 8;   break;
+                        case 5: divisor = 4;   break;
+                        case 6: divisor = 2;   break;
+                        case 7: divisor = 1;   break;
+                        default: divisor = 1;  break;
+                    }
+
+                    color32 color = bg;
+                    if ((((int) bits) / divisor) % 2 == 1) {
+                        color = fg;
+                    }
+                    # 2x2 pixel block
+                    int px = x + col * 2;
+                    int py = y + row * 2;
+                    Framebuffer.plotPixel(px, py, color);
+                    Framebuffer.plotPixel(px + 1, py, color);
+                    Framebuffer.plotPixel(px, py + 1, color);
+                    Framebuffer.plotPixel(px + 1, py + 1, color);
+                }
+            }
+        }
+    }
+
+    # ========================================================================
+    # Internal — Number parsing and formatting
+    # ========================================================================
+
+    private static func parseFloat(string s) -> float {
+        float result = 0.0;
+        float fraction = 0.1;
+        bool negative = false;
+        bool decimal = false;
+
+        int start = 0;
+        if (s.length > 0 && s.charAt(0) == '-') {
+            negative = true;
+            start = 1;
+        }
+
+        for (int i = start; i < s.length; i++) {
+            char c = s.charAt(i);
+            if (c == '.') {
+                decimal = true;
+                continue;
+            }
+            if (c >= '0' && c <= '9') {
+                int digit = int(c) - 48;
+                if (decimal) {
+                    result = result + (float) digit * fraction;
+                    fraction = fraction * 0.1;
+                } else {
+                    result = result * 10.0 + (float) digit;
+                }
+            }
+        }
+
+        if (negative) result = -result;
+        return result;
+    }
+
+    private static func formatFloat(float val) -> string {
+        # Check if it's an integer
+        int intVal = (int) val;
+        float diff = val - (float) intVal;
+        if (diff < 0.0001 && diff > -0.0001) {
+            return intToString(intVal);
+        }
+
+        # Format with up to 6 decimal places
+        string result = "";
+        if (val < 0.0) {
+            result = "-";
+            val = -val;
+        }
+
+        int wholePart = (int) val;
+        result += intToString(wholePart);
+        result += ".";
+
+        float frac = val - (float) wholePart;
+        for (int i = 0; i < 6; i++) {
+            frac = frac * 10.0;
+            int digit = (int) frac;
+            result += intToString(digit);
+            frac = frac - (float) digit;
+        }
+
+        # Trim trailing zeros
+        while (result.length > 1 && result.charAt(result.length - 1) == '0') {
+            result = result.substring(0, result.length - 1);
+        }
+        if (result.charAt(result.length - 1) == '.') {
+            result = result.substring(0, result.length - 1);
+        }
+
+        return result;
+    }
+
+    private static func intToString(int val) -> string {
+        if (val == 0) return "0";
+
+        string result = "";
+        bool neg = false;
+        if (val < 0) {
+            neg = true;
+            val = -val;
+        }
+
+        while (val > 0) {
+            int digit = val % 10;
+            char c = (char)(digit + 48);
+            result = (string) c + result;
+            val = val / 10;
+        }
+
+        if (neg) result = "-" + result;
+        return result;
+    }
+}

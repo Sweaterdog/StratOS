@@ -1,0 +1,195 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Scheduler — Round-robin process scheduler
+// kernel/core/scheduler.lx
+// ============================================================================
+
+import "kernel/core/bootinfo.lx";
+
+int MAX_PROCESSES = 256;
+int TIME_SLICE_MS = 10;     # 10ms time slices
+
+enum ProcessState {
+    READY = 0,
+    RUNNING = 1,
+    BLOCKED = 2,
+    SLEEPING = 3,
+    TERMINATED = 4
+}
+
+export struct Process {
+    int pid;
+    string name;
+    int state;                  # ProcessState
+    long stackPointer;          # Saved RSP
+    long instructionPointer;    # Saved RIP
+    long pageTable;             # CR3 for this process
+    int priority;               # 0 = highest
+    long sleepUntil;            # Timestamp for sleep wakeup
+    long cpuTime;               # Total CPU time used (ms)
+    int parentPid;              # Parent process ID
+}
+
+# Process table
+list<Process> processList = [];
+int currentPid = -1;
+int nextPid = 1;               # PID 0 is reserved for kernel idle
+
+export class Scheduler {
+    # Initialize the scheduler
+    public static func init() -> void {
+        # Create the kernel idle process (PID 0)
+        Process idle = {
+            pid: 0,
+            name: "kernel_idle",
+            state: ProcessState.RUNNING,
+            stackPointer: 0,
+            instructionPointer: 0,
+            pageTable: 0,
+            priority: 255,
+            sleepUntil: 0,
+            cpuTime: 0,
+            parentPid: -1
+        };
+        processList.add(idle);
+        currentPid = 0;
+    }
+
+    # Create a new process
+    public static func createProcess(string name, long entryPoint, int priority) -> int {
+        int pid = nextPid++;
+
+        Process proc = {
+            pid: pid,
+            name: name,
+            state: ProcessState.READY,
+            stackPointer: allocateStack(),
+            instructionPointer: entryPoint,
+            pageTable: createPageTable(),
+            priority: priority,
+            sleepUntil: 0,
+            cpuTime: 0,
+            parentPid: currentPid
+        };
+
+        processList.add(proc);
+        return pid;
+    }
+
+    # Terminate a process
+    public static func terminateProcess(int pid) -> void {
+        for (int i = 0; i < processList.length; i++) {
+            Process p = processList[i];
+            if (p.pid == pid) {
+                p.state = ProcessState.TERMINATED;
+                break;
+            }
+        }
+    }
+
+    # Timer interrupt handler — called every TIME_SLICE_MS
+    public static func tick() -> void {
+        # Update CPU time for current process
+        if (currentPid >= 0) {
+            for (int i = 0; i < processList.length; i++) {
+                Process p = processList[i];
+                if (p.pid == currentPid) {
+                    p.cpuTime += TIME_SLICE_MS;
+                    break;
+                }
+            }
+        }
+
+        # Wake up sleeping processes
+        long now = getSystemTime();
+        for (int i = 0; i < processList.length; i++) {
+            Process p = processList[i];
+            if (p.state == ProcessState.SLEEPING && now >= p.sleepUntil) {
+                p.state = ProcessState.READY;
+            }
+        }
+
+        # Schedule next process (round-robin)
+        schedule();
+    }
+
+    # Select next process to run
+    private static func schedule() -> void {
+        int startIndex = -1;
+
+        # Find current process index
+        for (int i = 0; i < processList.length; i++) {
+            if (processList[i].pid == currentPid) {
+                if (processList[i].state == ProcessState.RUNNING) {
+                    processList[i].state = ProcessState.READY;
+                }
+                startIndex = i;
+                break;
+            }
+        }
+
+        # Search for next ready process (round-robin)
+        int count = processList.length;
+        for (int j = 1; j <= count; j++) {
+            int idx = (startIndex + j) % count;
+            Process candidate = processList[idx];
+            if (candidate.state == ProcessState.READY) {
+                candidate.state = ProcessState.RUNNING;
+                currentPid = candidate.pid;
+                contextSwitch(candidate);
+                return;
+            }
+        }
+
+        # No ready process found — run idle
+        currentPid = 0;
+    }
+
+    # Perform context switch to target process
+    private static func contextSwitch(Process target) -> void {
+        unsafe {
+            # Save current process state
+            # Load target process state
+            # Switch page tables (CR3)
+            # This would be implemented in assembly for the actual register save/restore
+        }
+    }
+
+    # Allocate a new stack for a process (4KB)
+    private static func allocateStack() -> long {
+        # Placeholder — delegates to MemoryManager
+        return 0;
+    }
+
+    # Create a new page table for a process
+    private static func createPageTable() -> long {
+        # Placeholder — delegates to MemoryManager
+        return 0;
+    }
+
+    # Get system time in milliseconds (from Timer)
+    private static func getSystemTime() -> long {
+        return 0;  # Placeholder — reads from Timer driver
+    }
+
+    # Get current process
+    public static func getCurrentProcess() -> Process {
+        for (int i = 0; i < processList.length; i++) {
+            if (processList[i].pid == currentPid) {
+                return processList[i];
+            }
+        }
+        panic("No current process");
+    }
+
+    # Get process count
+    public static func getProcessCount() -> int {
+        int count = 0;
+        for (int i = 0; i < processList.length; i++) {
+            if (processList[i].state != ProcessState.TERMINATED) {
+                count++;
+            }
+        }
+        return count;
+    }
+}

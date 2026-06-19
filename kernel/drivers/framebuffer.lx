@@ -1,0 +1,396 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Framebuffer Driver — Direct pixel-level access to the display
+// kernel/drivers/framebuffer.lx
+//
+// Supports double buffering: all drawing goes to a back buffer, then
+// present() copies the back buffer to the hardware framebuffer atomically.
+// ============================================================================
+
+import "kernel/core/bootinfo.lx";
+import "kernel/memory/manager.lx";
+
+# Framebuffer state
+long fbBase = 0;         # Hardware framebuffer base address
+long drawTarget = 0;     # Current draw target (fbBase or backBuffer)
+long backBuffer = 0;     # Back buffer for double buffering
+long wpCache = 0;        # Wallpaper cache buffer
+int fbSize = 0;
+int fbWidth = 0;
+int fbHeight = 0;
+int fbPitch = 0;         # Pixels per scanline
+bool hasBackBuffer = false;
+bool wpCacheDirty = true; # Wallpaper cache needs re-render
+
+export class Framebuffer {
+    # Initialize from boot info
+    public static func init(BootInfo boot) -> void {
+        fbBase = boot.framebufferBase;
+        fbSize = boot.framebufferSize;
+        fbWidth = boot.screenWidth;
+        fbHeight = boot.screenHeight;
+        fbPitch = boot.pixelsPerScanline;
+        drawTarget = fbBase;
+    }
+
+    # Enable double buffering — allocates back buffer + wallpaper cache
+    public static func enableDoubleBuffering() -> void {
+        int bufferBytes = fbPitch * fbHeight * 4;
+        backBuffer = MemoryManager.kmalloc(bufferBytes);
+        wpCache = MemoryManager.kmalloc(bufferBytes);
+
+        if (backBuffer != 0 && wpCache != 0) {
+            hasBackBuffer = true;
+            drawTarget = backBuffer;
+
+            # Zero out both buffers
+            unsafe {
+                int bytes = fbPitch * fbHeight * 4;
+                __builtin_memset((void*) backBuffer, 0, bytes);
+                __builtin_memset((void*) wpCache, 0, bytes);
+            }
+        }
+    }
+
+    # Copy back buffer to hardware framebuffer (call at end of each frame)
+    public static func present() -> void {
+        if (!hasBackBuffer) return;
+        unsafe {
+            int bytes = fbPitch * fbHeight * 4;
+            __builtin_memcpy((void*) fbBase, (void*) backBuffer, bytes);
+        }
+    }
+
+    # Restore wallpaper from cache to back buffer (fast frame start)
+    public static func restoreWallpaper() -> void {
+        if (!hasBackBuffer || !wpCache) return;
+        unsafe {
+            int bytes = fbPitch * fbHeight * 4;
+            __builtin_memcpy((void*) backBuffer, (void*) wpCache, bytes);
+        }
+    }
+
+    # Save current back buffer as wallpaper cache
+    public static func cacheWallpaper() -> void {
+        if (!hasBackBuffer || !wpCache) return;
+        unsafe {
+            int bytes = fbPitch * fbHeight * 4;
+            __builtin_memcpy((void*) wpCache, (void*) backBuffer, bytes);
+        }
+        wpCacheDirty = false;
+    }
+
+    # Check if wallpaper cache needs re-render
+    public static func isWallpaperDirty() -> bool {
+        return wpCacheDirty;
+    }
+
+    # Mark wallpaper cache as dirty (call when wallpaper changes)
+    public static func invalidateWallpaper() -> void {
+        wpCacheDirty = true;
+    }
+
+    # Convert RGBA color32 (0xRRGGBBAA) to framebuffer format (0x00RRGGBB)
+    private static func toFB(color32 c) -> int {
+        return (int)(c >> 8);
+    }
+
+    # Create an RGB color32 from components (convenience)
+    public static func rgb(int r, int g, int b) -> color32 {
+        return (color32)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+    }
+
+    # Plot a single pixel (32-bit RGBA)
+    public static func plotPixel(int x, int y, color32 color) -> void {
+        if (x < 0 || x >= fbWidth || y < 0 || y >= fbHeight) return;
+        unsafe {
+            int* fb = (int*) drawTarget;
+            fb[y * fbPitch + x] = toFB(color);
+        }
+    }
+
+    # Alias for plotPixel (used by desktop wallpaper code)
+    public static func putPixel(int x, int y, color32 color) -> void {
+        plotPixel(x, y, color);
+    }
+
+    # Get pixel color at coordinates (reads from draw target)
+    public static func getPixel(int x, int y) -> color32 {
+        if (x < 0 || x >= fbWidth || y < 0 || y >= fbHeight) return 0;
+        unsafe {
+            int* fb = (int*) drawTarget;
+            return (color32) fb[y * fbPitch + x];
+        }
+    }
+
+    # Clear entire buffer to a color
+    public static func clear(color32 color) -> void {
+        unsafe {
+            int* fb = (int*) drawTarget;
+            int totalPixels = fbPitch * fbHeight;
+            int c = toFB(color);
+            for (int i = 0; i < totalPixels; i++) {
+                fb[i] = c;
+            }
+        }
+    }
+
+    # Draw a filled rectangle (optimized — direct buffer writes, no per-pixel bounds check)
+    public static func fillRect(int x, int y, int w, int h, color32 color) -> void {
+        # Clip to screen bounds
+        int x0 = x;
+        int y0 = y;
+        int x1 = x + w;
+        int y1 = y + h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > fbWidth) { x1 = fbWidth; }
+        if (y1 > fbHeight) { y1 = fbHeight; }
+        if (x0 >= x1 || y0 >= y1) return;
+
+        unsafe {
+            int* fb = (int*) drawTarget;
+            int c = toFB(color);
+            int rowW = x1 - x0;
+            for (int row = y0; row < y1; row++) {
+                int offset = row * fbPitch + x0;
+                for (int col = 0; col < rowW; col++) {
+                    fb[offset + col] = c;
+                }
+            }
+        }
+    }
+
+    # Draw a rectangle outline
+    public static func drawRect(int x, int y, int w, int h, color32 color) -> void {
+        drawHLine(x, y, w, color);
+        drawHLine(x, y + h - 1, w, color);
+        drawVLine(x, y, h, color);
+        drawVLine(x + w - 1, y, h, color);
+    }
+
+    # Draw horizontal line (fast — direct buffer writes)
+    public static func drawHLine(int x, int y, int length, color32 color) -> void {
+        if (y < 0 || y >= fbHeight) return;
+
+        unsafe {
+            int* fb = (int*) drawTarget;
+            int c = toFB(color);
+            int start = math.max(x, 0);
+            int end = math.min(x + length, fbWidth);
+            int count = end - start;
+            if (count <= 0) return;
+
+            int offset = y * fbPitch + start;
+            for (int i = 0; i < count; i++) {
+                fb[offset + i] = c;
+            }
+        }
+    }
+
+    # Draw vertical line
+    public static func drawVLine(int x, int y, int length, color32 color) -> void {
+        if (x < 0 || x >= fbWidth) return;
+
+        unsafe {
+            int* fb = (int*) drawTarget;
+            int c = toFB(color);
+            int start = math.max(y, 0);
+            int end = math.min(y + length, fbHeight);
+
+            for (int row = start; row < end; row++) {
+                fb[row * fbPitch + x] = c;
+            }
+        }
+    }
+
+    # Draw line using Bresenham's algorithm
+    public static func drawLine(int x0, int y0, int x1, int y1, color32 color) -> void {
+        int dx = math.abs(x1 - x0);
+        int dy = math.abs(y1 - y0);
+        int sx = x0 < x1 ? 1 : -1;
+        int sy = y0 < y1 ? 1 : -1;
+        int err = dx - dy;
+
+        while (true) {
+            plotPixel(x0, y0, color);
+            if (x0 == x1 && y0 == y1) break;
+
+            int e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                x0 += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    # Draw a circle outline (Bresenham midpoint)
+    public static func drawCircle(int cx, int cy, int radius, color32 color) -> void {
+        int x = radius;
+        int y = 0;
+        int err = 0;
+
+        while (x >= y) {
+            plotPixel(cx + x, cy + y, color);
+            plotPixel(cx + y, cy + x, color);
+            plotPixel(cx - y, cy + x, color);
+            plotPixel(cx - x, cy + y, color);
+            plotPixel(cx - x, cy - y, color);
+            plotPixel(cx - y, cy - x, color);
+            plotPixel(cx + y, cy - x, color);
+            plotPixel(cx + x, cy - y, color);
+
+            y++;
+            if (err <= 0) {
+                err += 2 * y + 1;
+            }
+            if (err > 0) {
+                x--;
+                err -= 2 * x + 1;
+            }
+        }
+    }
+
+    # Draw a filled circle
+    public static func fillCircle(int cx, int cy, int radius, color32 color) -> void {
+        for (int y = -radius; y <= radius; y++) {
+            for (int x = -radius; x <= radius; x++) {
+                if (x * x + y * y <= radius * radius) {
+                    plotPixel(cx + x, cy + y, color);
+                }
+            }
+        }
+    }
+
+    # Draw a rounded rectangle (filled)
+    public static func fillRoundedRect(int x, int y, int w, int h, int r, color32 color) -> void {
+        # Center rectangle
+        fillRect(x + r, y, w - 2 * r, h, color);
+        # Left / right strips
+        fillRect(x, y + r, r, h - 2 * r, color);
+        fillRect(x + w - r, y + r, r, h - 2 * r, color);
+        # Corners
+        fillCircleQuadrant(x + r, y + r, r, color, 0);        # Top-left
+        fillCircleQuadrant(x + w - r - 1, y + r, r, color, 1); # Top-right
+        fillCircleQuadrant(x + r, y + h - r - 1, r, color, 2); # Bottom-left
+        fillCircleQuadrant(x + w - r - 1, y + h - r - 1, r, color, 3); # Bottom-right
+    }
+
+    # Draw a filled quarter circle
+    private static func fillCircleQuadrant(int cx, int cy, int r, color32 color, int quadrant) -> void {
+        for (int py = 0; py <= r; py++) {
+            for (int px = 0; px <= r; px++) {
+                if (px * px + py * py <= r * r) {
+                    switch (quadrant) {
+                        case 0: plotPixel(cx - px, cy - py, color); break;
+                        case 1: plotPixel(cx + px, cy - py, color); break;
+                        case 2: plotPixel(cx - px, cy + py, color); break;
+                        case 3: plotPixel(cx + px, cy + py, color); break;
+                    }
+                }
+            }
+        }
+    }
+
+    # Draw a rounded rectangle outline (not filled)
+    public static func drawRoundedRect(int x, int y, int w, int h, int r, color32 color) -> void {
+        # Top edge
+        drawHLine(x + r, y, w - 2 * r, color);
+        # Bottom edge
+        drawHLine(x + r, y + h - 1, w - 2 * r, color);
+        # Left edge
+        drawVLine(x, y + r, h - 2 * r, color);
+        # Right edge
+        drawVLine(x + w - 1, y + r, h - 2 * r, color);
+        # Corner arcs
+        drawArcQuadrant(x + r, y + r, r, color, 0);
+        drawArcQuadrant(x + w - r - 1, y + r, r, color, 1);
+        drawArcQuadrant(x + r, y + h - r - 1, r, color, 2);
+        drawArcQuadrant(x + w - r - 1, y + h - r - 1, r, color, 3);
+    }
+
+    # Draw a quarter circle arc (outline only)
+    private static func drawArcQuadrant(int cx, int cy, int r, color32 color, int quadrant) -> void {
+        int px = 0;
+        int py = r;
+        int d = 1 - r;
+        while (px <= py) {
+            switch (quadrant) {
+                case 0:
+                    plotPixel(cx - py, cy - px, color);
+                    plotPixel(cx - px, cy - py, color);
+                    break;
+                case 1:
+                    plotPixel(cx + py, cy - px, color);
+                    plotPixel(cx + px, cy - py, color);
+                    break;
+                case 2:
+                    plotPixel(cx - py, cy + px, color);
+                    plotPixel(cx - px, cy + py, color);
+                    break;
+                case 3:
+                    plotPixel(cx + py, cy + px, color);
+                    plotPixel(cx + px, cy + py, color);
+                    break;
+            }
+            if (d < 0) {
+                d = d + 2 * px + 3;
+            } else {
+                d = d + 2 * (px - py) + 5;
+                py = py - 1;
+            }
+            px = px + 1;
+        }
+    }
+
+    # Alpha-blend a pixel onto the framebuffer
+    public static func blendPixel(int x, int y, color32 color) -> void {
+        if (x < 0 || x >= fbWidth || y < 0 || y >= fbHeight) return;
+
+        int alpha = ((int) color) & 0xFF;
+        if (alpha == 255) {
+            plotPixel(x, y, color);
+            return;
+        }
+        if (alpha == 0) return;
+
+        color32 bg = getPixel(x, y);
+        int bgR = ((int) bg >> 24) & 0xFF;
+        int bgG = ((int) bg >> 16) & 0xFF;
+        int bgB = ((int) bg >> 8) & 0xFF;
+
+        int fgR = ((int) color >> 24) & 0xFF;
+        int fgG = ((int) color >> 16) & 0xFF;
+        int fgB = ((int) color >> 8) & 0xFF;
+
+        int outR = (fgR * alpha + bgR * (255 - alpha)) / 255;
+        int outG = (fgG * alpha + bgG * (255 - alpha)) / 255;
+        int outB = (fgB * alpha + bgB * (255 - alpha)) / 255;
+
+        color32 blended = (color32)((outR << 24) | (outG << 16) | (outB << 8) | 0xFF);
+        plotPixel(x, y, blended);
+    }
+
+    # Copy a rectangular region (for window compositing)
+    public static func blit(int srcX, int srcY, int dstX, int dstY, int w, int h) -> void {
+        unsafe {
+            int* fb = (int*) drawTarget;
+            for (int row = 0; row < h; row++) {
+                for (int col = 0; col < w; col++) {
+                    int pixel = fb[(srcY + row) * fbPitch + (srcX + col)];
+                    fb[(dstY + row) * fbPitch + (dstX + col)] = pixel;
+                }
+            }
+        }
+    }
+
+    # Getters
+    public static func getWidth() -> int { return fbWidth; }
+    public static func getHeight() -> int { return fbHeight; }
+    public static func getPitch() -> int { return fbPitch; }
+    public static func getBase() -> long { return fbBase; }
+}

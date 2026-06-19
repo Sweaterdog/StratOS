@@ -1,0 +1,2091 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Stellar Compositor — StratOS Windowing System
+// system/windowing/compositor.lx
+//
+// Features:
+//   - Window management (create, move, resize, close)
+//   - Snapping (left/right half, quadrants, maximize)
+//   - Taskbar with running app list
+//   - Clean cosmic theme
+//   - Z-order / focus management
+//   - Double-buffered rendering
+// ============================================================================
+
+import "kernel/core/bootinfo.lx";
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/mouse.lx";
+import "kernel/drivers/timer.lx";
+import "kernel/core/console.lx";
+import "apps/terminal/terminal.lx";
+import "apps/calculator/calculator.lx";
+import "apps/settings/settings.lx";
+import "apps/explorer/explorer.lx";
+import "apps/editor/editor.lx";
+import "apps/browser/browser.lx";
+import "apps/music/player.lx";
+import "apps/notes/notes.lx";
+import "apps/games/games.lx";
+import "apps/games/snake/snake.lx";
+import "apps/viewer3d/viewer3d.lx";
+import "apps/onboarding/onboarding.lx";
+import "apps/lib/textrender.lx";
+import "apps/lib/launcher.lx";
+import "system/windowing/theme.lx";
+import "system/windowing/taskbar.lx";
+import "system/windowing/window.lx";
+import "system/windowing/desktop.lx";
+import "system/windowing/toast.lx";
+import "system/windowing/lockscreen.lx";
+import "system/windowing/shortcuts.lx";
+import "system/windowing/screensaver.lx";
+import "system/shell/shell.lx";
+import "kernel/drivers/speaker.lx";
+import "apps/sysmon/sysmon.lx";
+import "apps/help/help.lx";
+
+# Screen dimensions
+int screenW = 0;
+int screenH = 0;
+
+# Window list (z-order: last = front)
+list<AppWindow> windows = [];
+int focusedWindowId = -1;
+int nextWindowId = 1;
+
+# Mouse state
+int mouseX = 0;
+int mouseY = 0;
+bool mouseDown = false;
+bool mouseRightDown = false;
+int dragWindowId = -1;
+int dragOffsetX = 0;
+int dragOffsetY = 0;
+bool isResizing = false;
+int resizeEdge = 0;        # Bitmask: 1=left, 2=right, 4=top, 8=bottom
+int RESIZE_BORDER = 6;     # Edge detection thickness in pixels
+
+# Right-click context menu state
+bool contextMenuVisible = false;
+int contextMenuX = 0;
+int contextMenuY = 0;
+int contextMenuHover = -1;
+int CONTEXT_MENU_ITEMS = 5;
+int CONTEXT_MENU_W = 180;
+int CONTEXT_MENU_ITEM_H = 28;
+
+# Snap zones
+int SNAP_THRESHOLD = 20;
+int TASKBAR_HEIGHT = 48;
+
+# Snap preview state
+int snapPreviewX = 0;
+int snapPreviewY = 0;
+int snapPreviewW = 0;
+int snapPreviewH = 0;
+bool snapPreviewVisible = false;
+
+# Animation constants
+int ANIM_FRAMES = 6;
+int ANIM_MINIMIZE = 1;
+int ANIM_RESTORE = 2;
+
+# Cursor style constants
+int CURSOR_ARROW     = 0;
+int CURSOR_RESIZE_H  = 1;   # Horizontal resize (left/right edge)
+int CURSOR_RESIZE_V  = 2;   # Vertical resize (top/bottom edge)
+int CURSOR_RESIZE_DIAG_NWSE = 3;   # NW-SE diagonal (top-left / bottom-right)
+int CURSOR_RESIZE_DIAG_NESW = 4;   # NE-SW diagonal (top-right / bottom-left)
+int CURSOR_TEXT      = 5;   # I-beam for text apps
+int CURSOR_MOVE      = 6;   # Move/drag cursor
+int CURSOR_POINTER   = 7;   # Hand pointer for clickable areas
+int cursorStyle = 0;
+
+# Screenshot flash effect
+int screenshotFlash = 0;
+int screenshotCount = 0;
+
+# Double-click tracking
+int lastClickTime = 0;
+int lastClickX = 0;
+int lastClickY = 0;
+int DOUBLE_CLICK_MS = 40;    # ~400ms at 100 ticks/sec
+int DOUBLE_CLICK_DIST = 8;
+
+# Desktop state
+bool desktopRunning = false;
+
+export class Compositor {
+    # Initialize the compositor
+    public static func init(BootInfo boot) -> void {
+        screenW = boot.screenWidth;
+        screenH = boot.screenHeight;
+
+        mouseX = screenW / 2;
+        mouseY = screenH / 2;
+
+        # Enable double buffering for flicker-free rendering
+        Framebuffer.enableDoubleBuffering();
+
+        # Initialize PS/2 mouse
+        Mouse.init(screenW, screenH);
+
+        # Initialize theme
+        Theme.init();
+
+        # Initialize desktop (icons, wallpaper)
+        Desktop.init();
+
+        # Initialize PC speaker
+        Speaker.init();
+
+        # Initialize taskbar
+        Taskbar.init(screenW, screenH, TASKBAR_HEIGHT);
+    }
+
+    # Start the desktop environment
+    public static func startDesktop() -> void {
+        desktopRunning = true;
+
+        # Boot splash screen
+        showSplash();
+
+        # Initialize apps
+        TerminalApp.init();
+        CalculatorApp.init();
+        SettingsApp.init();
+        ExplorerApp.init();
+        EditorApp.init();
+        BrowserApp.init();
+        MusicApp.init();
+        NotesApp.init();
+        SysMonApp.init();
+        HelpApp.init();
+        GamesApp.init();
+        SnakeApp.init();
+        OnboardingApp.init();
+
+        # Open a terminal window by default
+        createWindow("Terminal", 100, 80, 800, 500, "terminal");
+
+        # Show onboarding wizard on first boot
+        createWindow("Welcome to StratOS", 150, 60, 600, 420, "onboarding");
+
+        # Welcome toast
+        Toast.info("Welcome to StratOS!");
+
+        # Main compositor loop (runs in kernel context)
+        while (desktopRunning) {
+            # Process input
+            processInput();
+
+            # Check for taskbar clicks — also unminimize
+            int clickedId = Taskbar.consumeClick();
+            if (clickedId != -1) {
+                # Unminimize with restore animation
+                for (int i = 0; i < windows.length; i++) {
+                    if (windows[i].id == clickedId && windows[i].isMinimized) {
+                        windows[i].isMinimized = false;
+                        windows[i].animType = ANIM_RESTORE;
+                        windows[i].animProgress = 1;
+                    }
+                }
+                focusWindow(clickedId);
+            }
+
+            # Check for tray icon actions (bell, lock)
+            int trayAct = Taskbar.consumeTrayAction();
+            if (trayAct == 1) {
+                Toast.togglePanel();
+                Speaker.click();
+            } elif (trayAct == 2) {
+                LockScreen.lock();
+                Speaker.notify();
+            }
+
+            # Sync volume from taskbar slider (self-contained, no AudioEngine)
+            int newVol = Taskbar.consumePendingVolume();
+            if (newVol >= 0) {
+                # Volume adjusted via slider — just stored in taskbar's cachedVolume
+                # In a full audio implementation, this would call AudioEngine.setVolume()
+            }
+
+            # Check if Explorer requests "Open in Terminal"
+            string termPath = ExplorerApp.consumePendingTermPath();
+            if (termPath.length > 0) {
+                createWindow("Terminal", 80 + (nextWindowId * 20) % 200, 60 + (nextWindowId * 15) % 150, 800, 500, "terminal");
+                Shell.setCwd(termPath);
+            }
+
+            # Update window states
+            updateWindows();
+
+            # Update window animations (minimize/restore)
+            for (int ai = 0; ai < windows.length; ai++) {
+                if (windows[ai].animProgress > 0) {
+                    windows[ai].animProgress = windows[ai].animProgress + 1;
+                    if (windows[ai].animProgress > ANIM_FRAMES) {
+                        if (windows[ai].animType == ANIM_MINIMIZE) {
+                            windows[ai].isMinimized = true;
+                        }
+                        windows[ai].animProgress = 0;
+                        windows[ai].animType = 0;
+                    }
+                }
+            }
+
+            # Update speaker auto-stop
+            Speaker.update();
+
+            # Tick idle timers (screensaver + auto-lock)
+            Screensaver.tickIdle();
+            LockScreen.tickIdle();
+
+            # Refresh system monitor data
+            SysMonApp.beginRefresh(Timer.getTicks(), Timer.getFrequency());
+            for (int si = 0; si < windows.length; si++) {
+                int minFlag = 0;
+                if (windows[si].isMinimized) { minFlag = 1; }
+                SysMonApp.addProcEntry(windows[si].title, windows[si].appType, windows[si].id, minFlag);
+            }
+
+            # Handle sysmon kill/focus requests
+            int smKill = SysMonApp.consumeKillRequest();
+            if (smKill != -1) {
+                closeWindow(smKill);
+            }
+            int smFocus = SysMonApp.consumeFocusRequest();
+            if (smFocus != -1) {
+                # Unminimize if needed
+                for (int sfi = 0; sfi < windows.length; sfi++) {
+                    if (windows[sfi].id == smFocus && windows[sfi].isMinimized) {
+                        windows[sfi].isMinimized = false;
+                        windows[sfi].animType = ANIM_RESTORE;
+                        windows[sfi].animProgress = 1;
+                    }
+                }
+                focusWindow(smFocus);
+            }
+
+            # Render frame
+            render();
+
+            # ~60 FPS target
+            Timer.sleep(16);
+        }
+    }
+
+    # Animated boot splash screen
+    private static func showSplash() -> void {
+        int cx = screenW / 2;
+        int cy = screenH / 2;
+        int totalFrames = 60;  # ~1 second at 60fps
+
+        for (int frame = 0; frame < totalFrames; frame++) {
+            # Black background
+            Framebuffer.fillRect(0, 0, screenW, screenH, 0x000000FF);
+
+            # Fade progress: 0→255 over first half, stay 255 for second half
+            int alpha = frame * 255 / (totalFrames / 2);
+            if (alpha > 255) alpha = 255;
+
+            # Star field appears gradually
+            int starCount = frame * 2;
+            if (starCount > 80) starCount = 80;
+            for (int s = 0; s < starCount; s++) {
+                int hash = (s * 2654435761) & 0xFFFFFF;
+                int sx = hash % screenW;
+                int sy = (hash / screenW) % screenH;
+                int brightness = 80 + (hash & 0x7F);
+                color32 starColor = (brightness << 24) | (brightness << 16) | (brightness << 8) | 0xFF;
+                Framebuffer.plotPixel(sx, sy, starColor);
+            }
+
+            # Logo: expanding circle
+            int logoRadius = 4 + frame * 30 / totalFrames;
+            color32 ringColor = 0x5B8CFFFF;
+            Framebuffer.drawCircle(cx, cy - 30, logoRadius, ringColor);
+            # Inner dot
+            if (frame > 10) {
+                Framebuffer.fillCircle(cx, cy - 30, 4, ringColor);
+            }
+
+            # Text fade in at frame 20+
+            if (frame >= 20) {
+                string name = "StratOS";
+                int nameW = name.length * 8;
+                TextRender.drawText(name, cx - nameW / 2, cy + 12, 0xC8D0E0FF);
+            }
+
+            # Subtitle at frame 35+
+            if (frame >= 35) {
+                string sub = "The Cosmic Desktop";
+                int subW = sub.length * 8;
+                TextRender.drawText(sub, cx - subW / 2, cy + 32, 0x6B7280FF);
+            }
+
+            # Loading bar at frame 15+
+            if (frame >= 15) {
+                int barW = 200;
+                int barH = 4;
+                int barX = cx - barW / 2;
+                int barY = cy + 60;
+                # Background
+                Framebuffer.fillRect(barX, barY, barW, barH, 0x30363DFF);
+                # Fill
+                int fillW = (frame - 15) * barW / (totalFrames - 15);
+                if (fillW > barW) fillW = barW;
+                Framebuffer.fillRect(barX, barY, fillW, barH, 0x5B8CFFFF);
+            }
+
+            Framebuffer.present();
+            Timer.sleep(16);
+        }
+
+        # Brief hold on completed splash
+        Timer.sleep(300);
+    }
+
+    # ========================================================================
+    # Window Management
+    # ========================================================================
+
+    # Create a new window
+    public static func createWindow(string title, int x, int y, int w, int h, string appType) -> int {
+        int id = nextWindowId++;
+
+        AppWindow win = {
+            id: id,
+            title: title,
+            x: x,
+            y: y,
+            width: w,
+            height: h,
+            minWidth: 200,
+            minHeight: 150,
+            isMaximized: false,
+            isMinimized: false,
+            isFocused: true,
+            isClosing: false,
+            appType: appType,
+            savedX: x,
+            savedY: y,
+            savedWidth: w,
+            savedHeight: h,
+            snapState: SnapState.NONE
+        };
+
+        # Unfocus previous window
+        if (focusedWindowId >= 0) {
+            for (int i = 0; i < windows.length; i++) {
+                if (windows[i].id == focusedWindowId) {
+                    windows[i].isFocused = false;
+                }
+            }
+        }
+
+        windows.add(win);
+        focusedWindowId = id;
+
+        # Add to taskbar
+        Taskbar.addApp(id, title, appType);
+        Taskbar.setActive(id);
+
+        # Window open sound
+        Speaker.chimeOpen();
+
+        return id;
+    }
+
+    # Close a window
+    public static func closeWindow(int id) -> void {
+        # Window close sound
+        Speaker.chimeClose();
+
+        for (int i = 0; i < windows.length; i++) {
+            AppWindow win = windows[i];
+            if (win.id == id) {
+                windows.removeAt(i);
+                Taskbar.removeApp(id);
+
+                # Focus the next window
+                if (windows.length > 0) {
+                    focusWindow(windows[windows.length - 1].id);
+                } else {
+                    focusedWindowId = -1;
+                    Taskbar.setActive(-1);
+                }
+                break;
+            }
+        }
+    }
+
+    # Focus a window (bring to front)
+    public static func focusWindow(int id) -> void {
+        int idx = -1;
+        for (int i = 0; i < windows.length; i++) {
+            windows[i].isFocused = (windows[i].id == id);
+            if (windows[i].id == id) idx = i;
+        }
+
+        # Move to end of list (top of z-order)
+        if (idx >= 0 && idx < windows.length - 1) {
+            AppWindow w = windows[idx];
+            windows.removeAt(idx);
+            w.isFocused = true;
+            windows.add(w);
+        }
+
+        focusedWindowId = id;
+        Taskbar.setActive(id);
+    }
+
+    # Maximize a window
+    public static func maximizeWindow(int id) -> void {
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].id == id) {
+                if (windows[i].isMaximized) {
+                    # Restore
+                    windows[i].x = windows[i].savedX;
+                    windows[i].y = windows[i].savedY;
+                    windows[i].width = windows[i].savedWidth;
+                    windows[i].height = windows[i].savedHeight;
+                    windows[i].isMaximized = false;
+                    windows[i].snapState = SnapState.NONE;
+                } else {
+                    # Save current position
+                    windows[i].savedX = windows[i].x;
+                    windows[i].savedY = windows[i].y;
+                    windows[i].savedWidth = windows[i].width;
+                    windows[i].savedHeight = windows[i].height;
+                    # Maximize
+                    windows[i].x = 0;
+                    windows[i].y = Taskbar.getContentTop();
+                    windows[i].width = screenW;
+                    windows[i].height = Taskbar.getUsableHeight();
+                    windows[i].isMaximized = true;
+                    windows[i].snapState = SnapState.MAXIMIZED;
+                }
+                break;
+            }
+        }
+    }
+
+    # Minimize a window (animated shrink to taskbar)
+    public static func minimizeWindow(int id) -> void {
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].id == id) {
+                if (windows[i].isMinimized) {
+                    # Restoring — start restore animation
+                    windows[i].isMinimized = false;
+                    windows[i].animType = ANIM_RESTORE;
+                    windows[i].animProgress = 1;
+                    focusWindow(id);
+                } else {
+                    # Minimizing — start minimize animation
+                    windows[i].animType = ANIM_MINIMIZE;
+                    windows[i].animProgress = 1;
+                    # Focus next visible window
+                    for (int j = windows.length - 1; j >= 0; j--) {
+                        if (!windows[j].isMinimized && windows[j].id != id) {
+                            if (windows[j].animType != ANIM_MINIMIZE) {
+                                focusWindow(windows[j].id);
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    # Snap a window to a screen region
+    public static func snapWindow(int id, int snapState) -> void {
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].id == id) {
+                # Save current if not already snapped
+                if (windows[i].snapState == SnapState.NONE) {
+                    windows[i].savedX = windows[i].x;
+                    windows[i].savedY = windows[i].y;
+                    windows[i].savedWidth = windows[i].width;
+                    windows[i].savedHeight = windows[i].height;
+                }
+
+                int usableH = Taskbar.getUsableHeight();
+                int halfW = screenW / 2;
+                int halfH = usableH / 2;
+
+                switch (snapState) {
+                    case SnapState.LEFT:
+                        windows[i].x = 0;
+                        windows[i].y = Taskbar.getContentTop();
+                        windows[i].width = halfW;
+                        windows[i].height = usableH;
+                        break;
+                    case SnapState.RIGHT:
+                        windows[i].x = halfW;
+                        windows[i].y = Taskbar.getContentTop();
+                        windows[i].width = halfW;
+                        windows[i].height = usableH;
+                        break;
+                    case SnapState.TOP_LEFT:
+                        windows[i].x = 0;
+                        windows[i].y = Taskbar.getContentTop();
+                        windows[i].width = halfW;
+                        windows[i].height = halfH;
+                        break;
+                    case SnapState.TOP_RIGHT:
+                        windows[i].x = halfW;
+                        windows[i].y = Taskbar.getContentTop();
+                        windows[i].width = halfW;
+                        windows[i].height = halfH;
+                        break;
+                    case SnapState.BOTTOM_LEFT:
+                        windows[i].x = 0;
+                        windows[i].y = Taskbar.getContentTop() + halfH;
+                        windows[i].width = halfW;
+                        windows[i].height = halfH;
+                        break;
+                    case SnapState.BOTTOM_RIGHT:
+                        windows[i].x = halfW;
+                        windows[i].y = Taskbar.getContentTop() + halfH;
+                        windows[i].width = halfW;
+                        windows[i].height = halfH;
+                        break;
+                    case SnapState.MAXIMIZED:
+                        maximizeWindow(id);
+                        return;
+                    case SnapState.NONE:
+                        # Restore
+                        windows[i].x = windows[i].savedX;
+                        windows[i].y = windows[i].savedY;
+                        windows[i].width = windows[i].savedWidth;
+                        windows[i].height = windows[i].savedHeight;
+                        break;
+                }
+
+                windows[i].snapState = snapState;
+                windows[i].isMaximized = (snapState == SnapState.MAXIMIZED);
+                break;
+            }
+        }
+    }
+
+    # Take a screenshot — flash effect + save metadata to VFS
+    public static func takeScreenshot() -> void {
+        screenshotFlash = 8;    # Flash for 8 frames
+        screenshotCount = screenshotCount + 1;
+        Speaker.click();
+
+        # Save screenshot metadata file (actual pixels can't fit in string VFS)
+        int hrs = Timer.getRtcHours();
+        int mins = Timer.getRtcMinutes();
+        int secs = Timer.getRtcSeconds();
+        int day = Timer.getRtcDay();
+        int month = Timer.getRtcMonth();
+        int year = Timer.getRtcYear();
+
+        string hStr = "";
+        if (hrs < 10) { hStr = "0${hrs}"; } else { hStr = "${hrs}"; }
+        string mStr = "";
+        if (mins < 10) { mStr = "0${mins}"; } else { mStr = "${mins}"; }
+        string sStr = "";
+        if (secs < 10) { sStr = "0${secs}"; } else { sStr = "${secs}"; }
+
+        string filename = "/home/pictures/screenshot_${screenshotCount}.txt";
+        string content = "Screenshot #${screenshotCount} - ${hStr}:${mStr}:${sStr} ${month}/${day}/20${year}";
+        VFS.write(filename, content);
+
+        Speaker.click();
+        Toast.info("Screenshot saved: screenshot_${screenshotCount}");
+    }
+
+    # Auto-tile all visible windows in a grid layout
+    public static func autoTileWindows() -> void {
+        # Count visible (non-minimized) windows
+        int count = 0;
+        for (int i = 0; i < windows.length; i++) {
+            if (!windows[i].isMinimized) {
+                count = count + 1;
+            }
+        }
+        if (count == 0) return;
+
+        int usableH = Taskbar.getUsableHeight();
+        int gap = 4;
+
+        # Determine grid dimensions
+        int cols = 1;
+        int rows = 1;
+        if (count == 1) {
+            cols = 1;
+            rows = 1;
+        } elif (count == 2) {
+            cols = 2;
+            rows = 1;
+        } elif (count <= 4) {
+            cols = 2;
+            rows = 2;
+        } elif (count <= 6) {
+            cols = 3;
+            rows = 2;
+        } elif (count <= 9) {
+            cols = 3;
+            rows = 3;
+        } else {
+            cols = 4;
+            rows = (count + 3) / 4;
+        }
+
+        int cellW = screenW / cols;
+        int cellH = usableH / rows;
+        int idx = 0;
+
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].isMinimized) continue;
+
+            int col = idx % cols;
+            int row = idx / cols;
+
+            # Save original position if not already snapped
+            if (windows[i].snapState == SnapState.NONE) {
+                windows[i].savedX = windows[i].x;
+                windows[i].savedY = windows[i].y;
+                windows[i].savedWidth = windows[i].width;
+                windows[i].savedHeight = windows[i].height;
+            }
+
+            windows[i].x = col * cellW + gap;
+            windows[i].y = Taskbar.getContentTop() + row * cellH + gap;
+            windows[i].width = cellW - gap * 2;
+            windows[i].height = cellH - gap * 2;
+            windows[i].isMaximized = false;
+            windows[i].snapState = SnapState.NONE;
+
+            idx = idx + 1;
+        }
+    }
+
+    # Minimize all windows (Show Desktop toggle)
+    # If all are minimized, restore them
+    private static func showDesktop() -> void {
+        # Check if all windows are already minimized
+        bool allMinimized = true;
+        for (int i = 0; i < windows.length; i++) {
+            if (!windows[i].isMinimized) {
+                allMinimized = false;
+                break;
+            }
+        }
+
+        if (allMinimized) {
+            # Restore all
+            for (int i = 0; i < windows.length; i++) {
+                windows[i].isMinimized = false;
+                windows[i].animType = ANIM_RESTORE;
+                windows[i].animProgress = 1;
+            }
+            Toast.show("Windows restored", 0);
+        } else {
+            # Minimize all
+            for (int i = 0; i < windows.length; i++) {
+                if (!windows[i].isMinimized) {
+                    windows[i].animType = ANIM_MINIMIZE;
+                    windows[i].animProgress = 1;
+                }
+            }
+            focusedWindowId = -1;
+            Toast.show("Show Desktop", 0);
+        }
+    }
+
+    # ========================================================================
+    # Input Processing
+    # ========================================================================
+
+    private static func processInput() -> void {
+        # Keyboard shortcuts
+        while (Keyboard.hasKey()) {
+            KeyEvent event = Keyboard.pollKey();
+            if (!event.pressed) continue;
+
+            # Screensaver dismisses on any keypress
+            if (Screensaver.isActive()) {
+                Screensaver.dismiss();
+                continue;
+            }
+
+            # Lock screen intercepts ALL input when active
+            if (LockScreen.isActive()) {
+                LockScreen.processKey(event);
+                continue;
+            }
+
+            # Shortcuts overlay intercepts all input when visible
+            if (ShortcutsOverlay.isVisible()) {
+                ShortcutsOverlay.processKey(event);
+                continue;
+            }
+
+            # Any key activity resets idle timers
+            LockScreen.resetIdle();
+            Screensaver.resetIdle();
+
+            # Super key: toggle app launcher
+            if (event.scancode == KEY_SUPER_L || event.scancode == KEY_SUPER_R) {
+                Launcher.toggle();
+                continue;
+            }
+
+            # If launcher is visible, route keys to it
+            if (Launcher.isVisible()) {
+                string appChoice = Launcher.processKey(event);
+                if (appChoice != "") {
+                    launchApp(appChoice);
+                }
+                continue;
+            }
+
+            # Escape — forward to focused app (never exits desktop)
+            if (event.scancode == 1) {
+                forwardKeyToApp(focusedWindowId, event);
+                continue;
+            }
+
+            # Alt key shortcuts
+            if (event.alt) {
+                if (event.scancode == KEY_LEFT) {
+                    snapWindow(focusedWindowId, SnapState.LEFT);
+                } elif (event.scancode == KEY_RIGHT) {
+                    snapWindow(focusedWindowId, SnapState.RIGHT);
+                } elif (event.scancode == KEY_UP) {
+                    maximizeWindow(focusedWindowId);
+                } elif (event.scancode == KEY_DOWN) {
+                    snapWindow(focusedWindowId, SnapState.NONE);
+                } elif (event.scancode == KEY_F4) {
+                    closeWindow(focusedWindowId);
+                } elif (event.scancode == KEY_TAB) {
+                    cycleFocus();
+                }
+                continue;
+            }
+
+            # Ctrl+W: cycle wallpaper
+            if (event.ctrl && event.ascii == 'w') {
+                Desktop.nextWallpaper();
+                continue;
+            }
+
+            # Ctrl+B: cycle UI theme (Dark/Light/Ocean/Forest)
+            if (event.ctrl && event.ascii == 'b') {
+                Theme.cycle();
+                Toast.show("Theme: " + Theme.getThemeName(), 0);
+                continue;
+            }
+
+            # Ctrl+T: open new terminal window
+            if (event.ctrl && event.ascii == 't') {
+                createWindow("Terminal", 80 + (nextWindowId * 20) % 200, 60 + (nextWindowId * 15) % 150, 800, 500, "terminal");
+                continue;
+            }
+
+            # Ctrl+F3: drop to TTY shell (scancode 61 = F3)
+            if (event.ctrl && event.scancode == 61) {
+                desktopRunning = false;
+                return;
+            }
+
+            # Ctrl+F1: lock screen (scancode 59 = F1)
+            if (event.ctrl && event.scancode == 59) {
+                LockScreen.lock();
+                continue;
+            }
+
+            # Ctrl+Q: close focused window
+            if (event.ctrl && event.ascii == 'q') {
+                if (focusedWindowId >= 0) {
+                    closeWindow(focusedWindowId);
+                }
+                continue;
+            }
+
+            # Ctrl+G: auto-tile all visible windows in a grid
+            if (event.ctrl && event.ascii == 'g') {
+                autoTileWindows();
+                continue;
+            }
+
+            # Ctrl+D: show desktop (minimize all windows)
+            if (event.ctrl && event.ascii == 'd') {
+                showDesktop();
+                continue;
+            }
+
+            # Ctrl+N: toggle notification history panel
+            if (event.ctrl && event.ascii == 'n') {
+                Toast.togglePanel();
+                continue;
+            }
+
+            # Ctrl+/: toggle keyboard shortcuts overlay (scancode 53 = '/')
+            if (event.ctrl && event.scancode == 53) {
+                ShortcutsOverlay.toggle();
+                continue;
+            }
+
+            # Ctrl+P: take screenshot (visual flash effect)
+            if (event.ctrl && event.ascii == 'p') {
+                takeScreenshot();
+                continue;
+            }
+
+            # Ctrl+F4: toggle taskbar position (top/bottom) — scancode 62 = F4
+            if (event.ctrl && event.scancode == 62) {
+                Taskbar.togglePosition();
+                Framebuffer.invalidateWallpaper();
+                if (Taskbar.isAtTop()) {
+                    Toast.show("Taskbar: Top", 0);
+                } else {
+                    Toast.show("Taskbar: Bottom", 0);
+                }
+                continue;
+            }
+
+            # If notification panel is visible, route keys to it
+            if (Toast.isPanelVisible()) {
+                Toast.processPanelKey(event);
+                continue;
+            }
+
+            # Filter modifier-only keypresses — don't forward Ctrl/Shift/Alt/CapsLock alone to apps
+            if (event.ascii == 0 && (event.scancode == 29 || event.scancode == 42 || event.scancode == 54 || event.scancode == 56 || event.scancode == 58)) {
+                continue;
+            }
+
+            # Delete key on selected desktop icon (scancode 83 = Delete)
+            if (event.scancode == 83 && Desktop.getSelectedIcon() >= 0 && focusedWindowId < 0) {
+                Desktop.removeDesktopIcon(Desktop.getSelectedIcon());
+                Desktop.setSelectedIcon(-1);
+                continue;
+            }
+
+            # Forward key to focused window's app
+            forwardKeyToApp(focusedWindowId, event);
+        }
+
+        # Process mouse events from PS/2 driver
+        while (Mouse.hasEvent()) {
+            MouseEvent mev = Mouse.pollEvent();
+            mouseX = mev.x;
+            mouseY = mev.y;
+
+            # Any mouse activity resets idle timers
+            LockScreen.resetIdle();
+            Screensaver.resetIdle();
+
+            if (mev.leftBtn && !mouseDown) {
+                # Mouse button just pressed
+                mouseDown = true;
+                # Close context menu if clicking outside it
+                if (contextMenuVisible) {
+                    if (mouseX >= contextMenuX && mouseX < contextMenuX + CONTEXT_MENU_W &&
+                        mouseY >= contextMenuY && mouseY < contextMenuY + CONTEXT_MENU_ITEMS * CONTEXT_MENU_ITEM_H) {
+                        # Click inside context menu — handle the item
+                        handleContextMenuClick(mouseX, mouseY);
+                    }
+                    contextMenuVisible = false;
+                } else {
+                    handleMouseDown(mouseX, mouseY);
+                }
+            } elif (!mev.leftBtn && mouseDown) {
+                # Mouse button just released
+                mouseDown = false;
+                handleMouseUp(mouseX, mouseY);
+            } elif (mouseDown && (mev.deltaX != 0 || mev.deltaY != 0)) {
+                # Dragging
+                handleMouseDrag(mouseX, mouseY);
+            }
+
+            # Right-click detection
+            if (mev.rightBtn && !mouseRightDown) {
+                mouseRightDown = true;
+                handleRightClick(mouseX, mouseY);
+            } elif (!mev.rightBtn && mouseRightDown) {
+                mouseRightDown = false;
+            }
+        }
+
+        # Also update cursor from raw mouse position even if no events queued
+        mouseX = Mouse.getX();
+        mouseY = Mouse.getY();
+    }
+
+    # ========================================================================
+    # Mouse Interaction
+    # ========================================================================
+
+    # Handle mouse button press — focus/drag/close window, or click taskbar
+    private static func handleMouseDown(int mx, int my) -> void {
+        # If launcher is open, route clicks to it
+        if (Launcher.isVisible()) {
+            string appChoice = Launcher.processClick(mx, my, screenW, screenH);
+            if (appChoice != "") {
+                launchApp(appChoice);
+            }
+            return;
+        }
+
+        # Check volume popup click first (it extends above taskbar)
+        if (Taskbar.isVolumePopupVisible()) {
+            bool handled = Taskbar.handleVolumePopupClick(mx, my);
+            if (handled) return;
+        }
+
+        # Check if clicking in taskbar area
+        bool inTaskbar = false;
+        if (Taskbar.isAtTop()) {
+            if (my < TASKBAR_HEIGHT) { inTaskbar = true; }
+        } else {
+            if (my >= screenH - TASKBAR_HEIGHT) { inTaskbar = true; }
+        }
+        if (inTaskbar) {
+            Taskbar.handleClick(mx, my);
+            return;
+        }
+
+        # Check windows from front to back (last in list = front)
+        for (int i = windows.length - 1; i >= 0; i--) {
+            AppWindow win = windows[i];
+            if (win.isMinimized) continue;
+
+            int titleH = Theme.TITLEBAR_HEIGHT;
+            int winBottom = win.y + win.height + titleH;
+            int winRight = win.x + win.width;
+
+            # Edge resize detection (before title bar/buttons)
+            if (!win.isMaximized) {
+                int edge = 0;
+                if (mx >= win.x - RESIZE_BORDER && mx < win.x + RESIZE_BORDER &&
+                    my >= win.y - RESIZE_BORDER && my < winBottom + RESIZE_BORDER) {
+                    edge = edge | 1;  # Left edge
+                }
+                if (mx >= winRight - RESIZE_BORDER && mx < winRight + RESIZE_BORDER &&
+                    my >= win.y - RESIZE_BORDER && my < winBottom + RESIZE_BORDER) {
+                    edge = edge | 2;  # Right edge
+                }
+                if (my >= win.y - RESIZE_BORDER && my < win.y + RESIZE_BORDER &&
+                    mx >= win.x - RESIZE_BORDER && mx < winRight + RESIZE_BORDER) {
+                    edge = edge | 4;  # Top edge
+                }
+                if (my >= winBottom - RESIZE_BORDER && my < winBottom + RESIZE_BORDER &&
+                    mx >= win.x - RESIZE_BORDER && mx < winRight + RESIZE_BORDER) {
+                    edge = edge | 8;  # Bottom edge
+                }
+
+                if (edge != 0) {
+                    focusWindow(win.id);
+                    isResizing = true;
+                    resizeEdge = edge;
+                    dragWindowId = win.id;
+                    return;
+                }
+            }
+
+            int btnSize = 12;
+            int btnPadding = 8;
+            int btnY = win.y + (titleH - btnSize) / 2;
+
+            # Check close button (rightmost)
+            int closeX = win.x + win.width - btnSize - btnPadding;
+            if (mx >= closeX && mx <= closeX + btnSize && my >= btnY && my <= btnY + btnSize) {
+                closeWindow(win.id);
+                return;
+            }
+
+            # Check maximize button (middle)
+            int maxX = closeX - btnSize - btnPadding;
+            if (mx >= maxX && mx <= maxX + btnSize && my >= btnY && my <= btnY + btnSize) {
+                maximizeWindow(win.id);
+                return;
+            }
+
+            # Check minimize button (leftmost of the three)
+            int minX = maxX - btnSize - btnPadding;
+            if (mx >= minX && mx <= minX + btnSize && my >= btnY && my <= btnY + btnSize) {
+                minimizeWindow(win.id);
+                return;
+            }
+
+            # Check title bar (drag handle) — excluding button area
+            if (mx >= win.x && mx < minX && my >= win.y && my < win.y + titleH) {
+                focusWindow(win.id);
+
+                # Double-click detection — maximize/restore
+                int now = Timer.getTicks();
+                int dx = mx - lastClickX;
+                int dy = my - lastClickY;
+                if (dx < 0) dx = -dx;
+                if (dy < 0) dy = -dy;
+                if ((now - lastClickTime) < DOUBLE_CLICK_MS && dx < DOUBLE_CLICK_DIST && dy < DOUBLE_CLICK_DIST) {
+                    maximizeWindow(win.id);
+                    lastClickTime = 0;
+                    return;
+                }
+                lastClickTime = now;
+                lastClickX = mx;
+                lastClickY = my;
+
+                dragWindowId = win.id;
+                dragOffsetX = mx - win.x;
+                dragOffsetY = my - win.y;
+                return;
+            }
+
+            # Check window body — forward click to app content
+            if (mx >= win.x && mx < win.x + win.width && my >= win.y && my < win.y + win.height + titleH) {
+                focusWindow(win.id);
+                # Calculate content-relative coordinates
+                int contentX = win.x + 1;
+                int contentY = win.y + titleH + 1;
+                int contentW = win.width - 2;
+                int contentH = win.height - 2;
+                if (mx >= contentX && my >= contentY && mx < contentX + contentW && my < contentY + contentH) {
+                    int relX = mx - contentX;
+                    int relY = my - contentY;
+                    forwardClickToApp(win.id, relX, relY, contentW, contentH);
+                }
+                return;
+            }
+        }
+
+        # Click on desktop (no window hit) — check icons with double-click-to-launch
+        int iconIdx = Desktop.hitTestIconIdx(mx, my);
+        if (iconIdx >= 0) {
+            # Deselect any focused window — desktop icon is now the focus target
+            focusedWindowId = -1;
+
+            # Double-click detection — launch app
+            int now = Timer.getTicks();
+            int dx2 = mx - lastClickX;
+            int dy2 = my - lastClickY;
+            if (dx2 < 0) dx2 = -dx2;
+            if (dy2 < 0) dy2 = -dy2;
+            if ((now - lastClickTime) < DOUBLE_CLICK_MS && dx2 < DOUBLE_CLICK_DIST && dy2 < DOUBLE_CLICK_DIST) {
+                string appType = Desktop.getIconAppType(iconIdx);
+                launchApp(appType);
+                lastClickTime = 0;
+                Desktop.setSelectedIcon(-1);
+                Desktop.setDragIdx(-1);
+                return;
+            }
+            lastClickTime = now;
+            lastClickX = mx;
+            lastClickY = my;
+
+            # Single click — select and start potential drag
+            Desktop.setSelectedIcon(iconIdx);
+            Desktop.setDragIdx(iconIdx);
+            Desktop.setDragX(Desktop.getIconPixelX(iconIdx));
+            Desktop.setDragY(Desktop.getIconPixelY(iconIdx));
+            return;
+        }
+        Desktop.setSelectedIcon(-1);
+        focusedWindowId = -1;
+    }
+
+    # Handle mouse button release
+    private static func handleMouseUp(int mx, int my) -> void {
+        # Clear snap preview
+        snapPreviewVisible = false;
+
+        # Desktop icon drop — snap to grid
+        if (Desktop.getDragIdx() >= 0) {
+            int newCol = Desktop.snapToGridCol(mx);
+            int newRow = Desktop.snapToGridRow(my);
+            Desktop.moveIconToGrid(Desktop.getDragIdx(), newCol, newRow);
+            Desktop.setDragIdx(-1);
+        }
+
+        # Stop dragging window
+        if (dragWindowId != -1) {
+            # Check for snap zones
+            if (mx <= SNAP_THRESHOLD) {
+                snapWindow(dragWindowId, SnapState.LEFT);
+            } elif (mx >= screenW - SNAP_THRESHOLD) {
+                snapWindow(dragWindowId, SnapState.RIGHT);
+            } elif (my <= SNAP_THRESHOLD) {
+                maximizeWindow(dragWindowId);
+            }
+            dragWindowId = -1;
+        }
+        isResizing = false;
+    }
+
+    # Handle mouse drag — move or resize windows, drag desktop icons
+    private static func handleMouseDrag(int mx, int my) -> void {
+        # Volume slider drag — handle before anything else
+        if (Taskbar.isVolumePopupVisible()) {
+            Taskbar.handleVolumePopupClick(mx, my);
+        }
+
+        # Desktop icon drag
+        if (Desktop.getDragIdx() >= 0) {
+            Desktop.setDragX(mx - ICON_SIZE / 2);
+            Desktop.setDragY(my - ICON_SIZE / 2);
+            return;
+        }
+
+        if (dragWindowId == -1) return;
+
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].id == dragWindowId) {
+                if (isResizing) {
+                    # Resize mode
+                    int titleH = Theme.TITLEBAR_HEIGHT;
+                    int newX = windows[i].x;
+                    int newY = windows[i].y;
+                    int newW = windows[i].width;
+                    int newH = windows[i].height;
+
+                    if ((resizeEdge & 2) != 0) {
+                        # Right edge
+                        newW = mx - windows[i].x;
+                    }
+                    if ((resizeEdge & 8) != 0) {
+                        # Bottom edge
+                        newH = my - windows[i].y - titleH;
+                    }
+                    if ((resizeEdge & 1) != 0) {
+                        # Left edge
+                        int right = windows[i].x + windows[i].width;
+                        newX = mx;
+                        newW = right - mx;
+                    }
+                    if ((resizeEdge & 4) != 0) {
+                        # Top edge
+                        int bottom = windows[i].y + windows[i].height + titleH;
+                        newY = my;
+                        newH = bottom - my - titleH;
+                    }
+
+                    # Enforce minimums
+                    if (newW < windows[i].minWidth) {
+                        if ((resizeEdge & 1) != 0) newX = windows[i].x + windows[i].width - windows[i].minWidth;
+                        newW = windows[i].minWidth;
+                    }
+                    if (newH < windows[i].minHeight) {
+                        if ((resizeEdge & 4) != 0) newY = windows[i].y + windows[i].height + titleH - windows[i].minHeight - titleH;
+                        newH = windows[i].minHeight;
+                    }
+
+                    windows[i].x = newX;
+                    windows[i].y = newY;
+                    windows[i].width = newW;
+                    windows[i].height = newH;
+                    windows[i].snapState = SnapState.NONE;
+                    windows[i].isMaximized = false;
+                } else {
+                    # Move mode
+                    windows[i].x = mx - dragOffsetX;
+                    windows[i].y = my - dragOffsetY;
+
+                    # Clamp to screen
+                    if (windows[i].y < Taskbar.getContentTop()) {
+                        windows[i].y = Taskbar.getContentTop();
+                    }
+                    if (windows[i].y > Taskbar.getContentBottom() - 30) {
+                        windows[i].y = Taskbar.getContentBottom() - 30;
+                    }
+
+                    # Reset snap state when manually dragged
+                    windows[i].snapState = SnapState.NONE;
+
+                    # Update snap preview zone based on cursor position
+                    int usableH = Taskbar.getUsableHeight();
+                    if (mx <= SNAP_THRESHOLD) {
+                        # Left half snap preview
+                        snapPreviewX = 0;
+                        snapPreviewY = Taskbar.getContentTop();
+                        snapPreviewW = screenW / 2;
+                        snapPreviewH = usableH;
+                        snapPreviewVisible = true;
+                    } elif (mx >= screenW - SNAP_THRESHOLD) {
+                        # Right half snap preview
+                        snapPreviewX = screenW / 2;
+                        snapPreviewY = Taskbar.getContentTop();
+                        snapPreviewW = screenW / 2;
+                        snapPreviewH = usableH;
+                        snapPreviewVisible = true;
+                    } elif (my <= SNAP_THRESHOLD) {
+                        # Maximize preview
+                        snapPreviewX = 0;
+                        snapPreviewY = Taskbar.getContentTop();
+                        snapPreviewW = screenW;
+                        snapPreviewH = usableH;
+                        snapPreviewVisible = true;
+                    } else {
+                        snapPreviewVisible = false;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    # Cycle focus through windows
+    private static func cycleFocus() -> void {
+        if (windows.length < 2) return;
+
+        int currentIdx = -1;
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].id == focusedWindowId) {
+                currentIdx = i;
+                break;
+            }
+        }
+
+        int nextIdx = (currentIdx + 1) % windows.length;
+        focusWindow(windows[nextIdx].id);
+    }
+
+    # Forward key event to an application
+    private static func forwardKeyToApp(int windowId, KeyEvent event) -> void {
+        # Dispatch to the appropriate app based on window type
+        for (int i = 0; i < windows.length; i++) {
+            AppWindow win = windows[i];
+            if (win.id == windowId) {
+                # Dispatch input to the appropriate app
+                if (win.appType == "terminal") {
+                    TerminalApp.processKey(event);
+                } elif (win.appType == "calculator") {
+                    CalculatorApp.processKey(event);
+                } elif (win.appType == "settings") {
+                    SettingsApp.processKey(event);
+                } elif (win.appType == "explorer") {
+                    ExplorerApp.processKey(event);
+                } elif (win.appType == "editor") {
+                    EditorApp.processKey(event);
+                } elif (win.appType == "browser") {
+                    BrowserApp.processKey(event);
+                } elif (win.appType == "music") {
+                    MusicApp.processKey(event);
+                } elif (win.appType == "notes") {
+                    NotesApp.processKey(event);
+                } elif (win.appType == "sysmon") {
+                    SysMonApp.processKey(event);
+                } elif (win.appType == "help") {
+                    HelpApp.processKey(event);
+                } elif (win.appType == "games") {
+                    GamesApp.processKey(event);
+                    string gameLaunchK = GamesApp.getPendingLaunch();
+                    if (gameLaunchK != "") {
+                        launchApp(gameLaunchK);
+                    }
+                } elif (win.appType == "snake") {
+                    SnakeApp.processKey(event);
+                } elif (win.appType == "viewer3d") {
+                    Viewer3D.processKey(event);
+                } elif (win.appType == "onboarding") {
+                    OnboardingApp.processKey(event);
+                    if (OnboardingApp.isCompleted()) {
+                        closeWindow(win.id);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    # Forward mouse click to an application's content area
+    private static func forwardClickToApp(int windowId, int relX, int relY, int contentW, int contentH) -> void {
+        for (int i = 0; i < windows.length; i++) {
+            AppWindow win = windows[i];
+            if (win.id == windowId) {
+                if (win.appType == "calculator") {
+                    CalculatorApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "settings") {
+                    SettingsApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "explorer") {
+                    ExplorerApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "editor") {
+                    EditorApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "terminal") {
+                    TerminalApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "browser") {
+                    BrowserApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "music") {
+                    MusicApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "notes") {
+                    NotesApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "sysmon") {
+                    SysMonApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "help") {
+                    HelpApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "games") {
+                    GamesApp.processClick(relX, relY, contentW, contentH);
+                    # Check if games launcher wants to launch a game
+                    string gameLaunch = GamesApp.getPendingLaunch();
+                    if (gameLaunch != "") {
+                        launchApp(gameLaunch);
+                    }
+                } elif (win.appType == "snake") {
+                    SnakeApp.processClick(relX, relY, contentW, contentH);
+                } elif (win.appType == "onboarding") {
+                    OnboardingApp.processClick(relX, relY, contentW, contentH);
+                    if (OnboardingApp.isCompleted()) {
+                        closeWindow(win.id);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    # ========================================================================
+    # Right-click Context Menu
+    # ========================================================================
+
+    private static func handleRightClick(int mx, int my) -> void {
+        # Only show context menu on desktop (not on windows or taskbar)
+        bool inTaskbarArea = false;
+        if (Taskbar.isAtTop()) {
+            if (my < TASKBAR_HEIGHT) { inTaskbarArea = true; }
+        } else {
+            if (my >= screenH - TASKBAR_HEIGHT) { inTaskbarArea = true; }
+        }
+        if (inTaskbarArea) return;
+
+        # Check if clicking on a window — forward right-click to explorer
+        for (int i = windows.length - 1; i >= 0; i--) {
+            AppWindow win = windows[i];
+            if (win.isMinimized) continue;
+            int titleH = Theme.TITLEBAR_HEIGHT;
+            if (mx >= win.x && mx < win.x + win.width && my >= win.y && my < win.y + win.height + titleH) {
+                # Forward right-click to explorer if it's an explorer window
+                if (win.appType == "explorer") {
+                    int relX = mx - win.x;
+                    int relY = my - (win.y + titleH);
+                    int contentW = win.width;
+                    int contentH = win.height;
+                    if (relY >= 0) {
+                        ExplorerApp.processRightClick(relX, relY, contentW, contentH);
+                    }
+                }
+                return;
+            }
+        }
+
+        # Show desktop context menu
+        contextMenuX = mx;
+        contextMenuY = my;
+        # Clamp menu to screen edges
+        int menuH = CONTEXT_MENU_ITEMS * CONTEXT_MENU_ITEM_H;
+        if (contextMenuX + CONTEXT_MENU_W > screenW) contextMenuX = screenW - CONTEXT_MENU_W;
+        if (contextMenuY + menuH > Taskbar.getContentBottom()) contextMenuY = Taskbar.getContentBottom() - menuH;
+        contextMenuHover = -1;
+        contextMenuVisible = true;
+    }
+
+    private static func handleContextMenuClick(int mx, int my) -> void {
+        int relY = my - contextMenuY;
+        int clickedItem = relY / CONTEXT_MENU_ITEM_H;
+        if (clickedItem < 0 || clickedItem >= CONTEXT_MENU_ITEMS) return;
+
+        switch (clickedItem) {
+            case 0:
+                # New Terminal
+                launchApp("terminal");
+                break;
+            case 1:
+                # New File (open editor)
+                launchApp("editor");
+                break;
+            case 2:
+                # Open Files
+                launchApp("explorer");
+                break;
+            case 3:
+                # Change Wallpaper
+                Desktop.nextWallpaper();
+                break;
+            case 4:
+                # Settings
+                launchApp("settings");
+                break;
+        }
+    }
+
+    private static func drawContextMenu() -> void {
+        if (!contextMenuVisible) return;
+
+        int menuH = CONTEXT_MENU_ITEMS * CONTEXT_MENU_ITEM_H;
+
+        # Shadow
+        Framebuffer.fillRect(contextMenuX + 3, contextMenuY + 3, CONTEXT_MENU_W, menuH, 0x00000060);
+
+        # Background
+        Framebuffer.fillRoundedRect(contextMenuX, contextMenuY, CONTEXT_MENU_W, menuH, 6, 0x1C2333FF);
+        Framebuffer.drawRoundedRect(contextMenuX, contextMenuY, CONTEXT_MENU_W, menuH, 6, 0x30363DFF);
+
+        # Menu items
+        for (int i = 0; i < CONTEXT_MENU_ITEMS; i++) {
+            int itemY = contextMenuY + i * CONTEXT_MENU_ITEM_H;
+
+            # Hover highlight (check if mouse is over this item)
+            if (mouseX >= contextMenuX && mouseX < contextMenuX + CONTEXT_MENU_W &&
+                mouseY >= itemY && mouseY < itemY + CONTEXT_MENU_ITEM_H) {
+                Framebuffer.fillRect(contextMenuX + 4, itemY + 2, CONTEXT_MENU_W - 8, CONTEXT_MENU_ITEM_H - 4, 0x1F6FEBFF);
+            }
+
+            string label = getContextMenuLabel(i);
+            TextRender.drawText(label, contextMenuX + 12, itemY + 6, 0xE6EDF3FF);
+
+            # Separator line after item 2
+            if (i == 2) {
+                Framebuffer.drawHLine(contextMenuX + 8, itemY + CONTEXT_MENU_ITEM_H - 1, CONTEXT_MENU_W - 16, 0x30363DFF);
+            }
+        }
+    }
+
+    private static func getContextMenuLabel(int idx) -> string {
+        switch (idx) {
+            case 0: return "New Terminal";
+            case 1: return "New File";
+            case 2: return "Open Files";
+            case 3: return "Change Wallpaper";
+            case 4: return "Settings";
+            default: return "";
+        }
+    }
+
+    # ========================================================================
+    # Rendering
+    # ========================================================================
+
+    private static func render() -> void {
+        # If wallpaper cache is stale, re-render and cache it
+        if (Framebuffer.isWallpaperDirty()) {
+            Desktop.drawWallpaper(screenW, screenH, TASKBAR_HEIGHT);
+            Desktop.drawIcons(screenW, screenH, TASKBAR_HEIGHT);
+            Framebuffer.cacheWallpaper();
+        } else {
+            # Fast path: restore cached wallpaper + icons to back buffer
+            Framebuffer.restoreWallpaper();
+        }
+
+        # Desktop clock widget (drawn every frame since time changes)
+        Desktop.drawClockWidget(screenW, screenH);
+
+        # Draw all windows (back to front)
+        for (int i = 0; i < windows.length; i++) {
+            if (windows[i].animProgress > 0) {
+                # Animating — draw scaled version
+                drawWindowAnimated(windows[i]);
+            } else if (!windows[i].isMinimized) {
+                drawWindow(windows[i]);
+            }
+        }
+
+        # Draw snap zone preview (translucent overlay with border)
+        if (snapPreviewVisible) {
+            # Draw semi-transparent fill using horizontal line blending
+            # Only blend every 2nd row for performance
+            for (int sy = snapPreviewY; sy < snapPreviewY + snapPreviewH; sy = sy + 2) {
+                for (int sx = snapPreviewX; sx < snapPreviewX + snapPreviewW; sx = sx + 2) {
+                    Framebuffer.blendPixel(sx, sy, 0x58A6FF20);
+                }
+            }
+            # Bright border
+            int bx = snapPreviewX + 4;
+            int by = snapPreviewY + 4;
+            int bw = snapPreviewW - 8;
+            int bh = snapPreviewH - 8;
+            Framebuffer.drawRoundedRect(bx, by, bw, bh, 8, 0x58A6FFBB);
+            Framebuffer.drawRoundedRect(bx + 1, by + 1, bw - 2, bh - 2, 7, 0x58A6FF60);
+        }
+
+        # Draw taskbar (always on top)
+        Taskbar.draw();
+
+        # Draw app launcher overlay (on top of everything except cursor)
+        Launcher.draw(screenW, screenH);
+
+        # Draw right-click context menu
+        drawContextMenu();
+
+        # Check if explorer wants to open a file in editor
+        string pendingFile = ExplorerApp.getPendingFile();
+        if (pendingFile != "") {
+            ExplorerApp.clearPendingFile();
+            launchApp("editor");
+            EditorApp.openFile(pendingFile);
+        }
+
+        # Update and draw toast notifications
+        Toast.update();
+        Toast.draw(screenW, screenH);
+
+        # Draw notification history panel (if open)
+        Toast.drawPanel(screenW, screenH);
+
+        # Screenshot flash effect
+        if (screenshotFlash > 0) {
+            # White overlay fading away
+            int alpha = screenshotFlash * 30;
+            if (alpha > 255) alpha = 255;
+            color32 flashColor = 0xFFFFFF00 | alpha;
+            for (int fy = 0; fy < screenH; fy = fy + 2) {
+                for (int fx = 0; fx < screenW; fx = fx + 2) {
+                    Framebuffer.blendPixel(fx, fy, flashColor);
+                    Framebuffer.blendPixel(fx + 1, fy, flashColor);
+                    Framebuffer.blendPixel(fx, fy + 1, flashColor);
+                    Framebuffer.blendPixel(fx + 1, fy + 1, flashColor);
+                }
+            }
+            screenshotFlash = screenshotFlash - 1;
+        }
+
+        # Screensaver overlay (under lock screen)
+        Screensaver.draw(screenW, screenH);
+
+        # Lock screen overlay (covers everything)
+        LockScreen.draw(screenW, screenH);
+
+        # Keyboard shortcuts overlay
+        ShortcutsOverlay.draw(screenW, screenH);
+
+        # Draw mouse cursor
+        updateCursorStyle();
+        drawCursor(mouseX, mouseY);
+
+        # Present: copy back buffer to hardware framebuffer
+        Framebuffer.present();
+    }
+
+    # Render a subtle star field on the desktop
+    private static func drawStarField() -> void {
+        # Deterministic "random" star positions using simple hash
+        int starCount = 120;
+        for (int i = 0; i < starCount; i++) {
+            # Simple hash for pseudo-random placement
+            int hash = (i * 2654435761) & 0xFFFFFF;
+            int sx = hash % screenW;
+            int sy = (hash / screenW) % Taskbar.getUsableHeight();
+            if (Taskbar.isAtTop()) {
+                sy = sy + TASKBAR_HEIGHT;
+            }
+
+            # Vary brightness
+            int brightness = 80 + (hash % 176);   # 80-255
+            int alpha = 60 + (hash % 196);         # 60-255
+
+            color32 starColor = (color32)((brightness << 24) | (brightness << 16) | (brightness << 8) | alpha);
+            Framebuffer.blendPixel(sx, sy, starColor);
+
+            # Some brighter stars get a small glow
+            if (brightness > 200) {
+                color32 glowColor = (color32)((brightness << 24) | (brightness << 16) | (brightness << 8) | 30);
+                Framebuffer.blendPixel(sx - 1, sy, glowColor);
+                Framebuffer.blendPixel(sx + 1, sy, glowColor);
+                Framebuffer.blendPixel(sx, sy - 1, glowColor);
+                Framebuffer.blendPixel(sx, sy + 1, glowColor);
+            }
+        }
+    }
+
+    # Draw a window during minimize/restore animation (scaled representation)
+    private static func drawWindowAnimated(AppWindow win) -> void {
+        int titleH = Theme.TITLEBAR_HEIGHT;
+        int progress = win.animProgress;
+
+        # Scale: minimize shrinks from full→nothing, restore grows nothing→full
+        int scale = 0;
+        if (win.animType == ANIM_MINIMIZE) {
+            scale = ANIM_FRAMES - progress;
+        } else {
+            scale = progress;
+        }
+
+        # Target position: center of taskbar
+        int targetX = screenW / 2;
+        int targetY = 0;
+        if (Taskbar.isAtTop()) {
+            targetY = TASKBAR_HEIGHT / 2;
+        } else {
+            targetY = screenH - TASKBAR_HEIGHT / 2;
+        }
+
+        # Interpolate position and size
+        int fullH = win.height + titleH;
+        int renderW = win.width * scale / ANIM_FRAMES;
+        int renderH = fullH * scale / ANIM_FRAMES;
+        int renderX = win.x + (targetX - win.x) * (ANIM_FRAMES - scale) / ANIM_FRAMES;
+        int renderY = win.y + (targetY - win.y) * (ANIM_FRAMES - scale) / ANIM_FRAMES;
+
+        if (renderW < 4) { renderW = 4; }
+        if (renderH < 4) { renderH = 4; }
+
+        # Simplified window: title bar + body + border
+        int renderTitleH = titleH * scale / ANIM_FRAMES;
+        if (renderTitleH < 2) { renderTitleH = 2; }
+
+        # Title bar
+        color32 titleBg = Theme.titleBarActive;
+        if (!win.isFocused) { titleBg = Theme.titleBarInactive; }
+        Framebuffer.fillRect(renderX, renderY, renderW, renderTitleH, titleBg);
+
+        # Window body
+        int bodyH = renderH - renderTitleH;
+        if (bodyH > 0) {
+            Framebuffer.fillRect(renderX, renderY + renderTitleH, renderW, bodyH, Theme.windowBg);
+        }
+
+        # Border
+        color32 borderColor = Theme.windowBorderActive;
+        if (!win.isFocused) { borderColor = Theme.windowBorderInactive; }
+        Framebuffer.drawRect(renderX, renderY, renderW, renderH, borderColor);
+    }
+
+    # Draw a window
+    private static func drawWindow(AppWindow win) -> void {
+        int titleH = Theme.TITLEBAR_HEIGHT;
+        bool focused = win.isFocused;
+
+        # Window shadow — multi-layer for depth
+        int totalH = win.height + titleH;
+        if (focused) {
+            Framebuffer.fillRect(win.x + 6, win.y + 6, win.width + 2, totalH + 2, 0x00000018);
+            Framebuffer.fillRect(win.x + 4, win.y + 5, win.width + 1, totalH + 1, 0x00000030);
+            Framebuffer.fillRect(win.x + 3, win.y + 3, win.width, totalH, 0x00000050);
+        } else {
+            Framebuffer.fillRect(win.x + 3, win.y + 3, win.width, totalH, 0x00000030);
+        }
+
+        # Window body
+        Framebuffer.fillRect(win.x, win.y + titleH, win.width, win.height, Theme.windowBg);
+
+        # Title bar
+        color32 titleBg = focused ? Theme.titleBarActive : Theme.titleBarInactive;
+        Framebuffer.fillRect(win.x, win.y, win.width, titleH, titleBg);
+
+        # Title text
+        int titleTextX = win.x + 12;
+        int titleTextY = win.y + (titleH - TextRender.getCharHeight()) / 2;
+        color32 titleColor = focused ? Theme.titleTextActive : Theme.titleTextInactive;
+        TextRender.drawText(win.title, titleTextX, titleTextY, titleColor);
+
+        # Window control buttons (right side of title bar)
+        int btnSize = 12;
+        int btnY = win.y + (titleH - btnSize) / 2;
+        int btnPadding = 8;
+
+        # Close button (red)
+        int closeX = win.x + win.width - btnSize - btnPadding;
+        Framebuffer.fillCircle(closeX + btnSize / 2, btnY + btnSize / 2, btnSize / 2, Theme.closeButton);
+
+        # Maximize button (green)
+        int maxX = closeX - btnSize - btnPadding;
+        Framebuffer.fillCircle(maxX + btnSize / 2, btnY + btnSize / 2, btnSize / 2, Theme.maximizeButton);
+
+        # Minimize button (amber)
+        int minX = maxX - btnSize - btnPadding;
+        Framebuffer.fillCircle(minX + btnSize / 2, btnY + btnSize / 2, btnSize / 2, Theme.minimizeButton);
+
+        # Window border
+        color32 borderColor = focused ? Theme.windowBorderActive : Theme.windowBorderInactive;
+        Framebuffer.drawRect(win.x, win.y, win.width, win.height + titleH, borderColor);
+
+        # Render app content
+        drawAppContent(win);
+    }
+
+    # Draw the content area of a window based on its app type
+    private static func drawAppContent(AppWindow win) -> void {
+        int contentX = win.x + 1;
+        int contentY = win.y + Theme.TITLEBAR_HEIGHT + 1;
+        int contentW = win.width - 2;
+        int contentH = win.height - 2;
+
+        switch (win.appType) {
+            case "terminal":
+                TerminalApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "calculator":
+                CalculatorApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "settings":
+                SettingsApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "explorer":
+                ExplorerApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "editor":
+                EditorApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "browser":
+                BrowserApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "music":
+                MusicApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "notes":
+                NotesApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "onboarding":
+                OnboardingApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "sysmon":
+                SysMonApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "help":
+                HelpApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "games":
+                GamesApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "snake":
+                SnakeApp.draw(contentX, contentY, contentW, contentH);
+                break;
+            case "viewer3d":
+                Viewer3D.draw(contentX, contentY, contentW, contentH);
+                break;
+            default:
+                # Default content area
+                Framebuffer.fillRect(contentX, contentY, contentW, contentH, Theme.windowBg);
+                break;
+        }
+    }
+
+    # Determine current cursor style based on mouse position
+    private static func updateCursorStyle() -> void {
+        int mx = mouseX;
+        int my = mouseY;
+
+        # If actively dragging a window, show move cursor
+        if (dragWindowId >= 0 && !isResizing) {
+            cursorStyle = CURSOR_MOVE;
+            return;
+        }
+        # If actively resizing, keep the resize cursor
+        if (isResizing) {
+            if (resizeEdge == 1 || resizeEdge == 2) {
+                cursorStyle = CURSOR_RESIZE_H;
+            } elif (resizeEdge == 4 || resizeEdge == 8) {
+                cursorStyle = CURSOR_RESIZE_V;
+            } elif (resizeEdge == 5 || resizeEdge == 10) {
+                cursorStyle = CURSOR_RESIZE_DIAG_NWSE;
+            } elif (resizeEdge == 6 || resizeEdge == 9) {
+                cursorStyle = CURSOR_RESIZE_DIAG_NESW;
+            } else {
+                cursorStyle = CURSOR_RESIZE_H;
+            }
+            return;
+        }
+
+        # Check window edges for resize cursor (top-most first)
+        for (int i = windows.length - 1; i >= 0; i--) {
+            if (windows[i].isMinimized) continue;
+            int wx = windows[i].x;
+            int wy = windows[i].y;
+            int wr = wx + windows[i].width;
+            int wb = wy + windows[i].height;
+            int rb = RESIZE_BORDER;
+
+            # Check if on an edge
+            bool onLeft   = (mx >= wx - rb && mx < wx + rb && my >= wy - rb && my < wb + rb);
+            bool onRight  = (mx >= wr - rb && mx < wr + rb && my >= wy - rb && my < wb + rb);
+            bool onTop    = (my >= wy - rb && my < wy + rb && mx >= wx - rb && mx < wr + rb);
+            bool onBottom = (my >= wb - rb && my < wb + rb && mx >= wx - rb && mx < wr + rb);
+
+            if (onLeft && onTop)     { cursorStyle = CURSOR_RESIZE_DIAG_NWSE; return; }
+            if (onRight && onBottom) { cursorStyle = CURSOR_RESIZE_DIAG_NWSE; return; }
+            if (onRight && onTop)    { cursorStyle = CURSOR_RESIZE_DIAG_NESW; return; }
+            if (onLeft && onBottom)  { cursorStyle = CURSOR_RESIZE_DIAG_NESW; return; }
+            if (onLeft || onRight)   { cursorStyle = CURSOR_RESIZE_H; return; }
+            if (onTop || onBottom)   { cursorStyle = CURSOR_RESIZE_V; return; }
+
+            # Check if inside this window
+            if (mx >= wx && mx < wr && my >= wy && my < wb) {
+                int titleH = 30;
+                # Over title bar close/max/min buttons → pointer
+                if (my < wy + titleH) {
+                    int btnX = wr - 30;
+                    if (mx >= btnX - 60) {
+                        cursorStyle = CURSOR_POINTER;
+                        return;
+                    }
+                    # Title bar area → move
+                    cursorStyle = CURSOR_MOVE;
+                    return;
+                }
+                # Inside content area for text apps → I-beam
+                string appT = windows[i].appType;
+                if (appT == "editor" || appT == "terminal" || appT == "notes") {
+                    cursorStyle = CURSOR_TEXT;
+                    return;
+                }
+                # Inside other apps → arrow
+                cursorStyle = CURSOR_ARROW;
+                return;
+            }
+        }
+
+        # Taskbar area → pointer
+        bool mouseInTaskbar = false;
+        if (Taskbar.isAtTop()) {
+            if (my < TASKBAR_HEIGHT) { mouseInTaskbar = true; }
+        } else {
+            if (my >= screenH - TASKBAR_HEIGHT) { mouseInTaskbar = true; }
+        }
+        if (mouseInTaskbar) {
+            cursorStyle = CURSOR_POINTER;
+            return;
+        }
+
+        # Default: arrow
+        cursorStyle = CURSOR_ARROW;
+    }
+
+    # Draw the mouse cursor with the current style
+    private static func drawCursor(int x, int y) -> void {
+        color32 white = 0xFFFFFFFF;
+        color32 black = 0x000000FF;
+
+        if (cursorStyle == CURSOR_ARROW) {
+            # Standard arrow cursor (12x16 pixels)
+            for (int row = 0; row < 16; row++) {
+                for (int col = 0; col <= row && col < 12; col++) {
+                    if (col == 0 || col == row || row == 15) {
+                        Framebuffer.plotPixel(x + col, y + row, black);
+                    } else {
+                        Framebuffer.plotPixel(x + col, y + row, white);
+                    }
+                }
+            }
+        } elif (cursorStyle == CURSOR_RESIZE_H) {
+            # Horizontal double-arrow: <-->
+            int cy = y;
+            # Left arrow head
+            for (int r = 0; r < 7; r++) {
+                int d = 3 - r;
+                if (d < 0) d = -d;
+                if (d <= 3) {
+                    Framebuffer.plotPixel(x + d, cy - 3 + r, black);
+                    if (d > 0) Framebuffer.plotPixel(x + d - 1, cy - 3 + r, white);
+                }
+            }
+            # Horizontal bar
+            for (int c = 3; c < 13; c++) {
+                Framebuffer.plotPixel(x + c, cy - 1, black);
+                Framebuffer.plotPixel(x + c, cy, white);
+                Framebuffer.plotPixel(x + c, cy + 1, black);
+            }
+            # Right arrow head
+            for (int r = 0; r < 7; r++) {
+                int d = 3 - r;
+                if (d < 0) d = -d;
+                if (d <= 3) {
+                    Framebuffer.plotPixel(x + 15 - d, cy - 3 + r, black);
+                    if (d > 0) Framebuffer.plotPixel(x + 16 - d, cy - 3 + r, white);
+                }
+            }
+        } elif (cursorStyle == CURSOR_RESIZE_V) {
+            # Vertical double-arrow
+            int cx = x;
+            # Top arrow head
+            for (int c = 0; c < 7; c++) {
+                int d = 3 - c;
+                if (d < 0) d = -d;
+                if (d <= 3) {
+                    Framebuffer.plotPixel(cx - 3 + c, y + d, black);
+                    if (d > 0) Framebuffer.plotPixel(cx - 3 + c, y + d - 1, white);
+                }
+            }
+            # Vertical bar
+            for (int r = 3; r < 13; r++) {
+                Framebuffer.plotPixel(cx - 1, y + r, black);
+                Framebuffer.plotPixel(cx,     y + r, white);
+                Framebuffer.plotPixel(cx + 1, y + r, black);
+            }
+            # Bottom arrow head
+            for (int c = 0; c < 7; c++) {
+                int d = 3 - c;
+                if (d < 0) d = -d;
+                if (d <= 3) {
+                    Framebuffer.plotPixel(cx - 3 + c, y + 15 - d, black);
+                    if (d > 0) Framebuffer.plotPixel(cx - 3 + c, y + 16 - d, white);
+                }
+            }
+        } elif (cursorStyle == CURSOR_RESIZE_DIAG_NWSE || cursorStyle == CURSOR_RESIZE_DIAG_NESW) {
+            # Diagonal resize: draw a diagonal line with arrow heads
+            int cx = x + 7;
+            int cy = y + 7;
+            for (int d = -6; d <= 6; d++) {
+                if (cursorStyle == CURSOR_RESIZE_DIAG_NWSE) {
+                    Framebuffer.plotPixel(cx + d, cy + d, white);
+                    Framebuffer.plotPixel(cx + d + 1, cy + d, black);
+                    Framebuffer.plotPixel(cx + d, cy + d + 1, black);
+                } else {
+                    Framebuffer.plotPixel(cx + d, cy - d, white);
+                    Framebuffer.plotPixel(cx + d + 1, cy - d, black);
+                    Framebuffer.plotPixel(cx + d, cy - d - 1, black);
+                }
+            }
+            # Small arrow heads at both ends
+            if (cursorStyle == CURSOR_RESIZE_DIAG_NWSE) {
+                Framebuffer.plotPixel(cx - 6, cy - 5, white);
+                Framebuffer.plotPixel(cx - 5, cy - 6, white);
+                Framebuffer.plotPixel(cx + 6, cy + 5, white);
+                Framebuffer.plotPixel(cx + 5, cy + 6, white);
+            } else {
+                Framebuffer.plotPixel(cx - 6, cy + 5, white);
+                Framebuffer.plotPixel(cx - 5, cy + 6, white);
+                Framebuffer.plotPixel(cx + 6, cy - 5, white);
+                Framebuffer.plotPixel(cx + 5, cy - 6, white);
+            }
+        } elif (cursorStyle == CURSOR_TEXT) {
+            # I-beam cursor
+            int cx = x;
+            int top = y;
+            # Top serif
+            Framebuffer.plotPixel(cx - 2, top, black);
+            Framebuffer.plotPixel(cx - 1, top, white);
+            Framebuffer.plotPixel(cx, top, white);
+            Framebuffer.plotPixel(cx + 1, top, white);
+            Framebuffer.plotPixel(cx + 2, top, black);
+            # Vertical stem
+            for (int r = 1; r < 15; r++) {
+                Framebuffer.plotPixel(cx - 1, top + r, black);
+                Framebuffer.plotPixel(cx,     top + r, white);
+                Framebuffer.plotPixel(cx + 1, top + r, black);
+            }
+            # Bottom serif
+            Framebuffer.plotPixel(cx - 2, top + 15, black);
+            Framebuffer.plotPixel(cx - 1, top + 15, white);
+            Framebuffer.plotPixel(cx, top + 15, white);
+            Framebuffer.plotPixel(cx + 1, top + 15, white);
+            Framebuffer.plotPixel(cx + 2, top + 15, black);
+        } elif (cursorStyle == CURSOR_MOVE) {
+            # Four-way arrow (cross with arrow heads)
+            int cx = x + 7;
+            int cy = y + 7;
+            # Center cross
+            for (int d = -5; d <= 5; d++) {
+                Framebuffer.plotPixel(cx + d, cy, white);
+                Framebuffer.plotPixel(cx, cy + d, white);
+                # Outlines
+                Framebuffer.plotPixel(cx + d, cy - 1, black);
+                Framebuffer.plotPixel(cx + d, cy + 1, black);
+                Framebuffer.plotPixel(cx - 1, cy + d, black);
+                Framebuffer.plotPixel(cx + 1, cy + d, black);
+            }
+            # Arrow heads (4 directions)
+            for (int a = 1; a <= 3; a++) {
+                Framebuffer.plotPixel(cx - 5 + a, cy - a, black);
+                Framebuffer.plotPixel(cx - 5 + a, cy + a, black);
+                Framebuffer.plotPixel(cx + 5 - a, cy - a, black);
+                Framebuffer.plotPixel(cx + 5 - a, cy + a, black);
+                Framebuffer.plotPixel(cx - a, cy - 5 + a, black);
+                Framebuffer.plotPixel(cx + a, cy - 5 + a, black);
+                Framebuffer.plotPixel(cx - a, cy + 5 - a, black);
+                Framebuffer.plotPixel(cx + a, cy + 5 - a, black);
+            }
+        } elif (cursorStyle == CURSOR_POINTER) {
+            # Hand pointer: simplified pointing finger
+            # Index finger pointing up from a fist
+            # Offset so the tip is at the click point
+            int bx = x;
+            int by = y;
+            # Finger (vertical bar at top)
+            for (int r = 0; r < 8; r++) {
+                Framebuffer.plotPixel(bx + 3, by + r, black);
+                Framebuffer.plotPixel(bx + 4, by + r, white);
+                Framebuffer.plotPixel(bx + 5, by + r, white);
+                Framebuffer.plotPixel(bx + 6, by + r, black);
+            }
+            # Palm (wider section below finger)
+            for (int r = 8; r < 14; r++) {
+                Framebuffer.plotPixel(bx + 1, by + r, black);
+                for (int c = 2; c < 10; c++) {
+                    Framebuffer.plotPixel(bx + c, by + r, white);
+                }
+                Framebuffer.plotPixel(bx + 10, by + r, black);
+            }
+            # Bottom edge
+            for (int c = 1; c <= 10; c++) {
+                Framebuffer.plotPixel(bx + c, by + 14, black);
+            }
+        } else {
+            # Fallback: simple arrow
+            for (int row = 0; row < 16; row++) {
+                for (int col = 0; col <= row && col < 12; col++) {
+                    if (col == 0 || col == row || row == 15) {
+                        Framebuffer.plotPixel(x + col, y + row, black);
+                    } else {
+                        Framebuffer.plotPixel(x + col, y + row, white);
+                    }
+                }
+            }
+        }
+    }
+
+    # Update window positions and states
+    private static func updateWindows() -> void {
+        # Remove windows marked for closing
+        int i = 0;
+        while (i < windows.length) {
+            if (windows[i].isClosing) {
+                windows.removeAt(i);
+            } else {
+                i++;
+            }
+        }
+    }
+
+    # Get screen dimensions
+    public static func getScreenWidth() -> int { return screenW; }
+    public static func getScreenHeight() -> int { return screenH; }
+
+    # Launch an app by type — creates a new window for it
+    public static func launchApp(string appType) -> void {
+        string title = Desktop.getAppTitle(appType);
+        int offX = 80 + (nextWindowId * 25) % 200;
+        int offY = 60 + (nextWindowId * 20) % 150;
+        int w = 800;
+        int h = 500;
+        if (appType == "calculator") {
+            w = 340;
+            h = 480;
+        } elif (appType == "settings") {
+            w = 700;
+            h = 500;
+        } elif (appType == "browser") {
+            w = 900;
+            h = 600;
+        } elif (appType == "music") {
+            w = 750;
+            h = 500;
+        } elif (appType == "notes") {
+            w = 700;
+            h = 500;
+        } elif (appType == "sysmon") {
+            w = 800;
+            h = 550;
+        } elif (appType == "help") {
+            w = 700;
+            h = 500;
+        } elif (appType == "games") {
+            w = 600;
+            h = 480;
+        } elif (appType == "snake") {
+            w = 500;
+            h = 520;
+        } elif (appType == "viewer3d") {
+            w = 640;
+            h = 480;
+        }
+        createWindow(title, offX, offY, w, h, appType);
+    }
+}

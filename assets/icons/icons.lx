@@ -1,0 +1,223 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Icon Set — SVG-like procedural icons for StratOS
+// assets/icons/icons.lx
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+
+# Icon sizes
+int ICON_SMALL  = 16;
+int ICON_MEDIUM = 24;
+int ICON_LARGE  = 32;
+
+export class Icons {
+    # ---- Application Icons ----
+
+    # Terminal icon: >_ prompt
+    public static func drawTerminal(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        # Outer box
+        Framebuffer.drawRect(x, y, s, s, color);
+        # > chevron
+        int mx = x + s / 6;
+        int my = y + s / 3;
+        Framebuffer.drawLine(mx, my, mx + s / 4, my + s / 6, color);
+        Framebuffer.drawLine(mx + s / 4, my + s / 6, mx, my + s / 3, color);
+        # _ underscore
+        int ux = mx + s / 3;
+        int uy = y + s * 2 / 3;
+        Framebuffer.drawHLine(ux, uy, s / 3, color);
+    }
+
+    # Editor icon: text lines with cursor
+    public static func drawEditor(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        # Page
+        Framebuffer.drawRect(x + 2, y, s - 4, s, color);
+        # Text lines
+        int lx = x + 5;
+        Framebuffer.drawHLine(lx, y + s / 5, s / 2, color);
+        Framebuffer.drawHLine(lx, y + s * 2 / 5, s * 2 / 3, color);
+        Framebuffer.drawHLine(lx, y + s * 3 / 5, s / 3, color);
+        # Cursor
+        Framebuffer.fillRect(lx + s / 3 + 2, y + s * 3 / 5 - 2, 1, s / 5, 0x5B8CFFFF);
+    }
+
+    # Folder icon
+    public static func drawFolder(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        # Tab
+        Framebuffer.fillRect(x, y + s / 5, s / 3, s / 6, color);
+        # Body
+        Framebuffer.fillRect(x, y + s / 5 + s / 6, s, s - s / 5 - s / 6 - 2, color);
+    }
+
+    # File icon
+    public static func drawFile(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int foldSize = s / 4;
+        # Main body
+        Framebuffer.drawRect(x + 2, y, s - 4 - foldSize, s, color);
+        Framebuffer.drawRect(x + 2, y, s - 4, s, color);
+        # Corner fold
+        int fx = x + s - 2 - foldSize;
+        Framebuffer.drawLine(fx, y, fx, y + foldSize, color);
+        Framebuffer.drawLine(fx, y + foldSize, x + s - 2, y + foldSize, color);
+    }
+
+    # Globe/browser icon
+    public static func drawGlobe(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cx = x + s / 2;
+        int cy = y + s / 2;
+        int r = s / 2 - 2;
+        # Outer circle
+        Framebuffer.drawCircle(cx, cy, r, color);
+        # Horizontal lines
+        Framebuffer.drawHLine(x + 2, cy, s - 4, color);
+        Framebuffer.drawHLine(x + 4, cy - r / 2, s - 8, color);
+        Framebuffer.drawHLine(x + 4, cy + r / 2, s - 8, color);
+        # Vertical meridian
+        Framebuffer.drawVLine(cx, y + 2, s - 4, color);
+    }
+
+    # Music note icon
+    public static func drawMusicNote(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        # Note stem
+        int stemX = x + s * 2 / 3;
+        Framebuffer.drawVLine(stemX, y + s / 6, s * 2 / 3, color);
+        # Note head
+        Framebuffer.fillCircle(stemX - s / 6, y + s * 5 / 6, s / 6, color);
+        # Flag
+        Framebuffer.drawLine(stemX, y + s / 6, stemX + s / 4, y + s / 3, color);
+        Framebuffer.drawLine(stemX + s / 4, y + s / 3, stemX, y + s / 2, color);
+    }
+
+    # Settings gear icon
+    public static func drawGear(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cx = x + s / 2;
+        int cy = y + s / 2;
+        # Outer circle
+        Framebuffer.drawCircle(cx, cy, s / 2 - 2, color);
+        # Inner circle
+        Framebuffer.drawCircle(cx, cy, s / 4, color);
+        # Teeth (simplified as lines)
+        Framebuffer.drawVLine(cx, y, s / 4, color);
+        Framebuffer.drawVLine(cx, y + s - s / 4, s / 4, color);
+        Framebuffer.drawHLine(x, cy, s / 4, color);
+        Framebuffer.drawHLine(x + s - s / 4, cy, s / 4, color);
+    }
+
+    # Package/box icon (for Quantum)
+    public static func drawPackage(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        # Box
+        Framebuffer.drawRect(x + 2, y + s / 4, s - 4, s * 3 / 4 - 2, color);
+        # Top flaps
+        Framebuffer.drawLine(x + 2, y + s / 4, x + s / 2, y, color);
+        Framebuffer.drawLine(x + s / 2, y, x + s - 2, y + s / 4, color);
+        # Center line
+        Framebuffer.drawVLine(x + s / 2, y, s / 4, color);
+    }
+
+    # ---- System Tray Icons ----
+
+    # Volume speaker icon
+    public static func drawSpeaker(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        # Speaker body
+        Framebuffer.fillRect(x + 2, y + s / 3, s / 4, s / 3, color);
+        # Cone
+        Framebuffer.drawLine(x + 2 + s / 4, y + s / 3, x + s / 2, y + s / 6, color);
+        Framebuffer.drawLine(x + 2 + s / 4, y + s * 2 / 3, x + s / 2, y + s * 5 / 6, color);
+        Framebuffer.drawVLine(x + s / 2, y + s / 6, s * 2 / 3, color);
+        # Sound waves
+        Framebuffer.drawCircle(x + s * 2 / 3, y + s / 2, s / 6, color);
+    }
+
+    # Network/wifi icon
+    public static func drawWifi(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cx = x + s / 2;
+        int by = y + s - 4;
+        # Dot at bottom
+        Framebuffer.fillCircle(cx, by, 2, color);
+        # Arcs
+        Framebuffer.drawCircle(cx, by, s / 4, color);
+        Framebuffer.drawCircle(cx, by, s / 2 - 2, color);
+    }
+
+    # Power icon
+    public static func drawPower(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cx = x + s / 2;
+        int cy = y + s / 2;
+        # Circle (gap at top)
+        Framebuffer.drawCircle(cx, cy + 2, s / 2 - 4, color);
+        # Vertical line through gap
+        Framebuffer.drawVLine(cx, y + 2, s / 3, color);
+    }
+
+    # Close X icon
+    public static func drawClose(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        Framebuffer.drawLine(x + 2, y + 2, x + s - 2, y + s - 2, color);
+        Framebuffer.drawLine(x + s - 2, y + 2, x + 2, y + s - 2, color);
+    }
+
+    # Maximize icon (square)
+    public static func drawMaximize(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        Framebuffer.drawRect(x + 3, y + 3, s - 6, s - 6, color);
+        Framebuffer.drawHLine(x + 3, y + 3, s - 6, color);
+        Framebuffer.drawHLine(x + 3, y + 4, s - 6, color);
+    }
+
+    # Minimize icon (horizontal line)
+    public static func drawMinimize(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        Framebuffer.drawHLine(x + 3, y + s - 5, s - 6, color);
+    }
+
+    # Arrow left
+    public static func drawArrowLeft(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cy = y + s / 2;
+        Framebuffer.drawHLine(x + 3, cy, s - 6, color);
+        Framebuffer.drawLine(x + 3, cy, x + s / 3, y + s / 4, color);
+        Framebuffer.drawLine(x + 3, cy, x + s / 3, y + s * 3 / 4, color);
+    }
+
+    # Arrow right
+    public static func drawArrowRight(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cy = y + s / 2;
+        Framebuffer.drawHLine(x + 3, cy, s - 6, color);
+        Framebuffer.drawLine(x + s - 3, cy, x + s * 2 / 3, y + s / 4, color);
+        Framebuffer.drawLine(x + s - 3, cy, x + s * 2 / 3, y + s * 3 / 4, color);
+    }
+
+    # Star icon (StratOS logo)
+    public static func drawStar(int x, int y, int size, color32 color) -> void {
+        int s = size;
+        int cx = x + s / 2;
+        int cy = y + s / 2;
+
+        # Simplified 4-point star
+        # Top
+        Framebuffer.drawLine(cx, y + 2, cx - s / 6, cy, color);
+        Framebuffer.drawLine(cx, y + 2, cx + s / 6, cy, color);
+        # Bottom
+        Framebuffer.drawLine(cx, y + s - 2, cx - s / 6, cy, color);
+        Framebuffer.drawLine(cx, y + s - 2, cx + s / 6, cy, color);
+        # Left
+        Framebuffer.drawLine(x + 2, cy, cx, cy - s / 6, color);
+        Framebuffer.drawLine(x + 2, cy, cx, cy + s / 6, color);
+        # Right
+        Framebuffer.drawLine(x + s - 2, cy, cx, cy - s / 6, color);
+        Framebuffer.drawLine(x + s - 2, cy, cx, cy + s / 6, color);
+    }
+}

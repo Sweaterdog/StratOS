@@ -1,0 +1,573 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// StratOS TUI Installer
+// system/installer/installer.lx
+//
+// Text-based installer shown on first boot or when invoked via `install`
+// command. Guides the user through:
+//   1. Welcome / language selection
+//   2. Disk partitioning (simulated in RAM)
+//   3. Username / hostname / password setup
+//   4. Package selection (desktop, minimal, developer)
+//   5. Installation progress bar
+//   6. Post-install configuration
+//   7. Reboot prompt
+//
+// The installer writes config files to /etc/ in the VFS.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "kernel/core/console.lx";
+import "system/fs/vfs.lx";
+
+# Installer color scheme
+color32 INST_BG          = 0x0D1117FF;
+color32 INST_HEADER_BG   = 0x5B8CFFFF;   # Cosmic blue header
+color32 INST_TEXT         = 0xC8D0E0FF;   # Silver
+color32 INST_HIGHLIGHT   = 0x69F0AEFF;   # Green highlight
+color32 INST_ACCENT       = 0xBB86FCFF;   # Purple accent
+color32 INST_ERROR       = 0xFF5252FF;   # Red
+color32 INST_DIM         = 0x6B7280FF;   # Gray
+color32 INST_PROGRESS    = 0x5B8CFFFF;   # Blue progress bar
+color32 INST_BOX_BORDER  = 0x3B4252FF;   # Box border
+
+# Installer state
+string instUsername = "void";
+string instHostname = "stratos";
+string instPassword = "";
+int instProfile = 0;                     # 0=desktop, 1=minimal, 2=developer
+bool installComplete = false;
+
+export class Installer {
+    # Run the full TUI installer
+    public static func run() -> bool {
+        # Step 1: Welcome screen
+        showWelcome();
+
+        # Step 2: Disk setup (simulated)
+        if (!showDiskSetup()) return false;
+
+        # Step 3: User configuration
+        showUserSetup();
+
+        # Step 4: Package profile selection
+        showProfileSelect();
+
+        # Step 5: Confirmation
+        if (!showConfirmation()) return false;
+
+        # Step 6: Installation with progress
+        showInstallProgress();
+
+        # Step 7: Post-install config writing
+        writeConfiguration();
+
+        # Step 8: Complete
+        showComplete();
+
+        installComplete = true;
+        return true;
+    }
+
+    # ========================================================================
+    # Step 1: Welcome
+    # ========================================================================
+    private static func showWelcome() -> void {
+        clearScreen();
+        drawHeader("Welcome to StratOS", 1, 8);
+
+        int y = 6;
+        printAt(4, y,     "      ____  _             _    ___  ____", INST_ACCENT);
+        printAt(4, y + 1, "     / ___|| |_ _ __ __ _| |_ / _ \\/ ___|", INST_ACCENT);
+        printAt(4, y + 2, "     \\___ \\| __| '__/ _` | __| | | \\___ \\", INST_ACCENT);
+        printAt(4, y + 3, "      ___) | |_| | | (_| | |_| |_| |___) |", INST_ACCENT);
+        printAt(4, y + 4, "     |____/ \\__|_|  \\__,_|\\__|\\___/|____/", INST_ACCENT);
+        printAt(4, y + 6, "         Cosmic Edition v0.1.0", INST_TEXT);
+
+        printAt(4, y + 9,  "  Welcome to the StratOS installer.", INST_TEXT);
+        printAt(4, y + 10, "  This wizard will guide you through setting up", INST_TEXT);
+        printAt(4, y + 11, "  your system.", INST_TEXT);
+
+        printAt(4, y + 14, "  System Requirements:", INST_HIGHLIGHT);
+        printAt(4, y + 15, "    * x86_64 processor", INST_DIM);
+        printAt(4, y + 16, "    * 64 MB RAM (recommended)", INST_DIM);
+        printAt(4, y + 17, "    * 256 MB disk space", INST_DIM);
+
+        drawFooter("[Enter] Continue    [Esc] Cancel");
+        waitForEnter();
+    }
+
+    # ========================================================================
+    # Step 2: Disk Setup (simulated — we're all RAM)
+    # ========================================================================
+    private static func showDiskSetup() -> bool {
+        clearScreen();
+        drawHeader("Disk Configuration", 2, 8);
+
+        int y = 6;
+        printAt(4, y,     "  Detected Storage:", INST_HIGHLIGHT);
+        printAt(4, y + 2, "  DEVICE        SIZE    TYPE", INST_DIM);
+        printAt(4, y + 3, "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", INST_DIM);
+        printAt(4, y + 4, "  /dev/ram0     16 MB   RAM Disk (kernel heap)", INST_TEXT);
+        printAt(4, y + 5, "  /dev/fb0      3 MB    Framebuffer (1024x768x32)", INST_TEXT);
+
+        printAt(4, y + 8,  "  Partition Layout:", INST_HIGHLIGHT);
+        printAt(4, y + 9,  "  MOUNT     SIZE     FS       PURPOSE", INST_DIM);
+        printAt(4, y + 10, "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", INST_DIM);
+        printAt(4, y + 11, "  /         8 MB     ramfs    Root filesystem", INST_TEXT);
+        printAt(4, y + 12, "  /home     4 MB     ramfs    User data", INST_TEXT);
+        printAt(4, y + 13, "  /tmp      2 MB     ramfs    Temporary files", INST_TEXT);
+        printAt(4, y + 14, "  /var      2 MB     ramfs    Variable data", INST_TEXT);
+
+        printAt(4, y + 17, "  NOTE: StratOS currently operates entirely in RAM.", INST_DIM);
+        printAt(4, y + 18, "  All data is volatile and will not persist across reboots.", INST_DIM);
+
+        drawFooter("[Enter] Accept Layout    [Esc] Cancel");
+        return waitForEnterOrEsc();
+    }
+
+    # ========================================================================
+    # Step 3: User Setup
+    # ========================================================================
+    private static func showUserSetup() -> void {
+        clearScreen();
+        drawHeader("User Configuration", 3, 8);
+
+        int y = 6;
+        printAt(4, y,     "  Create your user account:", INST_HIGHLIGHT);
+
+        # Username
+        printAt(4, y + 3, "  Username: ", INST_TEXT);
+        instUsername = readField(16, y + 3, 20, "void");
+
+        # Hostname
+        printAt(4, y + 5, "  Hostname: ", INST_TEXT);
+        instHostname = readField(16, y + 5, 20, "stratos");
+
+        # Password (shown as dots)
+        printAt(4, y + 7, "  Password: ", INST_TEXT);
+        instPassword = readField(16, y + 7, 20, "");
+
+        printAt(4, y + 10, "  Root password will be set to the same value.", INST_DIM);
+
+        printAt(4, y + 13, "  Account Preview:", INST_HIGHLIGHT);
+        printAt(4, y + 14, "    User:     ${instUsername}", INST_TEXT);
+        printAt(4, y + 15, "    Hostname: ${instHostname}", INST_TEXT);
+        printAt(4, y + 16, "    Home:     /home/${instUsername}", INST_TEXT);
+        printAt(4, y + 17, "    Shell:    /system/shell/shell", INST_TEXT);
+
+        drawFooter("[Enter] Continue");
+        waitForEnter();
+    }
+
+    # ========================================================================
+    # Step 4: Profile Selection
+    # ========================================================================
+    private static func showProfileSelect() -> void {
+        int selected = 0;
+        bool done = false;
+
+        while (!done) {
+            clearScreen();
+            drawHeader("Installation Profile", 4, 8);
+
+            int y = 6;
+            printAt(4, y,     "  Choose an installation profile:", INST_HIGHLIGHT);
+
+            # Profile options
+            drawProfileOption(y + 3, 0, selected, "Desktop",
+                "Full desktop environment with Stellar compositor,",
+                "all system utilities, and development tools.");
+
+            drawProfileOption(y + 9, 1, selected, "Minimal",
+                "Shell-only installation with core utilities.",
+                "No graphical environment. ~4 MB.");
+
+            drawProfileOption(y + 15, 2, selected, "Developer",
+                "Desktop + Flux compiler, debug tools,",
+                "language server, and Quantum packages.");
+
+            drawFooter("[Up/Down] Select    [Enter] Confirm");
+
+            # Wait for input
+            while (true) {
+                if (Keyboard.hasKey()) {
+                    KeyEvent event = Keyboard.pollKey();
+                    if (!event.pressed) continue;
+
+                    if (event.scancode == KEY_UP && selected > 0) {
+                        selected = selected - 1;
+                        break;
+                    }
+                    if (event.scancode == KEY_DOWN && selected < 2) {
+                        selected = selected + 1;
+                        break;
+                    }
+                    if (event.scancode == KEY_ENTER) {
+                        instProfile = selected;
+                        done = true;
+                        break;
+                    }
+                }
+                Timer.sleep(10);
+            }
+        }
+    }
+
+    private static func drawProfileOption(int y, int idx, int selected, string name, string desc1, string desc2) -> void {
+        bool isSel = (idx == selected);
+        color32 borderColor = isSel ? INST_HIGHLIGHT : INST_BOX_BORDER;
+        color32 nameColor = isSel ? INST_HIGHLIGHT : INST_TEXT;
+        color32 descColor = isSel ? INST_TEXT : INST_DIM;
+        string marker = isSel ? " ● " : " ○ ";
+        string prefix = isSel ? "  ▸ " : "    ";
+
+        printAt(4, y,     "${prefix}${marker}${name}", nameColor);
+        printAt(12, y + 1, desc1, descColor);
+        printAt(12, y + 2, desc2, descColor);
+
+        if (isSel) {
+            # Draw selection indicator
+            printAt(4, y, "  ▸", INST_HIGHLIGHT);
+        }
+    }
+
+    # ========================================================================
+    # Step 5: Confirmation
+    # ========================================================================
+    private static func showConfirmation() -> bool {
+        clearScreen();
+        drawHeader("Confirm Installation", 5, 8);
+
+        string profileName = "Desktop";
+        if (instProfile == 1) profileName = "Minimal";
+        elif (instProfile == 2) profileName = "Developer";
+
+        int y = 6;
+        printAt(4, y,     "  Installation Summary:", INST_HIGHLIGHT);
+        printAt(4, y + 2, "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", INST_DIM);
+        printAt(4, y + 3, "    Username:    ${instUsername}", INST_TEXT);
+        printAt(4, y + 4, "    Hostname:    ${instHostname}", INST_TEXT);
+        printAt(4, y + 5, "    Profile:     ${profileName}", INST_TEXT);
+        printAt(4, y + 6, "    Filesystem:  ramfs (volatile)", INST_TEXT);
+        printAt(4, y + 7, "    Desktop:     Stellar Compositor", INST_TEXT);
+        printAt(4, y + 8, "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", INST_DIM);
+
+        printAt(4, y + 11, "  Packages to install:", INST_HIGHLIGHT);
+        printAt(4, y + 12, "    ● core-utils       System utilities", INST_TEXT);
+        printAt(4, y + 13, "    ● shell            StratOS shell", INST_TEXT);
+        printAt(4, y + 14, "    ● quantum          Package manager", INST_TEXT);
+        if (instProfile != 1) {
+            printAt(4, y + 15, "    ● stellar          Desktop compositor", INST_TEXT);
+            printAt(4, y + 16, "    ● theme-cosmic     Clean Cosmic theme", INST_TEXT);
+        }
+        if (instProfile == 2) {
+            printAt(4, y + 17, "    ● flux-compiler    Flux language compiler", INST_TEXT);
+            printAt(4, y + 18, "    ● debug-tools      Debugger & profiler", INST_TEXT);
+        }
+
+        printAt(4, y + 21, "  Ready to install. This will configure your system.", INST_ACCENT);
+
+        drawFooter("[Enter] Begin Installation    [Esc] Cancel");
+        return waitForEnterOrEsc();
+    }
+
+    # ========================================================================
+    # Step 6: Installation Progress
+    # ========================================================================
+    private static func showInstallProgress() -> void {
+        clearScreen();
+        drawHeader("Installing StratOS", 6, 8);
+
+        int y = 6;
+        printAt(4, y, "  Installing system components...", INST_HIGHLIGHT);
+
+        # Simulate installation steps with progress bar
+        list<string> steps = [
+            "Creating filesystem structure...",
+            "Installing kernel modules...",
+            "Setting up user account...",
+            "Installing core utilities...",
+            "Configuring shell environment...",
+            "Installing Quantum package manager...",
+            "Setting up network stack...",
+            "Installing system fonts...",
+            "Configuring theme engine..."
+        ];
+
+        if (instProfile != 1) {
+            steps.add("Installing Stellar compositor...");
+            steps.add("Installing desktop icons...");
+            steps.add("Configuring wallpapers...");
+        }
+        if (instProfile == 2) {
+            steps.add("Installing Flux compiler...");
+            steps.add("Installing debug tools...");
+            steps.add("Setting up language server...");
+        }
+        steps.add("Running post-install scripts...");
+        steps.add("Finalizing installation...");
+
+        int totalSteps = steps.length;
+
+        for (int i = 0; i < totalSteps; i++) {
+            int percent = ((i + 1) * 100) / totalSteps;
+            string step = steps[i];
+
+            # Clear status area
+            printAt(4, y + 3, "                                                      ", INST_TEXT);
+            printAt(4, y + 3, "  ${step}", INST_TEXT);
+
+            # Draw progress bar
+            drawProgressBar(6, y + 6, 60, percent);
+
+            # Percent text
+            printAt(4, y + 8, "  ${percent}% complete", INST_HIGHLIGHT);
+
+            # Simulate work
+            int delay = 200 + (i * 50) % 300;
+            Timer.sleep(delay);
+        }
+
+        printAt(4, y + 11, "  Installation complete!", INST_HIGHLIGHT);
+        Timer.sleep(500);
+    }
+
+    # ========================================================================
+    # Step 7: Write Configuration
+    # ========================================================================
+    private static func writeConfiguration() -> void {
+        # Create filesystem structure
+        VFS.mkdirp("/home/${instUsername}");
+        VFS.mkdirp("/home/${instUsername}/Documents");
+        VFS.mkdirp("/home/${instUsername}/Downloads");
+        VFS.mkdirp("/home/${instUsername}/Desktop");
+        VFS.mkdirp("/home/${instUsername}/.config");
+        VFS.mkdirp("/root");
+        VFS.mkdirp("/etc/quantum");
+        VFS.mkdirp("/var/lib/quantum");
+        VFS.mkdirp("/var/log");
+        VFS.mkdirp("/tmp");
+        VFS.mkdirp("/img/wallpapers");
+        VFS.mkdirp("/img/icons");
+
+        # Write /etc/hostname
+        VFS.write("/etc/hostname", instHostname);
+
+        # Write /etc/passwd
+        VFS.write("/etc/passwd", "root:x:0:0:root:/root:/system/shell/shell\n${instUsername}:x:1000:1000:${instUsername}:/home/${instUsername}:/system/shell/shell");
+
+        # Write /etc/os-release
+        VFS.write("/etc/os-release", "NAME=\"StratOS\"\nVERSION=\"0.1.0\"\nID=stratos\nPRETTY_NAME=\"StratOS Cosmic Edition\"\nHOME_URL=\"https://stratos.skinnertopia.com\"");
+
+        # Write user profile
+        VFS.write("/home/${instUsername}/.config/profile", "SHELL=/system/shell/shell\nEDITOR=nova\nLANG=en_US.UTF-8\nDESKTOP=stellar");
+
+        # Write Quantum config
+        VFS.write("/etc/quantum/sources.conf", "stratos.skinnertopia.com");
+
+        # Write installer receipt
+        string profileName = "desktop";
+        if (instProfile == 1) profileName = "minimal";
+        elif (instProfile == 2) profileName = "developer";
+        VFS.write("/etc/install-receipt", "profile=${profileName}\nuser=${instUsername}\nhostname=${instHostname}\ndate=2026-02-13");
+    }
+
+    # ========================================================================
+    # Step 8: Complete
+    # ========================================================================
+    private static func showComplete() -> void {
+        clearScreen();
+        drawHeader("Installation Complete", 8, 8);
+
+        int y = 6;
+        printAt(4, y,     "      ★  StratOS has been installed!  ★", INST_ACCENT);
+        printAt(4, y + 3, "  Your system is ready to use.", INST_TEXT);
+        printAt(4, y + 5, "  Quick Start:", INST_HIGHLIGHT);
+        printAt(4, y + 6, "    Type 'startx' to launch the desktop", INST_TEXT);
+        printAt(4, y + 7, "    Type 'help' for shell commands", INST_TEXT);
+        printAt(4, y + 8, "    Type 'quantum install <pkg>' to add software", INST_TEXT);
+        printAt(4, y + 10, "  Keyboard shortcuts (desktop mode):", INST_HIGHLIGHT);
+        printAt(4, y + 11, "    Alt+Arrow     Snap windows", INST_TEXT);
+        printAt(4, y + 12, "    Alt+Tab       Switch windows", INST_TEXT);
+        printAt(4, y + 13, "    Alt+F4        Close window", INST_TEXT);
+        printAt(4, y + 14, "    Ctrl+W        Cycle wallpaper", INST_TEXT);
+        printAt(4, y + 15, "    Ctrl+T        New terminal", INST_TEXT);
+
+        printAt(4, y + 18, "  Thank you for choosing StratOS.", INST_DIM);
+
+        drawFooter("[Enter] Launch StratOS");
+        waitForEnter();
+    }
+
+    # ========================================================================
+    # TUI Drawing Helpers
+    # ========================================================================
+
+    # Clear the screen
+    private static func clearScreen() -> void {
+        Framebuffer.fillRect(0, 0, 1024, 768, INST_BG);
+    }
+
+    # Draw a header bar
+    private static func drawHeader(string title, int step, int totalSteps) -> void {
+        # Header background
+        Framebuffer.fillRect(0, 0, 1024, 40, INST_HEADER_BG);
+
+        # Step indicator
+        printAt(2, 1, "  StratOS Installer — ${title}", 0xFFFFFFFF);
+        printAt(80, 1, "Step ${step}/${totalSteps}", 0xFFFFFFE0);
+
+        # Progress dots at top
+        int dotStartX = 300;
+        for (int i = 1; i <= totalSteps; i++) {
+            color32 dotColor = (i <= step) ? 0xFFFFFFFF : 0xFFFFFF60;
+            int dotX = dotStartX + (i - 1) * 20;
+            Framebuffer.fillCircle(dotX, 20, 4, dotColor);
+        }
+    }
+
+    # Draw the footer help bar
+    private static func drawFooter(string helpText) -> void {
+        Framebuffer.fillRect(0, 728, 1024, 40, 0x151B23FF);
+        printAt(4, 46, "  ${helpText}", INST_DIM);
+    }
+
+    # Draw a progress bar
+    private static func drawProgressBar(int x, int y, int width, int percent) -> void {
+        int charX = x * FONT_WIDTH;
+        int charY = y * 16;
+        int barW = width * FONT_WIDTH;
+        int barH = 16;
+
+        # Background
+        Framebuffer.fillRect(charX, charY, barW, barH, INST_BOX_BORDER);
+
+        # Fill
+        int fillW = (barW * percent) / 100;
+        if (fillW > 0) {
+            Framebuffer.fillRect(charX, charY, fillW, barH, INST_PROGRESS);
+        }
+
+        # Border
+        Framebuffer.drawRect(charX, charY, barW, barH, INST_DIM);
+    }
+
+    # Print text at character position (col, row)
+    private static func printAt(int col, int row, string text, color32 color) -> void {
+        Console.setColor(color);
+        # Move to position and print
+        # Since Console doesn't support cursor positioning, we use Framebuffer directly
+        int px = col * FONT_WIDTH;
+        int py = row * 16;
+        for (int i = 0; i < text.length; i++) {
+            char ch = text.charAt(i);
+            if (ch >= 32 && ch <= 126) {
+                drawFontChar(px, py, ch, color);
+            }
+            px = px + FONT_WIDTH;
+        }
+    }
+
+    # Draw a single font character at pixel position
+    private static func drawFontChar(int px, int py, char ch, color32 color) -> void {
+        int glyphIndex = int(ch) - 32;
+        if (glyphIndex < 0 || glyphIndex > 94) return;
+
+        unsafe {
+            int* fontInts = (int*) BUILTIN_FONT_BASE;
+            int glyphBase = glyphIndex * 16;
+
+            for (int row = 0; row < 16; row++) {
+                byte bits = (byte) fontInts[glyphBase + row];
+                for (int col = 0; col < 8; col++) {
+                    int divisor = 1;
+                    switch (col) {
+                        case 0: divisor = 128; break;
+                        case 1: divisor = 64;  break;
+                        case 2: divisor = 32;  break;
+                        case 3: divisor = 16;  break;
+                        case 4: divisor = 8;   break;
+                        case 5: divisor = 4;   break;
+                        case 6: divisor = 2;   break;
+                        case 7: divisor = 1;   break;
+                    }
+                    if ((bits / divisor) % 2 == 1) {
+                        Framebuffer.plotPixel(px + col, py + row, color);
+                    }
+                }
+            }
+        }
+    }
+
+    # Read a text field with default value
+    private static func readField(int col, int row, int maxLen, string defaultVal) -> string {
+        string result = defaultVal;
+        int cursorPos = defaultVal.length;
+
+        # Show default
+        printAt(col, row, result, INST_HIGHLIGHT);
+        printAt(col + cursorPos, row, "_", INST_ACCENT);
+
+        while (true) {
+            if (Keyboard.hasKey()) {
+                KeyEvent event = Keyboard.pollKey();
+                if (!event.pressed) continue;
+
+                if (event.scancode == KEY_ENTER) {
+                    if (result.length == 0) result = defaultVal;
+                    return result;
+                }
+
+                if (event.scancode == KEY_BACKSPACE) {
+                    if (cursorPos > 0) {
+                        cursorPos = cursorPos - 1;
+                        result = result.substring(0, cursorPos);
+                        # Clear and redraw
+                        printAt(col, row, "                    ", INST_BG);
+                        printAt(col, row, result, INST_HIGHLIGHT);
+                        printAt(col + cursorPos, row, "_", INST_ACCENT);
+                    }
+                    continue;
+                }
+
+                char ch = event.ascii;
+                if (ch >= 32 && ch <= 126 && cursorPos < maxLen) {
+                    result = result + ch;
+                    cursorPos = cursorPos + 1;
+                    printAt(col, row, result, INST_HIGHLIGHT);
+                    printAt(col + cursorPos, row, "_", INST_ACCENT);
+                }
+            }
+            Timer.sleep(10);
+        }
+        return result;
+    }
+
+    # Wait for Enter key
+    private static func waitForEnter() -> void {
+        while (true) {
+            if (Keyboard.hasKey()) {
+                KeyEvent event = Keyboard.pollKey();
+                if (event.pressed && event.scancode == KEY_ENTER) return;
+            }
+            Timer.sleep(10);
+        }
+    }
+
+    # Wait for Enter (true) or Esc (false)
+    private static func waitForEnterOrEsc() -> bool {
+        while (true) {
+            if (Keyboard.hasKey()) {
+                KeyEvent event = Keyboard.pollKey();
+                if (!event.pressed) continue;
+                if (event.scancode == KEY_ENTER) return true;
+                if (event.scancode == 1) return false;   # Esc scancode = 1
+            }
+            Timer.sleep(10);
+        }
+        return false;
+    }
+}

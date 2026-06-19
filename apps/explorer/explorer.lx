@@ -1,0 +1,1131 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// File Explorer — Browse and manage files in StratOS
+// apps/explorer/explorer.lx
+//
+// Features:
+//   - VFS directory browsing with sidebar bookmarks
+//   - File/folder icons with type indicators
+//   - Keyboard navigation (arrows, enter, backspace)
+//   - Mouse click navigation (sidebar, file list)
+//   - Toolbar with path breadcrumb
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/fs/vfs.lx";
+
+# Explorer state
+string explorerPath = "/home";
+list<FileInfo> explorerEntries = [];
+int explorerSelected = 0;
+int explorerScroll = 0;
+bool explorerDirty = true;
+
+# File operation state
+string explorerPendingOpenFile = "";   # Set when user opens a file (compositor reads this)
+bool explorerShowNewFolder = false;    # Show new-folder input
+string explorerNewFolderName = "";     # Input buffer for new folder name
+string explorerStatusMsg = "";         # Status bar message
+int explorerStatusTimer = 0;          # Frames remaining for status message
+
+# Double-click tracking for file open
+int expLastClickTime = 0;
+int expLastClickItem = -1;
+int EXP_DOUBLE_CLICK_MS = 40;  # ~400ms at 100 ticks/sec
+
+# Context menu state
+bool expCtxMenuVisible = false;
+int expCtxMenuX = 0;
+int expCtxMenuY = 0;
+int expCtxMenuTargetIdx = -1;
+int EXP_CTX_MENU_W = 180;
+int EXP_CTX_MENU_ITEM_H = 24;
+int EXP_CTX_MENU_ITEMS = 9;
+
+# Rename state
+bool expRenaming = false;
+string expRenameBuffer = "";
+int expRenameIdx = -1;
+
+# Clipboard state for copy/cut/paste
+string expClipboardPath = "";
+bool expClipboardCut = false;
+
+# Show hidden files toggle
+bool expShowHidden = false;
+
+# Signal: request compositor to open terminal at current path
+string expPendingTermPath = "";
+
+# Properties panel state
+bool expPropsPanelVisible = false;
+string expPropsName = "";
+string expPropsType = "";
+string expPropsSize = "";
+string expPropsLocation = "";
+string expPropsPermissions = "rwxr-xr-x";
+
+# Bookmark data (parallel arrays)
+int BOOKMARK_COUNT = 7;
+string bmName0 = "Home";        string bmPath0 = "/home";
+string bmName1 = "Desktop";     string bmPath1 = "/home/desktop";
+string bmName2 = "Documents";   string bmPath2 = "/home/documents";
+string bmName3 = "Downloads";   string bmPath3 = "/home/downloads";
+string bmName4 = "Music";       string bmPath4 = "/home/music";
+string bmName5 = "Pictures";    string bmPath5 = "/home/pictures";
+string bmName6 = "Root";        string bmPath6 = "/";
+
+# Layout constants
+int EXP_SIDEBAR_W   = 150;
+int EXP_TOOLBAR_H   = 32;
+int EXP_ITEM_H      = 24;
+
+export class ExplorerApp {
+    # Initialize the file explorer
+    public static func init() -> void {
+        explorerPath = "/home";
+        explorerSelected = 0;
+        explorerScroll = 0;
+        explorerDirty = true;
+        explorerPendingOpenFile = "";
+        explorerShowNewFolder = false;
+        explorerNewFolderName = "";
+        explorerStatusMsg = "";
+        explorerStatusTimer = 0;
+        expLastClickTime = 0;
+        expLastClickItem = -1;
+        expCtxMenuVisible = false;
+        expRenaming = false;
+        expRenameBuffer = "";
+        expRenameIdx = -1;
+        expClipboardPath = "";
+        expClipboardCut = false;
+        expShowHidden = false;
+        loadDir(explorerPath);
+    }
+
+    # Check if there's a pending file to open in editor
+    public static func getPendingFile() -> string {
+        return explorerPendingOpenFile;
+    }
+
+    # Clear the pending file after compositor has handled it
+    public static func clearPendingFile() -> void {
+        explorerPendingOpenFile = "";
+    }
+
+    # Process a keyboard event from the compositor
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Handle rename input mode first
+        if (expRenaming) {
+            handleRenameInput(event);
+            return;
+        }
+
+        # Handle new-folder input mode
+        if (explorerShowNewFolder) {
+            handleNewFolderInput(event);
+            return;
+        }
+
+        # Close properties panel on Escape
+        if (expPropsPanelVisible) {
+            if (event.scancode == 1) {
+                expPropsPanelVisible = false;
+                explorerDirty = true;
+            }
+            return;   # Consume all input while panel is visible
+        }
+
+        # Close context menu on any key
+        if (expCtxMenuVisible) {
+            expCtxMenuVisible = false;
+            explorerDirty = true;
+            return;
+        }
+
+        # Up arrow
+        if (event.scancode == KEY_UP) {
+            if (explorerSelected > 0) {
+                explorerSelected = explorerSelected - 1;
+                ensureVisible();
+                explorerDirty = true;
+            }
+            return;
+        }
+
+        # Down arrow
+        if (event.scancode == KEY_DOWN) {
+            if (explorerSelected < explorerEntries.length - 1) {
+                explorerSelected = explorerSelected + 1;
+                ensureVisible();
+                explorerDirty = true;
+            }
+            return;
+        }
+
+        # Enter — open selected
+        if (event.scancode == 28) {
+            openSelected();
+            return;
+        }
+
+        # Backspace — go up one directory
+        if (event.scancode == 14) {
+            navigateUp();
+            return;
+        }
+
+        # F2 — rename selected
+        if (event.scancode == 60) {
+            startRename();
+            return;
+        }
+
+        # Ctrl+R — refresh
+        if (event.ctrl && event.ascii == 'r') {
+            loadDir(explorerPath);
+            return;
+        }
+
+        # Ctrl+N — create new folder
+        if (event.ctrl && event.ascii == 'n') {
+            explorerShowNewFolder = true;
+            explorerNewFolderName = "";
+            explorerDirty = true;
+            return;
+        }
+
+        # Ctrl+C — copy selected
+        if (event.ctrl && event.ascii == 'c') {
+            copySelected(false);
+            return;
+        }
+
+        # Ctrl+X — cut selected
+        if (event.ctrl && event.ascii == 'x') {
+            copySelected(true);
+            return;
+        }
+
+        # Ctrl+V — paste
+        if (event.ctrl && event.ascii == 'v') {
+            pasteClipboard();
+            return;
+        }
+
+        # Ctrl+H — toggle hidden files
+        if (event.ctrl && event.ascii == 'h') {
+            expShowHidden = !expShowHidden;
+            loadDir(explorerPath);
+            return;
+        }
+
+        # Delete key (scancode 83) — delete selected file/folder
+        if (event.scancode == 83) {
+            deleteSelected();
+            return;
+        }
+    }
+
+    # Process a mouse click in the content area
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        # If properties panel is visible, check for X button close
+        if (expPropsPanelVisible) {
+            int ppW = 280;
+            int ppH = 200;
+            int ppX = (contentW - ppW) / 2;
+            int ppY = (contentH - ppH) / 2;
+            # X button in top-right corner of panel
+            if (relX >= ppX + ppW - 24 && relX < ppX + ppW && relY >= ppY && relY < ppY + 28) {
+                expPropsPanelVisible = false;
+                explorerDirty = true;
+            }
+            return;  # Consume clicks while panel is visible
+        }
+
+        # If context menu is visible, handle its clicks
+        if (expCtxMenuVisible) {
+            if (relX >= expCtxMenuX && relX < expCtxMenuX + EXP_CTX_MENU_W &&
+                relY >= expCtxMenuY && relY < expCtxMenuY + EXP_CTX_MENU_ITEMS * EXP_CTX_MENU_ITEM_H) {
+                int itemIdx = (relY - expCtxMenuY) / EXP_CTX_MENU_ITEM_H;
+                handleCtxMenuItem(itemIdx);
+            }
+            expCtxMenuVisible = false;
+            explorerDirty = true;
+            return;
+        }
+
+        # Check sidebar region
+        if (relX < EXP_SIDEBAR_W) {
+            # Which bookmark was clicked?
+            int itemStartY = 32;   # Below "Places" header
+            int itemH = 28;
+            int clickIdx = (relY - itemStartY) / itemH;
+            if (clickIdx >= 0 && clickIdx < BOOKMARK_COUNT) {
+                string path = getBookmarkPath(clickIdx);
+                if (path != "") {
+                    explorerPath = path;
+                    loadDir(explorerPath);
+                }
+            }
+            return;
+        }
+
+        # Check toolbar region
+        if (relY < EXP_TOOLBAR_H) {
+            return;
+        }
+
+        # File list region (account for column header row)
+        int listRelY = relY - EXP_TOOLBAR_H - EXP_ITEM_H;
+        if (listRelY < 0) return;  # Clicked on column header
+
+        int clickedItem = listRelY / EXP_ITEM_H + explorerScroll;
+        if (clickedItem >= 0 && clickedItem < explorerEntries.length) {
+            # Double-click detection — open item
+            int now = Timer.getTicks();
+            if (clickedItem == expLastClickItem && (now - expLastClickTime) < EXP_DOUBLE_CLICK_MS) {
+                openSelected();
+                expLastClickTime = 0;
+                expLastClickItem = -1;
+                return;
+            }
+            expLastClickTime = now;
+            expLastClickItem = clickedItem;
+
+            # Single click — just select
+            explorerSelected = clickedItem;
+            explorerDirty = true;
+        }
+    }
+
+    # Handle right-click for context menu
+    public static func processRightClick(int relX, int relY, int contentW, int contentH) -> void {
+        # Only show context menu in file list area
+        if (relX < EXP_SIDEBAR_W) return;
+        if (relY < EXP_TOOLBAR_H + EXP_ITEM_H) return;
+
+        int listRelY = relY - EXP_TOOLBAR_H - EXP_ITEM_H;
+        int clickedItem = listRelY / EXP_ITEM_H + explorerScroll;
+
+        if (clickedItem >= 0 && clickedItem < explorerEntries.length) {
+            explorerSelected = clickedItem;
+            expCtxMenuTargetIdx = clickedItem;
+        } else {
+            expCtxMenuTargetIdx = -1;   # Right-clicked in empty space
+        }
+
+        # Position menu at click, clamping to content area
+        expCtxMenuX = relX;
+        expCtxMenuY = relY;
+        if (expCtxMenuX + EXP_CTX_MENU_W > contentW) {
+            expCtxMenuX = contentW - EXP_CTX_MENU_W;
+        }
+        if (expCtxMenuY + EXP_CTX_MENU_ITEMS * EXP_CTX_MENU_ITEM_H > contentH) {
+            expCtxMenuY = contentH - EXP_CTX_MENU_ITEMS * EXP_CTX_MENU_ITEM_H;
+        }
+
+        expCtxMenuVisible = true;
+        explorerDirty = true;
+    }
+
+    # Handle context menu item selection
+    private static func handleCtxMenuItem(int idx) -> void {
+        switch (idx) {
+            case 0:
+                # Open
+                if (expCtxMenuTargetIdx >= 0) {
+                    explorerSelected = expCtxMenuTargetIdx;
+                    openSelected();
+                }
+                break;
+            case 1:
+                # Rename
+                if (expCtxMenuTargetIdx >= 0) {
+                    explorerSelected = expCtxMenuTargetIdx;
+                    startRename();
+                }
+                break;
+            case 2:
+                # Copy
+                if (expCtxMenuTargetIdx >= 0) {
+                    explorerSelected = expCtxMenuTargetIdx;
+                    copySelected(false);
+                }
+                break;
+            case 3:
+                # Cut
+                if (expCtxMenuTargetIdx >= 0) {
+                    explorerSelected = expCtxMenuTargetIdx;
+                    copySelected(true);
+                }
+                break;
+            case 4:
+                # Paste
+                pasteClipboard();
+                break;
+            case 5:
+                # Open in Terminal
+                expPendingTermPath = explorerPath;
+                break;
+            case 6:
+                # Properties
+                if (expCtxMenuTargetIdx >= 0) {
+                    showPropertiesPanel(expCtxMenuTargetIdx);
+                } else {
+                    # Show properties for current directory
+                    showDirProperties();
+                }
+                break;
+            case 7:
+                # Toggle hidden files
+                expShowHidden = !expShowHidden;
+                loadDir(explorerPath);
+                break;
+            case 8:
+                # New Folder — trigger the naming dialog
+                explorerShowNewFolder = true;
+                explorerNewFolderName = "";
+                explorerDirty = true;
+                break;
+        }
+    }
+
+    # ========================================================================
+    # Right-click context query — check if explorer wants right-click
+    # ========================================================================
+    public static func isCtxMenuVisible() -> bool {
+        return expCtxMenuVisible;
+    }
+
+    # ========================================================================
+    # Rename support
+    # ========================================================================
+    private static func startRename() -> void {
+        if (explorerSelected < 0 || explorerSelected >= explorerEntries.length) return;
+        expRenaming = true;
+        expRenameIdx = explorerSelected;
+        expRenameBuffer = explorerEntries[explorerSelected].name;
+        explorerDirty = true;
+    }
+
+    private static func handleRenameInput(KeyEvent event) -> void {
+        # Escape — cancel rename
+        if (event.scancode == 1) {
+            expRenaming = false;
+            expRenameIdx = -1;
+            explorerDirty = true;
+            return;
+        }
+        # Enter — commit rename
+        if (event.scancode == 28) {
+            commitRename();
+            return;
+        }
+        # Backspace
+        if (event.scancode == 14) {
+            if (expRenameBuffer.length > 0) {
+                expRenameBuffer = expRenameBuffer.substring(0, expRenameBuffer.length - 1);
+                explorerDirty = true;
+            }
+            return;
+        }
+        # Printable characters
+        if (event.ascii >= 32 && event.ascii < 127) {
+            expRenameBuffer = expRenameBuffer + "${event.ascii}";
+            explorerDirty = true;
+        }
+    }
+
+    private static func commitRename() -> void {
+        if (expRenameIdx < 0 || expRenameIdx >= explorerEntries.length) {
+            expRenaming = false;
+            return;
+        }
+        if (expRenameBuffer.length == 0) {
+            expRenaming = false;
+            explorerDirty = true;
+            return;
+        }
+
+        string oldName = explorerEntries[expRenameIdx].name;
+        if (oldName == expRenameBuffer) {
+            expRenaming = false;
+            explorerDirty = true;
+            return;
+        }
+
+        string oldPath = explorerPath;
+        if (explorerPath == "/") {
+            oldPath = "/" + oldName;
+        } else {
+            oldPath = explorerPath + "/" + oldName;
+        }
+        string newPath = explorerPath;
+        if (explorerPath == "/") {
+            newPath = "/" + expRenameBuffer;
+        } else {
+            newPath = explorerPath + "/" + expRenameBuffer;
+        }
+
+        bool ok = VFS.rename(oldPath, newPath);
+        if (ok) {
+            explorerStatusMsg = "Renamed: " + oldName + " -> " + expRenameBuffer;
+        } else {
+            explorerStatusMsg = "Rename failed";
+        }
+        explorerStatusTimer = 200;
+        expRenaming = false;
+        expRenameIdx = -1;
+        loadDir(explorerPath);
+    }
+
+    # ========================================================================
+    # Copy / Cut / Paste
+    # ========================================================================
+    private static func copySelected(bool cut) -> void {
+        if (explorerSelected < 0 || explorerSelected >= explorerEntries.length) return;
+        string name = explorerEntries[explorerSelected].name;
+        if (explorerPath == "/") {
+            expClipboardPath = "/" + name;
+        } else {
+            expClipboardPath = explorerPath + "/" + name;
+        }
+        expClipboardCut = cut;
+        if (cut) {
+            explorerStatusMsg = "Cut: " + name;
+        } else {
+            explorerStatusMsg = "Copied: " + name;
+        }
+        explorerStatusTimer = 150;
+        explorerDirty = true;
+    }
+
+    private static func pasteClipboard() -> void {
+        if (expClipboardPath.length == 0) {
+            explorerStatusMsg = "Clipboard empty";
+            explorerStatusTimer = 100;
+            return;
+        }
+
+        # Extract filename from clipboard path
+        string clipName = expClipboardPath;
+        int lastSlash = -1;
+        for (int i = clipName.length - 1; i >= 0; i--) {
+            if (clipName.charAt(i) == '/') {
+                lastSlash = i;
+                break;
+            }
+        }
+        if (lastSlash >= 0) {
+            clipName = clipName.substring(lastSlash + 1, clipName.length);
+        }
+
+        string destPath = explorerPath;
+        if (explorerPath == "/") {
+            destPath = "/" + clipName;
+        } else {
+            destPath = explorerPath + "/" + clipName;
+        }
+
+        if (VFS.isFile(expClipboardPath)) {
+            string content = VFS.read(expClipboardPath);
+            VFS.write(destPath, content);
+            if (expClipboardCut) {
+                VFS.remove(expClipboardPath);
+                expClipboardPath = "";
+            }
+            explorerStatusMsg = "Pasted: " + clipName;
+        } elif (VFS.isDirectory(expClipboardPath)) {
+            VFS.mkdirp(destPath);
+            if (expClipboardCut) {
+                VFS.removeRecursive(expClipboardPath);
+                expClipboardPath = "";
+            }
+            explorerStatusMsg = "Pasted folder: " + clipName;
+        } else {
+            explorerStatusMsg = "Paste failed: source not found";
+        }
+        explorerStatusTimer = 200;
+        loadDir(explorerPath);
+    }
+
+    # ========================================================================
+    # Properties display (shows info in status bar)
+    # ========================================================================
+    private static func showProperties(int idx) -> void {
+        if (idx < 0 || idx >= explorerEntries.length) return;
+        FileInfo entry = explorerEntries[idx];
+        if (entry.type == 1) {
+            explorerStatusMsg = entry.name + " — Directory";
+        } else {
+            string sizeStr = formatSize(entry.size);
+            explorerStatusMsg = entry.name + " — " + sizeStr;
+        }
+        explorerStatusTimer = 300;
+    }
+
+    # Full properties panel for a file/folder
+    private static func showPropertiesPanel(int idx) -> void {
+        if (idx < 0 || idx >= explorerEntries.length) return;
+        FileInfo entry = explorerEntries[idx];
+        expPropsName = entry.name;
+        if (entry.type == 1) {
+            expPropsType = "Directory";
+            # Count children
+            string dirPath = "";
+            if (explorerPath == "/") {
+                dirPath = "/" + entry.name;
+            } else {
+                dirPath = explorerPath + "/" + entry.name;
+            }
+            list<FileInfo> children = VFS.listDir(dirPath);
+            expPropsSize = "${children.length} items";
+        } else {
+            # Determine file type from extension
+            string ext = getFileExtension(entry.name);
+            if (ext == "txt") {
+                expPropsType = "Text File";
+            } elif (ext == "lx" || ext == "flux") {
+                expPropsType = "Flux Source File";
+            } elif (ext == "cfg" || ext == "conf") {
+                expPropsType = "Configuration File";
+            } elif (ext == "png" || ext == "bmp" || ext == "jpg") {
+                expPropsType = "Image File";
+            } elif (ext == "md") {
+                expPropsType = "Markdown Document";
+            } else {
+                expPropsType = "File";
+            }
+            expPropsSize = formatSize(entry.size);
+        }
+        expPropsLocation = explorerPath;
+        expPropsPermissions = "rwxr-xr-x";
+        expPropsPanelVisible = true;
+        explorerDirty = true;
+    }
+
+    # Properties for current directory
+    private static func showDirProperties() -> void {
+        expPropsName = explorerPath;
+        expPropsType = "Directory";
+        list<FileInfo> children = VFS.listDir(explorerPath);
+        expPropsSize = "${children.length} items";
+        # Compute parent path
+        if (explorerPath == "/") {
+            expPropsLocation = "/";
+        } else {
+            expPropsLocation = VFS.parentPath(explorerPath);
+        }
+        expPropsPermissions = "rwxr-xr-x";
+        expPropsPanelVisible = true;
+        explorerDirty = true;
+    }
+
+    # Create a new folder in current directory
+    private static func createNewFolder() -> void {
+        # Find unique name
+        string baseName = "New Folder";
+        string newPath = "";
+        if (explorerPath == "/") {
+            newPath = "/" + baseName;
+        } else {
+            newPath = explorerPath + "/" + baseName;
+        }
+        int suffix = 1;
+        while (VFS.isDirectory(newPath)) {
+            baseName = "New Folder ${suffix}";
+            if (explorerPath == "/") {
+                newPath = "/" + baseName;
+            } else {
+                newPath = explorerPath + "/" + baseName;
+            }
+            suffix = suffix + 1;
+            if (suffix > 99) break;
+        }
+        VFS.mkdirp(newPath);
+        explorerStatusMsg = "Created: " + baseName;
+        explorerStatusTimer = 200;
+        loadDir(explorerPath);
+    }
+
+    # Consume pending terminal path (called by compositor)
+    public static func consumePendingTermPath() -> string {
+        string path = expPendingTermPath;
+        expPendingTermPath = "";
+        return path;
+    }
+
+    # Get file extension
+    private static func getFileExtension(string name) -> string {
+        int dotPos = -1;
+        for (int i = name.length - 1; i >= 0; i--) {
+            if (name.charAt(i) == '.') {
+                dotPos = i;
+                break;
+            }
+        }
+        if (dotPos < 0) return "";
+        return name.substring(dotPos + 1, name.length);
+    }
+
+    # Draw the file explorer UI
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        # Sidebar
+        int sideW = EXP_SIDEBAR_W;
+        if (sideW > w / 3) sideW = w / 3;
+        Framebuffer.fillRect(x, y, sideW, h, 0x0A0E1AFF);
+        Framebuffer.drawVLine(x + sideW - 1, y, h, 0x1A2332FF);
+
+        # Sidebar header
+        TextRender.drawText("Places", x + 12, y + 8, 0x8B949EFF);
+
+        # Bookmark items
+        int bmY = y + 32;
+        for (int i = 0; i < BOOKMARK_COUNT; i++) {
+            string bmName = getBookmarkName(i);
+            string bmPathVal = getBookmarkPath(i);
+            bool isActive = (bmPathVal == explorerPath);
+
+            if (isActive) {
+                Framebuffer.fillRect(x + 2, bmY, sideW - 4, 24, 0x21262DFF);
+                Framebuffer.fillRect(x, bmY + 2, 3, 20, Theme.textAccent);
+            }
+
+            # Folder icon dot
+            color32 dotColor = isActive ? Theme.textAccent : 0xFFB74DFF;
+            Framebuffer.fillCircle(x + 16, bmY + 12, 3, dotColor);
+
+            color32 textColor = isActive ? 0xE6EDF3FF : 0x8B949EFF;
+            TextRender.drawText(bmName, x + 28, bmY + 4, textColor);
+            bmY = bmY + 28;
+        }
+
+        # Toolbar (path breadcrumb)
+        int toolX = x + sideW;
+        int toolW = w - sideW;
+        Framebuffer.fillRect(toolX, y, toolW, EXP_TOOLBAR_H, 0x101824FF);
+        Framebuffer.drawHLine(toolX, y + EXP_TOOLBAR_H - 1, toolW, 0x1A2332FF);
+
+        # Path text
+        TextRender.drawText(explorerPath, toolX + 12, y + 8, 0xC9D1D9FF);
+
+        # File count
+        string countStr = "${explorerEntries.length} items";
+        int countTxtW = countStr.length * charW;
+        TextRender.drawText(countStr, toolX + toolW - countTxtW - 12, y + 8, 0x6B7280FF);
+
+        # File list area
+        int listX = x + sideW;
+        int listY = y + EXP_TOOLBAR_H;
+        int listW = w - sideW;
+        int listH = h - EXP_TOOLBAR_H;
+        int visibleItems = listH / EXP_ITEM_H;
+
+        # Column headers
+        Framebuffer.fillRect(listX, listY, listW, EXP_ITEM_H, 0x101824FF);
+        TextRender.drawText("Name", listX + 32, listY + 4, 0x8B949EFF);
+        TextRender.drawText("Size", listX + listW - 80, listY + 4, 0x8B949EFF);
+        Framebuffer.drawHLine(listX, listY + EXP_ITEM_H - 1, listW, 0x1A2332FF);
+        listY = listY + EXP_ITEM_H;
+        visibleItems = visibleItems - 1;
+
+        # Draw file entries
+        for (int i = 0; i < visibleItems; i++) {
+            int idx = explorerScroll + i;
+            if (idx >= explorerEntries.length) break;
+
+            FileInfo entry = explorerEntries[idx];
+            int itemY = listY + i * EXP_ITEM_H;
+
+            # Selection highlight
+            if (idx == explorerSelected) {
+                Framebuffer.fillRect(listX, itemY, listW, EXP_ITEM_H, 0x1E3A5FFF);
+            } elif (i % 2 == 0) {
+                Framebuffer.fillRect(listX, itemY, listW, EXP_ITEM_H, 0x0F1520FF);
+            }
+
+            # File/directory icon
+            bool isDir = (entry.type == 1);
+            if (isDir) {
+                Framebuffer.fillRect(listX + 10, itemY + 7, 12, 10, 0xFFB74DFF);
+                Framebuffer.fillRect(listX + 10, itemY + 5, 6, 3, 0xFFB74DFF);
+            } else {
+                Framebuffer.fillRect(listX + 12, itemY + 5, 8, 14, 0x4A5568FF);
+                Framebuffer.fillRect(listX + 16, itemY + 5, 4, 4, 0x0D1117FF);
+            }
+
+            # File name
+            color32 nameColor = isDir ? 0x5B8CFFFF : 0xC9D1D9FF;
+            TextRender.drawText(entry.name, listX + 32, itemY + 4, nameColor);
+
+            # Size (for files only)
+            if (!isDir) {
+                string sizeStr = formatSize(entry.size);
+                int sizeTxtW = sizeStr.length * charW;
+                TextRender.drawText(sizeStr, listX + listW - sizeTxtW - 12, itemY + 4, 0x6B7280FF);
+            } else {
+                TextRender.drawText("--", listX + listW - 24, itemY + 4, 0x484F58FF);
+            }
+        }
+
+        # Scrollbar indicator
+        if (explorerEntries.length > visibleItems && visibleItems > 0) {
+            int trackH = visibleItems * EXP_ITEM_H;
+            int thumbH = trackH * visibleItems / explorerEntries.length;
+            if (thumbH < 16) thumbH = 16;
+            int maxScroll = explorerEntries.length - visibleItems;
+            if (maxScroll < 1) maxScroll = 1;
+            int thumbY = listY + (trackH - thumbH) * explorerScroll / maxScroll;
+            Framebuffer.fillRect(listX + listW - 6, thumbY, 4, thumbH, 0x30363DFF);
+        }
+
+        # Empty directory message
+        if (explorerEntries.length == 0) {
+            int msgX = listX + listW / 2 - 56;
+            int msgY = listY + 40;
+            TextRender.drawText("Empty directory", msgX, msgY, 0x484F58FF);
+        }
+
+        # New folder input dialog
+        if (explorerShowNewFolder) {
+            int dlgW = 300;
+            int dlgH = 60;
+            int dlgX = x + w / 2 - dlgW / 2;
+            int dlgY = y + h / 2 - dlgH / 2;
+            Framebuffer.fillRect(dlgX, dlgY, dlgW, dlgH, 0x21262DFF);
+            Framebuffer.drawRect(dlgX, dlgY, dlgW, dlgH, Theme.textAccent);
+            TextRender.drawText("New Folder Name:", dlgX + 12, dlgY + 8, 0xC9D1D9FF);
+            Framebuffer.fillRect(dlgX + 12, dlgY + 28, dlgW - 24, 20, 0x0D1117FF);
+            TextRender.drawText(explorerNewFolderName + "_", dlgX + 16, dlgY + 30, 0xE6EDF3FF);
+        }
+
+        # Status bar at bottom
+        if (explorerStatusTimer > 0) {
+            explorerStatusTimer = explorerStatusTimer - 1;
+            int stY = y + h - 18;
+            Framebuffer.fillRect(x + sideW, stY, w - sideW, 18, 0x161B22FF);
+            TextRender.drawText(explorerStatusMsg, x + sideW + 8, stY + 1, 0x8B949EFF);
+        }
+
+        # Rename inline editing overlay
+        if (expRenaming && expRenameIdx >= 0) {
+            int renRowIdx = expRenameIdx - explorerScroll;
+            int renListY = y + EXP_TOOLBAR_H + EXP_ITEM_H;  # After column header
+            if (renRowIdx >= 0 && renRowIdx < visibleItems) {
+                int renItemY = renListY + renRowIdx * EXP_ITEM_H;
+                int renInputX = x + sideW + 30;
+                int renInputW = w - sideW - 100;
+                Framebuffer.fillRect(renInputX, renItemY + 1, renInputW, EXP_ITEM_H - 2, 0x0D1117FF);
+                Framebuffer.drawRect(renInputX, renItemY + 1, renInputW, EXP_ITEM_H - 2, Theme.textAccent);
+                TextRender.drawText(expRenameBuffer + "_", renInputX + 4, renItemY + 4, 0xE6EDF3FF);
+            }
+        }
+
+        # Context menu overlay
+        if (expCtxMenuVisible) {
+            int cmX = x + expCtxMenuX;
+            int cmY = y + expCtxMenuY;
+            int cmTotalH = EXP_CTX_MENU_ITEMS * EXP_CTX_MENU_ITEM_H;
+
+            # Drop shadow
+            Framebuffer.fillRect(cmX + 3, cmY + 3, EXP_CTX_MENU_W, cmTotalH, 0x00000060);
+
+            # Menu background
+            Framebuffer.fillRect(cmX, cmY, EXP_CTX_MENU_W, cmTotalH, 0x21262DFF);
+            Framebuffer.drawRect(cmX, cmY, EXP_CTX_MENU_W, cmTotalH, 0x30363DFF);
+
+            # Menu items
+            for (int mi = 0; mi < EXP_CTX_MENU_ITEMS; mi++) {
+                int miy = cmY + mi * EXP_CTX_MENU_ITEM_H;
+                string miLabel = "";
+                if (mi == 0) miLabel = "  Open";
+                if (mi == 1) miLabel = "  Rename          F2";
+                if (mi == 2) miLabel = "  Copy         Ctrl+C";
+                if (mi == 3) miLabel = "  Cut          Ctrl+X";
+                if (mi == 4) miLabel = "  Paste        Ctrl+V";
+                if (mi == 5) miLabel = "  Open in Terminal";
+                if (mi == 6) miLabel = "  Properties";
+                if (mi == 7) {
+                    if (expShowHidden) {
+                        miLabel = "  Hide Hidden Files";
+                    } else {
+                        miLabel = "  Show Hidden Files";
+                    }
+                }
+                if (mi == 8) miLabel = "  New Folder";
+
+                # Separator lines
+                if (mi == 5) {
+                    Framebuffer.drawHLine(cmX + 8, miy, EXP_CTX_MENU_W - 16, 0x30363DFF);
+                }
+                if (mi == 7) {
+                    Framebuffer.drawHLine(cmX + 8, miy, EXP_CTX_MENU_W - 16, 0x30363DFF);
+                }
+
+                # Disabled items (paste when clipboard empty, or file ops when no target)
+                bool disabled = false;
+                if (mi == 4 && expClipboardPath.length == 0) disabled = true;
+                if (expCtxMenuTargetIdx < 0) {
+                    if (mi == 0 || mi == 1 || mi == 2 || mi == 3) disabled = true;
+                }
+
+                color32 miColor = disabled ? 0x484F58FF : 0xC9D1D9FF;
+                TextRender.drawText(miLabel, cmX + 4, miy + 4, miColor);
+            }
+        }
+
+        # Properties panel overlay
+        if (expPropsPanelVisible) {
+            int ppW = 280;
+            int ppH = 200;
+            int ppX = x + (w - ppW) / 2;
+            int ppY = y + (h - ppH) / 2;
+
+            # Shadow + background
+            Framebuffer.fillRect(ppX + 4, ppY + 4, ppW, ppH, 0x00000060);
+            Framebuffer.fillRoundedRect(ppX, ppY, ppW, ppH, 6, 0x161B22FF);
+            Framebuffer.drawRoundedRect(ppX, ppY, ppW, ppH, 6, 0x30363DFF);
+
+            # Title bar
+            Framebuffer.fillRect(ppX + 1, ppY + 1, ppW - 2, 28, 0x21262DFF);
+            TextRender.drawText("Properties", ppX + 12, ppY + 8, 0xE6EDF3FF);
+
+            # Close button (X)
+            TextRender.drawText("X", ppX + ppW - 20, ppY + 8, 0xF85149FF);
+
+            # Property rows
+            int rowY = ppY + 38;
+            int rowH = 22;
+            int labelX = ppX + 16;
+            int valueX = ppX + 100;
+
+            TextRender.drawText("Name:", labelX, rowY, 0x8B949EFF);
+            TextRender.drawText(expPropsName, valueX, rowY, 0xC9D1D9FF);
+            rowY = rowY + rowH;
+
+            TextRender.drawText("Type:", labelX, rowY, 0x8B949EFF);
+            TextRender.drawText(expPropsType, valueX, rowY, 0xC9D1D9FF);
+            rowY = rowY + rowH;
+
+            TextRender.drawText("Size:", labelX, rowY, 0x8B949EFF);
+            TextRender.drawText(expPropsSize, valueX, rowY, 0xC9D1D9FF);
+            rowY = rowY + rowH;
+
+            TextRender.drawText("Location:", labelX, rowY, 0x8B949EFF);
+            TextRender.drawText(expPropsLocation, valueX, rowY, 0xC9D1D9FF);
+            rowY = rowY + rowH;
+
+            TextRender.drawText("Perms:", labelX, rowY, 0x8B949EFF);
+            TextRender.drawText(expPropsPermissions, valueX, rowY, 0xC9D1D9FF);
+            rowY = rowY + rowH;
+
+            # Free space
+            TextRender.drawText("Free:", labelX, rowY, 0x8B949EFF);
+            TextRender.drawText("128 MB (VFS)", valueX, rowY, 0xC9D1D9FF);
+
+            # Dismiss hint
+            TextRender.drawText("Press Escape or click X to close", ppX + 16, ppY + ppH - 20, 0x484F58FF);
+        }
+
+        explorerDirty = false;
+    }
+
+    # ========================================================================
+    # Internal — Directory operations
+    # ========================================================================
+
+    private static func loadDir(string path) -> void {
+        explorerEntries = VFS.listDir(path);
+        explorerSelected = 0;
+        explorerScroll = 0;
+        explorerDirty = true;
+    }
+
+    private static func openSelected() -> void {
+        if (explorerSelected >= explorerEntries.length) return;
+        FileInfo entry = explorerEntries[explorerSelected];
+
+        if (entry.type == 1) {
+            # Directory — navigate into it
+            if (explorerPath == "/") {
+                explorerPath = "/" + entry.name;
+            } else {
+                explorerPath = explorerPath + "/" + entry.name;
+            }
+            loadDir(explorerPath);
+        } else {
+            # File — request open in editor via pending path
+            if (explorerPath == "/") {
+                explorerPendingOpenFile = "/" + entry.name;
+            } else {
+                explorerPendingOpenFile = explorerPath + "/" + entry.name;
+            }
+            explorerStatusMsg = "Opening: " + entry.name;
+            explorerStatusTimer = 150;
+        }
+    }
+
+    private static func navigateUp() -> void {
+        if (explorerPath == "/") return;
+
+        int lastSlash = -1;
+        for (int i = explorerPath.length - 1; i >= 0; i--) {
+            if (explorerPath.charAt(i) == '/') {
+                lastSlash = i;
+                break;
+            }
+        }
+
+        if (lastSlash <= 0) {
+            explorerPath = "/";
+        } else {
+            explorerPath = explorerPath.substring(0, lastSlash);
+        }
+        loadDir(explorerPath);
+    }
+
+    private static func ensureVisible() -> void {
+        int vis = 16;  # Approximate visible items
+        if (explorerSelected < explorerScroll) {
+            explorerScroll = explorerSelected;
+        }
+        if (explorerSelected >= explorerScroll + vis) {
+            explorerScroll = explorerSelected - vis + 1;
+        }
+    }
+
+    # ========================================================================
+    # Internal — File operations
+    # ========================================================================
+
+    private static func deleteSelected() -> void {
+        if (explorerSelected >= explorerEntries.length) return;
+        FileInfo entry = explorerEntries[explorerSelected];
+        string fullPath = explorerPath;
+        if (explorerPath == "/") {
+            fullPath = "/" + entry.name;
+        } else {
+            fullPath = explorerPath + "/" + entry.name;
+        }
+
+        bool ok = false;
+        if (entry.type == 1) {
+            ok = VFS.removeRecursive(fullPath);
+        } else {
+            ok = VFS.remove(fullPath);
+        }
+
+        if (ok) {
+            explorerStatusMsg = "Deleted: " + entry.name;
+        } else {
+            explorerStatusMsg = "Delete failed: " + entry.name;
+        }
+        explorerStatusTimer = 200;
+        loadDir(explorerPath);
+    }
+
+    private static func handleNewFolderInput(KeyEvent event) -> void {
+        # Escape — cancel
+        if (event.scancode == 1) {
+            explorerShowNewFolder = false;
+            explorerNewFolderName = "";
+            explorerDirty = true;
+            return;
+        }
+
+        # Enter — create folder
+        if (event.scancode == 28) {
+            if (explorerNewFolderName.length > 0) {
+                string newPath = explorerPath;
+                if (explorerPath == "/") {
+                    newPath = "/" + explorerNewFolderName;
+                } else {
+                    newPath = explorerPath + "/" + explorerNewFolderName;
+                }
+                bool ok = VFS.mkdir(newPath);
+                if (ok) {
+                    explorerStatusMsg = "Created: " + explorerNewFolderName;
+                } else {
+                    explorerStatusMsg = "Create failed";
+                }
+                explorerStatusTimer = 200;
+                loadDir(explorerPath);
+            }
+            explorerShowNewFolder = false;
+            explorerNewFolderName = "";
+            explorerDirty = true;
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            if (explorerNewFolderName.length > 0) {
+                explorerNewFolderName = explorerNewFolderName.substring(0, explorerNewFolderName.length - 1);
+                explorerDirty = true;
+            }
+            return;
+        }
+
+        # Printable chars
+        if (event.ascii >= 32 && event.ascii < 127) {
+            explorerNewFolderName = explorerNewFolderName + "${event.ascii}";
+            explorerDirty = true;
+        }
+    }
+
+    # ========================================================================
+    # Internal — Helpers
+    # ========================================================================
+
+    private static func getBookmarkName(int idx) -> string {
+        switch (idx) {
+            case 0: return bmName0;
+            case 1: return bmName1;
+            case 2: return bmName2;
+            case 3: return bmName3;
+            case 4: return bmName4;
+            case 5: return bmName5;
+            case 6: return bmName6;
+            default: return "";
+        }
+    }
+
+    private static func getBookmarkPath(int idx) -> string {
+        switch (idx) {
+            case 0: return bmPath0;
+            case 1: return bmPath1;
+            case 2: return bmPath2;
+            case 3: return bmPath3;
+            case 4: return bmPath4;
+            case 5: return bmPath5;
+            case 6: return bmPath6;
+            default: return "";
+        }
+    }
+
+    private static func formatSize(long size) -> string {
+        if (size < 1024) {
+            return "${size} B";
+        } elif (size < 1048576) {
+            int kb = (int)(size / 1024);
+            return "${kb} KB";
+        } else {
+            int mb = (int)(size / 1048576);
+            return "${mb} MB";
+        }
+    }
+}

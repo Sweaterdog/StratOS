@@ -1,0 +1,572 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Taskbar — Bottom panel with app launcher, running apps, and system tray
+// system/windowing/taskbar.lx
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/timer.lx";
+import "kernel/drivers/e1000.lx";
+import "kernel/drivers/net.lx";
+import "system/windowing/theme.lx";
+import "apps/lib/textrender.lx";
+import "apps/lib/launcher.lx";
+import "system/windowing/toast.lx";
+import "system/windowing/lockscreen.lx";
+
+int taskbarX = 0;
+int taskbarY = 0;
+int taskbarW = 0;
+int taskbarH = 0;
+bool taskbarAtTop = false;     # If true, taskbar is at top of screen
+int tbScreenH = 0;              # Cached screen height for position helpers
+
+# Running apps in taskbar
+list<TaskbarApp> taskbarApps = [];
+int taskbarClickedWindowId = -1;  # Set by handleClick, consumed by compositor
+
+# Clock popup state
+bool clockPopupVisible = false;
+
+# Tray action signals (consumed by compositor)
+int trayAction = 0;   # 0=none, 1=toggle notif panel, 2=lock screen
+
+# Volume popup state
+bool volumePopupVisible = false;
+int cachedVolume = 80;   # Cached volume level (synced from AudioEngine by compositor)
+int pendingVolume = -1;  # Set when user adjusts slider, consumed by compositor
+
+struct TaskbarApp {
+    int windowId;
+    string title;
+    string appType;
+    bool isActive;
+}
+
+export class Taskbar {
+    # Initialize the taskbar
+    public static func init(int screenW, int screenH, int height) -> void {
+        taskbarW = screenW;
+        taskbarH = height;
+        taskbarX = 0;
+        tbScreenH = screenH;
+        if (taskbarAtTop) {
+            taskbarY = 0;
+        } else {
+            taskbarY = screenH - height;
+        }
+    }
+
+    # Toggle taskbar position between top and bottom
+    public static func togglePosition() -> void {
+        taskbarAtTop = !taskbarAtTop;
+        if (taskbarAtTop) {
+            taskbarY = 0;
+        } else {
+            taskbarY = tbScreenH - taskbarH;
+        }
+    }
+
+    # Check if taskbar is at top
+    public static func isAtTop() -> bool {
+        return taskbarAtTop;
+    }
+
+    # Get the Y where usable content area starts (below top taskbar, or 0)
+    public static func getContentTop() -> int {
+        if (taskbarAtTop) {
+            return taskbarH;
+        }
+        return 0;
+    }
+
+    # Get the Y where usable content area ends (above bottom taskbar, or screenH)
+    public static func getContentBottom() -> int {
+        if (taskbarAtTop) {
+            return tbScreenH;
+        }
+        return tbScreenH - taskbarH;
+    }
+
+    # Get the usable height (screenH - taskbarH regardless of position)
+    public static func getUsableHeight() -> int {
+        return tbScreenH - taskbarH;
+    }
+
+    # Add an app to the taskbar
+    public static func addApp(int id, string title, string appType) -> void {
+        TaskbarApp app = {
+            windowId: id,
+            title: title,
+            appType: appType,
+            isActive: true
+        };
+        taskbarApps.add(app);
+    }
+
+    # Remove an app from the taskbar
+    public static func removeApp(int id) -> void {
+        for (int i = 0; i < taskbarApps.length; i++) {
+            TaskbarApp app = taskbarApps[i];
+            if (app.windowId == id) {
+                taskbarApps.removeAt(i);
+                break;
+            }
+        }
+    }
+
+    # Set active app in taskbar
+    public static func setActive(int id) -> void {
+        for (int i = 0; i < taskbarApps.length; i++) {
+            taskbarApps[i].isActive = (taskbarApps[i].windowId == id);
+        }
+    }
+
+    # Draw the taskbar
+    public static func draw() -> void {
+        # Background
+        Framebuffer.fillRect(taskbarX, taskbarY, taskbarW, taskbarH, Theme.taskbarBg);
+
+        # Border line — at top edge when bottom, at bottom edge when top
+        if (taskbarAtTop) {
+            Framebuffer.drawHLine(taskbarX, taskbarY + taskbarH - 1, taskbarW, Theme.taskbarBorder);
+        } else {
+            Framebuffer.drawHLine(taskbarX, taskbarY, taskbarW, Theme.taskbarBorder);
+        }
+
+        # StratOS logo / start button (left side)
+        drawStartButton();
+
+        # Running apps (center area)
+        drawAppButtons();
+
+        # System tray (right side)
+        drawSystemTray();
+
+        # Clock popup overlay
+        drawClockPopup();
+
+        # Volume popup overlay
+        drawVolumePopup();
+    }
+
+    # Draw the StratOS start button
+    private static func drawStartButton() -> void {
+        int btnW = 40;
+        int btnH = taskbarH - 8;
+        int btnX = taskbarX + 8;
+        int btnY = taskbarY + 4;
+
+        # Button background
+        Framebuffer.fillRoundedRect(btnX, btnY, btnW, btnH, 4, Theme.buttonBg);
+
+        # Star icon (simplified ★ shape)
+        int cx = btnX + btnW / 2;
+        int cy = btnY + btnH / 2;
+        Framebuffer.fillCircle(cx, cy, 4, Theme.textAccent);
+
+        # Subtle glow ring
+        Framebuffer.drawCircle(cx, cy, 8, 0x5B8CFF40);
+    }
+
+    # Draw buttons for running apps
+    private static func drawAppButtons() -> void {
+        int startX = 64;  # After start button
+        int btnW = 140;
+        int btnH = taskbarH - 12;
+        int padding = 4;
+
+        for (int i = 0; i < taskbarApps.length; i++) {
+            TaskbarApp app = taskbarApps[i];
+            int btnX = startX + i * (btnW + padding);
+            int btnY = taskbarY + 6;
+
+            # Active indicator
+            color32 bg = app.isActive ? Theme.taskbarActiveApp : 0x00000000;
+            Framebuffer.fillRoundedRect(btnX, btnY, btnW, btnH, 4, bg);
+
+            # Active bar (bottom indicator)
+            if (app.isActive) {
+                int barW = 24;
+                int barX = btnX + (btnW - barW) / 2;
+                int barY = taskbarY + taskbarH - 3;
+                Framebuffer.fillRect(barX, barY, barW, 2, Theme.textAccent);
+            }
+
+            # App icon placeholder (small colored dot)
+            color32 iconColor = getAppIconColor(app.appType);
+            Framebuffer.fillCircle(btnX + 14, btnY + btnH / 2, 4, iconColor);
+
+            # Title text
+            int textX = btnX + 26;
+            int textY = btnY + (btnH - 16) / 2;
+            TextRender.drawText(app.title, textX, textY, Theme.taskbarText);
+        }
+    }
+
+    # Draw system tray (clock, volume, network, notifications, lock)
+    private static func drawSystemTray() -> void {
+        int trayX = taskbarW - 200;
+        int trayY = taskbarY + 4;
+        int trayH = taskbarH - 8;
+
+        # Separator
+        Framebuffer.drawVLine(trayX - 8, taskbarY + 8, taskbarH - 16, Theme.taskbarBorder);
+
+        # Volume icon (simple speaker shape)
+        drawVolumeIcon(trayX + 10, trayY + trayH / 2);
+
+        # Network icon (simple wifi bars)
+        drawNetworkIcon(trayX + 40, trayY + trayH / 2);
+
+        # Notification bell icon
+        drawBellIcon(trayX + 70, trayY + trayH / 2);
+
+        # Lock icon
+        drawLockIcon(trayX + 100, trayY + trayH / 2);
+
+        # Clock
+        drawClock(taskbarW - 80, trayY, trayH);
+    }
+
+    # Draw a volume icon
+    private static func drawVolumeIcon(int x, int y) -> void {
+        # Simple speaker shape
+        Framebuffer.fillRect(x - 3, y - 3, 6, 6, Theme.taskbarText);
+        Framebuffer.drawLine(x + 3, y - 5, x + 7, y - 5, Theme.taskbarText);
+        Framebuffer.drawLine(x + 3, y + 5, x + 7, y + 5, Theme.taskbarText);
+    }
+
+    # Draw a network icon — colour reflects real adapter state
+    private static func drawNetworkIcon(int x, int y) -> void {
+        int color = 0x484F58FF;   # Grey = no adapter
+        if (E1000.isPresent()) {
+            if (Net.isConfigured()) {
+                color = 0x3FB950FF;   # Green = connected with IP
+            } else {
+                color = 0xD29922FF;   # Yellow = adapter up, no IP
+            }
+        }
+        Framebuffer.drawCircle(x, y + 4, 3, color);
+        Framebuffer.drawCircle(x, y + 4, 6, color);
+        Framebuffer.drawCircle(x, y + 4, 9, color);
+    }
+
+    # Draw notification bell icon with unread badge
+    private static func drawBellIcon(int x, int y) -> void {
+        # Bell body (dome shape using circles + rect)
+        Framebuffer.fillCircle(x, y - 2, 5, Theme.taskbarText);
+        Framebuffer.fillRect(x - 5, y, 10, 4, Theme.taskbarText);
+        # Bell clapper (small dot at bottom)
+        Framebuffer.fillCircle(x, y + 6, 2, Theme.taskbarText);
+
+        # Unread badge — show dot if panel has unseen notifications
+        if (Toast.getUnreadCount() > 0) {
+            # Red notification dot (top-right of bell)
+            Framebuffer.fillCircle(x + 5, y - 6, 4, 0xF85149FF);
+            # Count text
+            int count = Toast.getUnreadCount();
+            if (count > 9) count = 9;
+            string countStr = "${count}";
+            TextRender.drawText(countStr, x + 2, y - 13, 0xFFFFFFFF);
+        }
+    }
+
+    # Draw lock status icon
+    private static func drawLockIcon(int x, int y) -> void {
+        # Lock body (padlock shape)
+        if (LockScreen.isAutoLockEnabled()) {
+            # Active lock icon (filled)
+            Framebuffer.fillRect(x - 4, y - 1, 8, 6, Theme.taskbarText);
+            # Shackle (arc shape)
+            Framebuffer.drawCircle(x, y - 4, 4, Theme.taskbarText);
+        } else {
+            # Inactive lock (outline only)
+            Framebuffer.drawRect(x - 4, y - 1, 8, 6, Theme.taskbarText);
+            Framebuffer.drawCircle(x, y - 4, 4, 0x484F58FF);
+        }
+    }
+
+    # Consume a tray action (called by compositor each frame)
+    public static func consumeTrayAction() -> int {
+        int action = trayAction;
+        trayAction = 0;
+        return action;
+    }
+
+    # Draw clock showing real time from RTC as HH:MM
+    private static func drawClock(int x, int y, int h) -> void {
+        int hours = Timer.getRtcHours();
+        int minutes = Timer.getRtcMinutes();
+
+        # Format HH:MM
+        string h0 = "${hours}";
+        string m0 = "${minutes}";
+
+        string timeStr = "";
+        if (hours < 10) timeStr = "0";
+        timeStr = "${timeStr}${h0}:";
+        if (minutes < 10) timeStr = "${timeStr}0";
+        timeStr = "${timeStr}${m0}";
+
+        int textW = timeStr.length * 8;
+        int textX = x + 20 - textW / 2;
+        int textY = y + (h - 16) / 2;
+        TextRender.drawText(timeStr, textX, textY, Theme.taskbarClock);
+    }
+
+    # Draw clock popup with full date/time info
+    private static func drawClockPopup() -> void {
+        if (!clockPopupVisible) return;
+
+        int popW = 240;
+        int popH = 160;
+        int popX = taskbarW - popW - 8;
+        int popY = 0;
+        if (taskbarAtTop) {
+            popY = taskbarH + 4;
+        } else {
+            popY = taskbarY - popH - 4;
+        }
+        int charH = TextRender.getCharHeight();
+
+        # Background with border
+        Framebuffer.fillRect(popX, popY, popW, popH, 0x1C2333FF);
+        Framebuffer.drawRect(popX, popY, popW, popH, 0x5B8CFF60);
+
+        int py = popY + 12;
+
+        # Day of week
+        string dow = Timer.getRtcDayOfWeek();
+        TextRender.drawText(dow, popX + 16, py, 0xC8D0E0FF);
+        py = py + charH + 6;
+
+        # Full date: Month Day, 20XX
+        int month = Timer.getRtcMonth();
+        int day = Timer.getRtcDay();
+        int year = Timer.getRtcYear();
+        string monthName = Timer.getMonthName(month);
+        string dayStr = "${day}";
+        string yearStr = "${year}";
+        string dateStr = monthName + " " + dayStr + ", 20" + yearStr;
+        TextRender.drawText(dateStr, popX + 16, py, 0xA0A8B8FF);
+        py = py + charH + 12;
+
+        # Large time display HH:MM:SS
+        int hours = Timer.getRtcHours();
+        int minutes = Timer.getRtcMinutes();
+        int seconds = Timer.getRtcSeconds();
+        string hStr = "${hours}";
+        string mStr = "${minutes}";
+        string sStr = "${seconds}";
+        string bigTime = "";
+        if (hours < 10) bigTime = "0";
+        bigTime = bigTime + hStr + ":";
+        if (minutes < 10) bigTime = bigTime + "0";
+        bigTime = bigTime + mStr + ":";
+        if (seconds < 10) bigTime = bigTime + "0";
+        bigTime = bigTime + sStr;
+
+        # Center the large time
+        int timeW = bigTime.length * 8;
+        TextRender.drawText(bigTime, popX + (popW - timeW) / 2, py, 0xFFFFFFFF);
+        py = py + charH + 16;
+
+        # Separator
+        Framebuffer.drawHLine(popX + 12, py, popW - 24, 0x30363DFF);
+        py = py + 8;
+
+        # Uptime
+        int totalSec = Timer.getTicks() / Timer.getFrequency();
+        int uh = totalSec / 3600;
+        int um = (totalSec - uh * 3600) / 60;
+        string uhStr = "${uh}";
+        string umStr = "${um}";
+        string uptimeStr = "Uptime: " + uhStr + "h " + umStr + "m";
+        TextRender.drawText(uptimeStr, popX + 16, py, 0x6B7280FF);
+    }
+
+    # Draw volume popup with slider
+    private static func drawVolumePopup() -> void {
+        if (!volumePopupVisible) return;
+
+        int trayX = taskbarW - 200;
+        int popW = 60;
+        int popH = 160;
+        int popX = trayX + 10 - popW / 2;
+        int popY = 0;
+        if (taskbarAtTop) {
+            popY = taskbarH + 4;
+        } else {
+            popY = taskbarY - popH - 4;
+        }
+
+        # Background with border
+        Framebuffer.fillRoundedRect(popX, popY, popW, popH, 8, 0x1C2333FF);
+        Framebuffer.drawRoundedRect(popX, popY, popW, popH, 8, 0x30363DFF);
+
+        int vol = cachedVolume;
+        string volStr = "${vol}%";
+
+        # Volume label at top
+        int labelW = volStr.length * 8;
+        TextRender.drawText(volStr, popX + (popW - labelW) / 2, popY + 8, 0xE6EDF3FF);
+
+        # Vertical slider track
+        int trackX = popX + popW / 2 - 2;
+        int trackY = popY + 30;
+        int trackH = popH - 50;
+        int trackW = 4;
+        Framebuffer.fillRoundedRect(trackX, trackY, trackW, trackH, 2, 0x30363DFF);
+
+        # Fill portion (from bottom up)
+        int fillH = (vol * trackH) / 100;
+        int fillY = trackY + trackH - fillH;
+        Framebuffer.fillRoundedRect(trackX, fillY, trackW, fillH, 2, 0x58A6FFFF);
+
+        # Thumb circle
+        int thumbY = fillY - 4;
+        if (thumbY < trackY - 4) thumbY = trackY - 4;
+        Framebuffer.fillCircle(trackX + 2, thumbY + 4, 6, 0xE6EDF3FF);
+        Framebuffer.drawCircle(trackX + 2, thumbY + 4, 6, 0x58A6FFFF);
+
+        # Mute indicator
+        if (vol == 0) {
+            TextRender.drawText("MUTE", popX + 14, popY + popH - 18, 0xF85149FF);
+        }
+    }
+
+    # Handle clicks inside the volume popup (slider interaction)
+    public static func handleVolumePopupClick(int mx, int my) -> bool {
+        if (!volumePopupVisible) return false;
+
+        int trayX = taskbarW - 200;
+        int popW = 60;
+        int popH = 160;
+        int popX = trayX + 10 - popW / 2;
+        int popY = 0;
+        if (taskbarAtTop) {
+            popY = taskbarH + 4;
+        } else {
+            popY = taskbarY - popH - 4;
+        }
+
+        # Check if click is inside the popup
+        if (mx < popX || mx >= popX + popW || my < popY || my >= popY + popH) {
+            volumePopupVisible = false;
+            return false;
+        }
+
+        # Map click Y to volume (30px from top to popH-20 from bottom)
+        int trackY = popY + 30;
+        int trackH = popH - 50;
+        int trackBottom = trackY + trackH;
+
+        if (my >= trackY && my <= trackBottom) {
+            int relY = trackBottom - my;  # 0 at bottom, trackH at top
+            int newVol = (relY * 100) / trackH;
+            if (newVol < 0) newVol = 0;
+            if (newVol > 100) newVol = 100;
+            cachedVolume = newVol;
+            pendingVolume = newVol;
+        }
+
+        return true;
+    }
+
+    # Check if volume popup is visible
+    public static func isVolumePopupVisible() -> bool {
+        return volumePopupVisible;
+    }
+
+    # Sync volume from audio engine (called by compositor)
+    public static func syncVolume(int vol) -> void {
+        cachedVolume = vol;
+    }
+
+    # Consume pending volume change (called by compositor, returns -1 if none)
+    public static func consumePendingVolume() -> int {
+        int v = pendingVolume;
+        pendingVolume = -1;
+        return v;
+    }
+
+    # Get icon color for app type
+    private static func getAppIconColor(string appType) -> color32 {
+        switch (appType) {
+            case "terminal":  return 0x69F0AEFF;  # Green
+            case "editor":    return 0x5B8CFFFF;  # Blue
+            case "explorer":  return 0xFFB74DFF;  # Amber
+            case "browser":   return 0xBB86FCFF;  # Purple
+            case "music":     return 0xFF5252FF;  # Red
+            default:          return 0xC8D0E0FF;  # Silver
+        }
+    }
+
+    # Handle a mouse click in the taskbar area
+    public static func handleClick(int mx, int my) -> void {
+        int trayX = taskbarW - 200;
+
+        # Clock area click — toggle popup
+        if (mx >= taskbarW - 80) {
+            clockPopupVisible = !clockPopupVisible;
+            volumePopupVisible = false;
+            return;
+        }
+
+        # Volume icon click (trayX-5 to trayX+25) — toggle volume popup
+        if (mx >= trayX - 5 && mx < trayX + 25) {
+            volumePopupVisible = !volumePopupVisible;
+            clockPopupVisible = false;
+            return;
+        }
+
+        # Bell icon click (trayX+55 to trayX+85) — toggle notification panel
+        if (mx >= trayX + 55 && mx < trayX + 85) {
+            trayAction = 1;  # Toggle notification panel
+            clockPopupVisible = false;
+            volumePopupVisible = false;
+            return;
+        }
+
+        # Lock icon click (trayX+85 to trayX+115) — lock screen
+        if (mx >= trayX + 85 && mx < trayX + 115) {
+            trayAction = 2;  # Lock screen
+            clockPopupVisible = false;
+            volumePopupVisible = false;
+            return;
+        }
+
+        # Close popups on any other click
+        clockPopupVisible = false;
+        volumePopupVisible = false;
+
+        # Check start button (x: 8..48, y: taskbarY+4 .. taskbarY+taskbarH-4)
+        if (mx >= 8 && mx < 48) {
+            # Start button clicked — toggle app launcher
+            Launcher.toggle();
+            return;
+        }
+
+        # Check app buttons
+        int startX = 64;
+        int btnW = 140;
+        int padding = 4;
+        for (int i = 0; i < taskbarApps.length; i++) {
+            int btnX = startX + i * (btnW + padding);
+            if (mx >= btnX && mx < btnX + btnW) {
+                # Clicked on app button — focus the window
+                # The compositor will handle the actual focus via its focusWindow
+                taskbarClickedWindowId = taskbarApps[i].windowId;
+                return;
+            }
+        }
+    }
+
+    # Check and consume a taskbar click (returns window ID or -1)
+    public static func consumeClick() -> int {
+        int id = taskbarClickedWindowId;
+        taskbarClickedWindowId = -1;
+        return id;
+    }
+}

@@ -1,0 +1,277 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Help Viewer — Keyboard shortcuts and app documentation
+// apps/help/help.lx
+//
+// Displays system shortcuts, app-specific help, and general usage tips.
+// Navigate sections with Up/Down, scroll content with Page Up/Down.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Help viewer state
+int helpSection = 0;         # Current section index
+int helpScroll = 0;          # Scroll offset within section
+int HELP_SECTION_COUNT = 6;
+
+export class HelpApp {
+    public static func init() -> void {
+        helpSection = 0;
+        helpScroll = 0;
+    }
+
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Tab — next section
+        if (event.scancode == 15) {
+            helpSection = helpSection + 1;
+            if (helpSection >= HELP_SECTION_COUNT) helpSection = 0;
+            helpScroll = 0;
+            return;
+        }
+
+        # Up arrow — previous section
+        if (event.scancode == 72) {
+            if (helpScroll > 0) {
+                helpScroll = helpScroll - 1;
+            } else {
+                if (helpSection > 0) {
+                    helpSection = helpSection - 1;
+                    helpScroll = 0;
+                }
+            }
+            return;
+        }
+
+        # Down arrow — scroll down
+        if (event.scancode == 80) {
+            helpScroll = helpScroll + 1;
+            return;
+        }
+
+        # Page Up
+        if (event.scancode == 73) {
+            helpScroll = helpScroll - 8;
+            if (helpScroll < 0) helpScroll = 0;
+            return;
+        }
+
+        # Page Down
+        if (event.scancode == 81) {
+            helpScroll = helpScroll + 8;
+            return;
+        }
+    }
+
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int charH = TextRender.getCharHeight();
+        # Sidebar click — select section
+        if (relX < 160) {
+            int clickedIdx = (relY - 12) / (charH + 8);
+            if (clickedIdx >= 0 && clickedIdx < HELP_SECTION_COUNT) {
+                helpSection = clickedIdx;
+                helpScroll = 0;
+            }
+        }
+    }
+
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+        color32 bg = 0x161B22FF;
+        color32 sidebarBg = 0x1C2333FF;
+        color32 selBg = 0x2A4A7FFF;
+        color32 headColor = 0x5B8CFFFF;
+        color32 textColor = 0xC8D0E0FF;
+        color32 dimColor = 0x6B7280FF;
+        color32 keyColor = 0xFFA657FF;
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, bg);
+
+        # Sidebar
+        int sideW = 160;
+        Framebuffer.fillRect(x, y, sideW, h, sidebarBg);
+
+        # Section list
+        int sy = y + 12;
+        int sectionH = charH + 8;
+        for (int i = 0; i < HELP_SECTION_COUNT; i++) {
+            color32 sbg = sidebarBg;
+            if (i == helpSection) sbg = selBg;
+            Framebuffer.fillRect(x, sy, sideW, sectionH, sbg);
+            string sName = getSectionName(i);
+            TextRender.drawText(sName, x + 12, sy + 4, textColor);
+            sy = sy + sectionH;
+        }
+
+        # Content area
+        int cx = x + sideW + 16;
+        int cy = y + 12;
+        int contentMaxW = w - sideW - 32;
+
+        # Section title
+        string title = getSectionName(helpSection);
+        TextRender.drawText(title, cx, cy, headColor);
+        cy = cy + charH + 8;
+        Framebuffer.drawHLine(cx, cy, contentMaxW, 0x30363DFF);
+        cy = cy + 8;
+
+        # Section content (scrolled)
+        int lineH = charH + 4;
+        int startLine = helpScroll;
+        int maxLines = (h - 40) / lineH;
+
+        switch (helpSection) {
+            case 0: drawDesktopShortcuts(cx, cy, lineH, startLine, maxLines, keyColor, textColor, dimColor); break;
+            case 1: drawEditorHelp(cx, cy, lineH, startLine, maxLines, keyColor, textColor, dimColor); break;
+            case 2: drawTerminalHelp(cx, cy, lineH, startLine, maxLines, keyColor, textColor, dimColor); break;
+            case 3: drawExplorerHelp(cx, cy, lineH, startLine, maxLines, keyColor, textColor, dimColor); break;
+            case 4: drawBrowserHelp(cx, cy, lineH, startLine, maxLines, keyColor, textColor, dimColor); break;
+            case 5: drawAbout(cx, cy, lineH, startLine, maxLines, keyColor, textColor, dimColor); break;
+            default: break;
+        }
+    }
+
+    private static func getSectionName(int idx) -> string {
+        switch (idx) {
+            case 0: return "Desktop";
+            case 1: return "Editor";
+            case 2: return "Terminal";
+            case 3: return "Files";
+            case 4: return "Browser";
+            case 5: return "About";
+            default: return "";
+        }
+    }
+
+    # ====================================================================
+    # Section renderers
+    # ====================================================================
+
+    private static func drawLine(string text, int x, int cy, int lineIdx, int startLine, int maxLines, int lineH, color32 col) -> int {
+        int dispIdx = lineIdx - startLine;
+        if (dispIdx >= 0 && dispIdx < maxLines) {
+            TextRender.drawText(text, x, cy + dispIdx * lineH, col);
+        }
+        return lineIdx + 1;
+    }
+
+    private static func drawDesktopShortcuts(int x, int cy, int lineH, int start, int max, color32 kc, color32 tc, color32 dc) -> void {
+        int li = 0;
+        li = drawLine("WINDOW MANAGEMENT", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Super           Open app launcher", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Alt+F4          Close focused window", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Click titlebar  Drag to move window", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Drag edges      Resize window", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Drag to edge    Snap window (half/quad)", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Drag to top     Maximize window", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("DESKTOP", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Double-click    Launch app from icon", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Click icon      Select icon", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Drag icon       Rearrange desktop icons", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Delete          Remove selected icon", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Right-click     Desktop context menu", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("SYSTEM", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Click clock     Show date/time popup", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Taskbar button  Focus / unminimize app", x, cy, li, start, max, lineH, tc);
+    }
+
+    private static func drawEditorHelp(int x, int cy, int lineH, int start, int max, color32 kc, color32 tc, color32 dc) -> void {
+        int li = 0;
+        li = drawLine("FILE OPERATIONS", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Ctrl+S          Save file", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Ctrl+N          New file", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Ctrl+O          Open file (type path)", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("EDITING", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Ctrl+Z          Undo last edit", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Ctrl+F          Find text", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Ctrl+G          Go to line number", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Tab             Insert 4 spaces", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Home / End      Move to line start/end", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  PgUp / PgDn     Scroll page up/down", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("FEATURES", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Line numbers    Shown in left gutter", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Syntax colors   Keywords highlighted", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Auto-indent     Preserved on Enter", x, cy, li, start, max, lineH, tc);
+    }
+
+    private static func drawTerminalHelp(int x, int cy, int lineH, int start, int max, color32 kc, color32 tc, color32 dc) -> void {
+        int li = 0;
+        li = drawLine("SHORTCUTS", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Ctrl+T          Cycle color theme", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Ctrl+L          Clear screen", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Ctrl+C          Cancel input", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Tab             Path autocomplete", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Up / Down       Browse command history", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  PgUp / PgDn     Scroll output", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("COMMON COMMANDS", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  help            Show available commands", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  ls / dir        List directory contents", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  cd <path>       Change directory", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  cat <file>      Display file content", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  mkdir <name>    Create directory", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  rm <path>       Remove file", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  echo <text>     Print text", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  clear           Clear terminal output", x, cy, li, start, max, lineH, tc);
+    }
+
+    private static func drawExplorerHelp(int x, int cy, int lineH, int start, int max, color32 kc, color32 tc, color32 dc) -> void {
+        int li = 0;
+        li = drawLine("NAVIGATION", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Click folder    Open folder", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Click file      Open in Editor", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Sidebar links   Quick jump to folders", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Back arrow      Navigate to parent", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("FILE INFO", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Name column     File or folder name", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Size column     File size (B/KB/MB)", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Folders shown   With '/' suffix", x, cy, li, start, max, lineH, tc);
+    }
+
+    private static func drawBrowserHelp(int x, int cy, int lineH, int start, int max, color32 kc, color32 tc, color32 dc) -> void {
+        int li = 0;
+        li = drawLine("NAVIGATION", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Click URL bar   Type a URL", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Enter           Navigate to URL", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Bookmarks       Click to visit page", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("SEARCH", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Home search     Type to search VoidSearch", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  URL bar text    Non-URL text = search", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Click result    Open encyclopedia article", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("BUILT-IN PAGES", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  stratos://home       Home page", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  stratos://settings   Settings page", x, cy, li, start, max, lineH, tc);
+    }
+
+    private static func drawAbout(int x, int cy, int lineH, int start, int max, color32 kc, color32 tc, color32 dc) -> void {
+        int li = 0;
+        li = drawLine("StratOS — The Cosmic Desktop", x, cy, li, start, max, lineH, kc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("A complete desktop operating system", x, cy, li, start, max, lineH, tc);
+        li = drawLine("written entirely in Flux.", x, cy, li, start, max, lineH, tc);
+        li = drawLine("", x, cy, li, start, max, lineH, tc);
+        li = drawLine("INCLUDED APPS", x, cy, li, start, max, lineH, kc);
+        li = drawLine("  Terminal        Command-line shell", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Editor          Text editor with syntax HL", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Files           File explorer with VFS", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Browser         Web browser with search", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Calculator      Math with history panel", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Music           Audio player", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Notes           Quick notepad", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Monitor         System process manager", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Settings        System preferences", x, cy, li, start, max, lineH, tc);
+        li = drawLine("  Help            This help viewer", x, cy, li, start, max, lineH, tc);
+    }
+}

@@ -1,0 +1,290 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// System Monitor — Process manager and system info viewer
+// apps/sysmon/sysmon.lx
+//
+// Displays running windows/processes, system uptime, and heap usage.
+// Allows user to select and kill processes.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Process entry data (populated by compositor each frame)
+list<string> smProcTitles;
+list<string> smProcTypes;
+list<int>    smProcIds;
+list<int>    smProcMinimized;     # 0 = visible, 1 = minimized
+
+# System info
+int smUptimeTicks = 0;
+int smTickFreq    = 100;
+
+# State
+int smSelectedIdx = -1;
+int smScrollOffset = 0;
+
+# Kill request (consumed by compositor)
+int smKillRequestId  = -1;
+int smFocusRequestId = -1;
+
+export class SysMonApp {
+    # =====================================================================
+    # Init
+    # =====================================================================
+    public static func init() -> void {
+        smProcTitles.clear();
+        smProcTypes.clear();
+        smProcIds.clear();
+        smProcMinimized.clear();
+        smSelectedIdx = -1;
+        smScrollOffset = 0;
+        smKillRequestId = -1;
+        smFocusRequestId = -1;
+    }
+
+    # =====================================================================
+    # Data refresh — called by compositor before render
+    # =====================================================================
+    public static func beginRefresh(int ticks, int freq) -> void {
+        smProcTitles.clear();
+        smProcTypes.clear();
+        smProcIds.clear();
+        smProcMinimized.clear();
+        smUptimeTicks = ticks;
+        smTickFreq = freq;
+    }
+
+    public static func addProcEntry(string title, string appType, int id, int minimized) -> void {
+        smProcTitles.add(title);
+        smProcTypes.add(appType);
+        smProcIds.add(id);
+        smProcMinimized.add(minimized);
+    }
+
+    # Consume a kill request (returns -1 if none)
+    public static func consumeKillRequest() -> int {
+        int id = smKillRequestId;
+        smKillRequestId = -1;
+        return id;
+    }
+
+    # Consume a focus request (returns -1 if none)
+    public static func consumeFocusRequest() -> int {
+        int id = smFocusRequestId;
+        smFocusRequestId = -1;
+        return id;
+    }
+
+    # =====================================================================
+    # Input
+    # =====================================================================
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        int count = smProcTitles.length;
+
+        # Arrow Up — select previous
+        if (event.scancode == 72) {
+            if (smSelectedIdx > 0) {
+                smSelectedIdx = smSelectedIdx - 1;
+            } elif (smSelectedIdx == -1 && count > 0) {
+                smSelectedIdx = 0;
+            }
+            return;
+        }
+
+        # Arrow Down — select next
+        if (event.scancode == 80) {
+            if (smSelectedIdx < count - 1) {
+                smSelectedIdx = smSelectedIdx + 1;
+            }
+            return;
+        }
+
+        # Delete or Backspace — kill selected process
+        if (event.scancode == 83 || event.scancode == 14) {
+            if (smSelectedIdx >= 0 && smSelectedIdx < count) {
+                # Don't allow killing the sysmon itself
+                if (smProcTypes[smSelectedIdx] != "sysmon") {
+                    smKillRequestId = smProcIds[smSelectedIdx];
+                }
+            }
+            return;
+        }
+
+        # Enter — focus selected process
+        if (event.scancode == 28) {
+            if (smSelectedIdx >= 0 && smSelectedIdx < count) {
+                smFocusRequestId = smProcIds[smSelectedIdx];
+            }
+            return;
+        }
+    }
+
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int charH = TextRender.getCharHeight();
+        int headerH = 94;     # 72px header + 22px column header row
+        int rowH = charH + 6; # Row height with padding
+        int count = smProcTitles.length;
+
+        # Click in process list area
+        if (relY >= headerH) {
+            int clickedRow = (relY - headerH) / rowH;
+            if (clickedRow >= 0 && clickedRow < count) {
+                smSelectedIdx = clickedRow;
+            }
+        }
+
+        # Kill button at bottom — check if clicked
+        int btnY = contentH - 36;
+        int btnW = 100;
+        int btnX = contentW - btnW - 16;
+        if (relY >= btnY && relY < btnY + 28 && relX >= btnX && relX < btnX + btnW) {
+            if (smSelectedIdx >= 0 && smSelectedIdx < count) {
+                if (smProcTypes[smSelectedIdx] != "sysmon") {
+                    smKillRequestId = smProcIds[smSelectedIdx];
+                }
+            }
+        }
+
+        # Focus button
+        int focusBtnX = btnX - btnW - 12;
+        if (relY >= btnY && relY < btnY + 28 && relX >= focusBtnX && relX < focusBtnX + btnW) {
+            if (smSelectedIdx >= 0 && smSelectedIdx < count) {
+                smFocusRequestId = smProcIds[smSelectedIdx];
+            }
+        }
+    }
+
+    # =====================================================================
+    # Drawing
+    # =====================================================================
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+        color32 bg = 0x1A1D23FF;
+        color32 headerBg = 0x21252BFF;
+        color32 rowBg = 0x1E2228FF;
+        color32 rowAltBg = 0x242830FF;
+        color32 selBg = 0x2A4A7FFF;
+        color32 textColor = 0xD0D4DCFF;
+        color32 dimColor = 0x6B7280FF;
+        color32 accentColor = 0x5B8CFFFF;
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, bg);
+
+        # ---- Header Section ----
+        int py = y + 8;
+        Framebuffer.fillRect(x, y, w, 72, headerBg);
+
+        # Title
+        TextRender.drawText("System Monitor", x + 12, py, accentColor);
+        py = py + charH + 4;
+
+        # Uptime
+        int totalSecs = smUptimeTicks / smTickFreq;
+        int hours = totalSecs / 3600;
+        int mins = (totalSecs - hours * 3600) / 60;
+        int secs = totalSecs - hours * 3600 - mins * 60;
+        string uptimeStr = "Uptime: " + "${hours}" + "h " + "${mins}" + "m " + "${secs}" + "s";
+        TextRender.drawText(uptimeStr, x + 12, py, textColor);
+
+        # Process count on the right
+        string countStr = "${smProcTitles.length}" + " processes";
+        int countX = x + w - countStr.length * charW - 12;
+        TextRender.drawText(countStr, countX, py, dimColor);
+        py = py + charH + 4;
+
+        # ---- Column Headers ----
+        int headerY = y + 72;
+        Framebuffer.fillRect(x, headerY, w, charH + 6, 0x2D333BFF);
+        int colId = x + 8;
+        int colTitle = x + 60;
+        int colType = x + w - 220;
+        int colStatus = x + w - 100;
+        TextRender.drawText("ID", colId, headerY + 3, dimColor);
+        TextRender.drawText("Title", colTitle, headerY + 3, dimColor);
+        TextRender.drawText("Type", colType, headerY + 3, dimColor);
+        TextRender.drawText("Status", colStatus, headerY + 3, dimColor);
+
+        # ---- Process Rows ----
+        int rowH = charH + 6;
+        int listY = headerY + rowH;
+        int maxRows = (h - 80 - 44) / rowH;  # Leave room for header + footer
+        int count = smProcTitles.length;
+
+        # Clamp selection
+        if (smSelectedIdx >= count) {
+            smSelectedIdx = count - 1;
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (i >= maxRows) break;
+
+            int ry = listY + i * rowH;
+
+            # Row background
+            color32 rbg = rowBg;
+            if (i == smSelectedIdx) {
+                rbg = selBg;
+            } elif (i % 2 == 1) {
+                rbg = rowAltBg;
+            }
+            Framebuffer.fillRect(x, ry, w, rowH, rbg);
+
+            # ID
+            string idStr = "${smProcIds[i]}";
+            TextRender.drawText(idStr, colId, ry + 3, dimColor);
+
+            # Title (truncate if needed)
+            string title = smProcTitles[i];
+            int maxTitleChars = (colType - colTitle - 8) / charW;
+            if (title.length > maxTitleChars) {
+                title = title.substring(0, maxTitleChars - 2) + "..";
+            }
+            TextRender.drawText(title, colTitle, ry + 3, textColor);
+
+            # Type
+            TextRender.drawText(smProcTypes[i], colType, ry + 3, dimColor);
+
+            # Status
+            if (smProcMinimized[i] == 1) {
+                TextRender.drawText("Hidden", colStatus, ry + 3, 0xFFA657FF);
+            } else {
+                TextRender.drawText("Active", colStatus, ry + 3, 0x69F0AEFF);
+            }
+        }
+
+        # ---- Footer Bar ----
+        int footerY = y + h - 36;
+        Framebuffer.fillRect(x, footerY, w, 36, headerBg);
+
+        # Instructions
+        TextRender.drawText("Up/Down: Select  Enter: Focus  Del: Kill", x + 12, footerY + 10, dimColor);
+
+        # Kill button
+        int btnW = 100;
+        int btnH = 28;
+        int killBtnX = x + w - btnW - 16;
+        int killBtnY = footerY + 4;
+        color32 killBtnColor = 0x6B2020FF;
+        if (smSelectedIdx >= 0 && smSelectedIdx < count) {
+            if (smProcTypes[smSelectedIdx] != "sysmon") {
+                killBtnColor = 0xDC3545FF;
+            }
+        }
+        Framebuffer.fillRect(killBtnX, killBtnY, btnW, btnH, killBtnColor);
+        int killTextX = killBtnX + (btnW - 4 * charW) / 2;
+        TextRender.drawText("Kill", killTextX, killBtnY + 6, 0xFFFFFFFF);
+
+        # Focus button
+        int focusBtnX = killBtnX - btnW - 12;
+        Framebuffer.fillRect(focusBtnX, killBtnY, btnW, btnH, 0x2A4A7FFF);
+        int focusTextX = focusBtnX + (btnW - 5 * charW) / 2;
+        TextRender.drawText("Focus", focusTextX, killBtnY + 6, 0xFFFFFFFF);
+    }
+}

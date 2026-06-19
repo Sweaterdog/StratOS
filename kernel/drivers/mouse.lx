@@ -1,0 +1,282 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// PS/2 Mouse Driver — Handles mouse input via IRQ12
+// kernel/drivers/mouse.lx
+//
+// The PS/2 mouse uses the 8042 keyboard controller (ports 0x60/0x64).
+// Mouse data arrives as 3-byte packets on IRQ12 (vector 44).
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+
+# ============================================================================
+# PS/2 Controller Ports (shared with keyboard)
+# ============================================================================
+int MOUSE_DATA_PORT = 0x60;
+int MOUSE_CMD_PORT = 0x64;
+int MOUSE_STATUS_PORT = 0x64;
+
+# Mouse IRQ = 12 on the slave PIC (bit 4 of PIC2 mask)
+int MOUSE_IRQ = 12;
+int MOUSE_VECTOR = 44;   # 40 + (12 - 8)
+
+# ============================================================================
+# Mouse State
+# ============================================================================
+int mouseXPos = 0;       # Absolute X position (clamped to screen)
+int mouseYPos = 0;       # Absolute Y position (clamped to screen)
+int mouseScreenW = 1024; # Screen width for clamping
+int mouseScreenH = 768;  # Screen height for clamping
+
+bool mouseLeftBtn = false;
+bool mouseRightBtn = false;
+bool mouseMiddleBtn = false;
+
+# Packet assembly — PS/2 mouse sends 3 bytes per event
+int mouseCycle = 0;      # Which byte we're expecting (0, 1, or 2)
+int mouseByte0 = 0;      # Flags: buttons, sign bits, overflow
+int mouseByte1 = 0;      # Delta X (unsigned, sign in byte 0)
+int mouseByte2 = 0;      # Delta Y (unsigned, sign in byte 0)
+
+# Mouse event buffer
+list<MouseEvent> mouseBuffer = [];
+int MOUSE_BUFFER_SIZE = 64;
+
+# Mouse event structure
+export struct MouseEvent {
+    int x;                # Absolute X position
+    int y;                # Absolute Y position
+    int deltaX;           # Relative X movement
+    int deltaY;           # Relative Y movement
+    bool leftBtn;         # Left button pressed
+    bool rightBtn;        # Right button pressed
+    bool middleBtn;       # Middle button pressed
+}
+
+export class Mouse {
+    # ========================================================================
+    # Initialization
+    # ========================================================================
+
+    public static func init(int screenW, int screenH) -> void {
+        mouseScreenW = screenW;
+        mouseScreenH = screenH;
+        mouseXPos = screenW / 2;
+        mouseYPos = screenH / 2;
+        mouseCycle = 0;
+
+        # Enable the PS/2 auxiliary (mouse) device
+        enableMouse();
+
+        # Register IRQ12 handler (vector 44)
+        IDT.registerHandler(MOUSE_VECTOR, mouseInterruptHandler);
+
+        # Unmask IRQ12 on the slave PIC (bit 4)
+        unsafe {
+            # First, enable IRQ2 on master PIC (cascade line to slave)
+            byte mask1 = inb(PIC1_DATA);
+            mask1 = mask1 & ~(1 << 2);   # Clear bit 2 (IRQ2 = cascade)
+            outb(PIC1_DATA, mask1);
+
+            # Then unmask IRQ12 on slave PIC (bit 4)
+            byte mask2 = inb(PIC2_DATA);
+            mask2 = mask2 & ~(1 << 4);   # Clear bit 4 (IRQ12 = mouse)
+            outb(PIC2_DATA, mask2);
+        }
+    }
+
+    # Enable the PS/2 mouse via the 8042 controller
+    private static func enableMouse() -> void {
+        unsafe {
+            # Wait for controller to be ready
+            waitWrite();
+
+            # Enable the auxiliary device (mouse port)
+            outb(MOUSE_CMD_PORT, 0xA8);
+
+            # Get the current controller configuration byte
+            waitWrite();
+            outb(MOUSE_CMD_PORT, 0x20);  # Read command byte
+            waitRead();
+            byte config = inb(MOUSE_DATA_PORT);
+
+            # Set bit 1 (enable IRQ12) and bit 5 (mouse clock) if needed
+            config = config | 0x02;      # Enable IRQ12
+            config = config & ~0x20;     # Clear bit 5 (enable mouse clock)
+
+            # Write back the config byte
+            waitWrite();
+            outb(MOUSE_CMD_PORT, 0x60);  # Write command byte
+            waitWrite();
+            outb(MOUSE_DATA_PORT, config);
+
+            # Tell the mouse to use default settings
+            mouseWrite(0xF6);
+            mouseRead();  # ACK
+
+            # Enable data reporting (mouse will start sending packets)
+            mouseWrite(0xF4);
+            mouseRead();  # ACK
+        }
+    }
+
+    # ========================================================================
+    # Public API
+    # ========================================================================
+
+    # Get current mouse position
+    public static func getX() -> int { return mouseXPos; }
+    public static func getY() -> int { return mouseYPos; }
+
+    # Get button state
+    public static func isLeftDown() -> bool { return mouseLeftBtn; }
+    public static func isRightDown() -> bool { return mouseRightBtn; }
+    public static func isMiddleDown() -> bool { return mouseMiddleBtn; }
+
+    # Poll next mouse event (non-blocking, returns event with deltaX=0 if empty)
+    public static func pollEvent() -> MouseEvent {
+        unsafe { asm("cli"); }
+        if (mouseBuffer.length == 0) {
+            unsafe { asm("sti"); }
+            return {
+                x: mouseXPos, y: mouseYPos,
+                deltaX: 0, deltaY: 0,
+                leftBtn: mouseLeftBtn, rightBtn: mouseRightBtn,
+                middleBtn: mouseMiddleBtn
+            };
+        }
+        MouseEvent event = mouseBuffer[0];
+        mouseBuffer.removeAt(0);
+        unsafe { asm("sti"); }
+        return event;
+    }
+
+    # Check if mouse events are pending
+    public static func hasEvent() -> bool {
+        asm("" ::: "memory");
+        return mouseBuffer.length > 0;
+    }
+
+    # ========================================================================
+    # Helper: PS/2 Controller I/O
+    # ========================================================================
+
+    # Wait until the controller input buffer is empty (safe to write)
+    private static func waitWrite() -> void {
+        unsafe {
+            for (int i = 0; i < 100000; i++) {
+                if ((inb(MOUSE_STATUS_PORT) & 0x02) == 0) return;
+            }
+        }
+    }
+
+    # Wait until the controller output buffer has data (safe to read)
+    private static func waitRead() -> void {
+        unsafe {
+            for (int i = 0; i < 100000; i++) {
+                if ((inb(MOUSE_STATUS_PORT) & 0x01) != 0) return;
+            }
+        }
+    }
+
+    # Write a byte to the mouse (via 0xD4 command prefix)
+    private static func mouseWrite(int data) -> void {
+        unsafe {
+            waitWrite();
+            outb(MOUSE_CMD_PORT, 0xD4);  # Tell controller: next byte is for mouse
+            waitWrite();
+            outb(MOUSE_DATA_PORT, data);
+        }
+    }
+
+    # Read a byte from the mouse
+    private static func mouseRead() -> int {
+        unsafe {
+            waitRead();
+            return (int) inb(MOUSE_DATA_PORT);
+        }
+    }
+}
+
+# ============================================================================
+# Mouse Interrupt Handler (IRQ12 → Vector 44)
+# ============================================================================
+func mouseInterruptHandler(int vector, long errorCode) -> void {
+    unsafe {
+        # Check if data is actually from mouse (bit 5 of status = auxiliary data)
+        byte status = inb(MOUSE_STATUS_PORT);
+        if ((status & 0x20) == 0) return;  # Not mouse data, ignore
+
+        byte data = inb(MOUSE_DATA_PORT);
+        int raw = (int) data;
+
+        if (mouseCycle == 0) {
+            mouseByte0 = raw;
+
+            # Validate: bit 3 must always be set in byte 0 of a valid packet
+            if ((mouseByte0 & 0x08) == 0) {
+                # Out of sync — discard and wait for a valid first byte
+                mouseCycle = 0;
+                return;
+            }
+            mouseCycle = 1;
+        } elif (mouseCycle == 1) {
+            mouseByte1 = raw;
+            mouseCycle = 2;
+        } elif (mouseCycle == 2) {
+            mouseByte2 = raw;
+            mouseCycle = 0;
+
+            # Check for overflow — discard packet if X or Y overflow set
+            if ((mouseByte0 & 0xC0) != 0) return;
+
+            # Decode the 3-byte packet
+            int deltaX = mouseByte1;
+            int deltaY = mouseByte2;
+
+            # Apply sign extension from byte 0 sign bits
+            if ((mouseByte0 & 0x10) != 0) {
+                deltaX = deltaX | (-256);    # Sign-extend X (bit 4)
+            }
+            if ((mouseByte0 & 0x20) != 0) {
+                deltaY = deltaY | (-256);    # Sign-extend Y (bit 5)
+            }
+
+            # PS/2 Y axis is inverted (positive = up), screen Y is down
+            deltaY = -deltaY;
+
+            # Update absolute position (clamped to screen bounds)
+            mouseXPos = mouseXPos + deltaX;
+            mouseYPos = mouseYPos + deltaY;
+
+            if (mouseXPos < 0) mouseXPos = 0;
+            if (mouseYPos < 0) mouseYPos = 0;
+            if (mouseXPos >= mouseScreenW) mouseXPos = mouseScreenW - 1;
+            if (mouseYPos >= mouseScreenH) mouseYPos = mouseScreenH - 1;
+
+            # Update button states
+            mouseLeftBtn = (mouseByte0 & 0x01) != 0;
+            mouseRightBtn = (mouseByte0 & 0x02) != 0;
+            mouseMiddleBtn = (mouseByte0 & 0x04) != 0;
+
+            # Create event
+            MouseEvent event = {
+                x: mouseXPos,
+                y: mouseYPos,
+                deltaX: deltaX,
+                deltaY: deltaY,
+                leftBtn: mouseLeftBtn,
+                rightBtn: mouseRightBtn,
+                middleBtn: mouseMiddleBtn
+            };
+
+            # Add to buffer (drop oldest if full)
+            if (mouseBuffer.length >= MOUSE_BUFFER_SIZE) {
+                mouseBuffer.removeAt(0);
+            }
+            mouseBuffer.add(event);
+        }
+    }
+
+    # NOTE: EOI is sent by isr_dispatch — do not send here
+}

@@ -1,0 +1,107 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// 3D Viewer — Spinning cube demo for StratOS
+// apps/viewer3d/viewer3d.lx
+//
+// Displays a spinning 3D cube rendered by the software rasterizer.
+// Arrow keys adjust the viewing angle; auto-rotates continuously.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/render3d/renderer.lx";
+
+# Rotation angles (degrees)
+int v3dAngleY = 0;
+int v3dAngleX = 20;
+bool v3dInited = false;
+
+# Fixed-point one
+int V3D_FP = 1024;
+
+# Cube half-edge length (0.5 in fixed-point)
+int cubeHalf = 512;
+
+export class Viewer3D {
+
+    public static func setup() -> void {
+        if (!v3dInited) {
+            Renderer3D.setup(1024, 768);
+            v3dInited = true;
+        }
+    }
+
+    # Handle keyboard input
+    public static func processKey(KeyEvent event) -> void {
+        if (event.scancode == 75) {       # Left
+            v3dAngleY = v3dAngleY - 5;
+        } elif (event.scancode == 77) {   # Right
+            v3dAngleY = v3dAngleY + 5;
+        } elif (event.scancode == 72) {   # Up
+            v3dAngleX = v3dAngleX - 5;
+        } elif (event.scancode == 80) {   # Down
+            v3dAngleX = v3dAngleX + 5;
+        }
+    }
+
+    # Render the 3D scene into the given window region
+    public static func draw(int x, int y, int w, int h) -> void {
+        setup();
+
+        # Dark background
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        # Set viewport to window content area
+        Renderer3D.setViewport(x, y, w, h);
+
+        # Camera at (0, 0, 4) looking at origin
+        int camDist = 4 * V3D_FP;
+        Renderer3D.setCamera(0, 0, camDist, 0, 0, 0);
+
+        # Light from top-right
+        Renderer3D.setLight(591, -591, 591);
+
+        # Auto-rotate
+        v3dAngleY = v3dAngleY + 1;
+        if (v3dAngleY >= 360) v3dAngleY = v3dAngleY - 360;
+
+        # Model transform: rotate cube
+        Renderer3D.setIdentityModel();
+        Renderer3D.rotateModelY(v3dAngleY);
+        Renderer3D.rotateModelX(v3dAngleX);
+
+        # Build combined MVP
+        Renderer3D.buildMVP();
+
+        # Clear z-buffer
+        Renderer3D.clearDepth();
+
+        # ── Cube faces ──────────────────────────────────────────────
+        int s = cubeHalf;
+
+        # Front face (z = +s) — blue
+        Renderer3D.drawQuad(-s, -s, s, s, -s, s, s, s, s, -s, s, s, 0x5899E6FF);
+
+        # Back face (z = -s) — teal
+        Renderer3D.drawQuad(s, -s, -s, -s, -s, -s, -s, s, -s, s, s, -s, 0x3FB9A0FF);
+
+        # Top face (y = -s) — green
+        Renderer3D.drawQuad(-s, -s, -s, s, -s, -s, s, -s, s, -s, -s, s, 0x3FB950FF);
+
+        # Bottom face (y = +s) — red
+        Renderer3D.drawQuad(-s, s, s, s, s, s, s, s, -s, -s, s, -s, 0xF85149FF);
+
+        # Right face (x = +s) — purple
+        Renderer3D.drawQuad(s, -s, s, s, -s, -s, s, s, -s, s, s, s, 0xA371F7FF);
+
+        # Left face (x = -s) — orange
+        Renderer3D.drawQuad(-s, -s, -s, -s, -s, s, -s, s, s, -s, s, -s, 0xD29922FF);
+
+        # ── Overlay info ────────────────────────────────────────────
+        TextRender.drawText("3D Viewer — Arrow keys to rotate", x + 8, y + h - 20, 0x8B949EFF);
+        string info = "Y:${v3dAngleY}  X:${v3dAngleX}";
+        TextRender.drawText(info, x + 8, y + 8, 0x484F58FF);
+    }
+}

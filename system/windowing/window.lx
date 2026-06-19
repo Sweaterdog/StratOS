@@ -1,0 +1,46 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Window — Window data structure and snap states
+// system/windowing/window.lx
+// ============================================================================
+
+export enum SnapState {
+    NONE = 0,
+    LEFT = 1,
+    RIGHT = 2,
+    TOP_LEFT = 3,
+    TOP_RIGHT = 4,
+    BOTTOM_LEFT = 5,
+    BOTTOM_RIGHT = 6,
+    MAXIMIZED = 7
+}
+
+export struct AppWindow {
+    int id;
+    string title;
+    int x;
+    int y;
+    int width;
+    int height;
+    int minWidth;
+    int minHeight;
+    bool isMaximized;
+    bool isMinimized;
+    bool isFocused;
+    bool isClosing;
+    string appType;        # "terminal", "editor", "explorer", "browser", "music"
+
+    # Saved position for restore from snap/maximize
+    int savedX;
+    int savedY;
+    int savedWidth;
+    int savedHeight;
+    int snapState;         # SnapState
+
+    # Animation state (0 = idle)
+    int animProgress;      # Frame counter: 0 = done, 1..6 = in progress
+    int animType;          # 0 = none, 1 = minimizing, 2 = restoring
+}
+
+
+

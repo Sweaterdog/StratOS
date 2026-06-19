@@ -1,0 +1,592 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Intel E1000 Network Driver for QEMU
+// kernel/drivers/e1000.lx
+//
+// Supports the Intel 82540EM (e1000) NIC as emulated by QEMU.
+// PCI Vendor: 0x8086 (Intel), Device: 0x100E (82540EM)
+//
+// The driver uses MMIO (memory-mapped I/O) for register access and sets up
+// transmit/receive descriptor rings for packet DMA.
+//
+// Transmit: 32 descriptor ring, each pointing to a 2048-byte buffer
+// Receive:  32 descriptor ring, each pointing to a 2048-byte buffer
+//
+// References:
+//   - Intel 8254x Software Developer Manual (SDM)
+//   - QEMU e1000 implementation
+// ============================================================================
+
+import "kernel/drivers/pci.lx";
+import "kernel/memory/manager.lx";
+import "kernel/interrupts/idt.lx";
+import "kernel/core/console.lx";
+
+# ============================================================================
+# E1000 PCI identification
+# ============================================================================
+int E1000_VENDOR_ID = 0x8086;
+int E1000_DEVICE_ID = 0x100E;    # 82540EM (QEMU default)
+int E1000_DEVICE_ID2 = 0x100F;   # 82545EM (alternate)
+int E1000_DEVICE_ID3 = 0x10D3;   # 82574L
+int E1000_DEVICE_ID4 = 0x153A;   # I217-LM
+
+# ============================================================================
+# E1000 Register Offsets (from Intel SDM)
+# ============================================================================
+int E1000_CTRL       = 0x0000;   # Device Control
+int E1000_STATUS     = 0x0008;   # Device Status
+int E1000_EECD       = 0x0010;   # EEPROM/Flash Control
+int E1000_EERD       = 0x0014;   # EEPROM Read
+int E1000_ICR        = 0x00C0;   # Interrupt Cause Read
+int E1000_IMS        = 0x00D0;   # Interrupt Mask Set
+int E1000_IMC        = 0x00D8;   # Interrupt Mask Clear
+int E1000_RCTL       = 0x0100;   # Receive Control
+int E1000_TCTL       = 0x0400;   # Transmit Control
+int E1000_RDBAL      = 0x2800;   # RX Descriptor Base Low
+int E1000_RDBAH      = 0x2804;   # RX Descriptor Base High
+int E1000_RDLEN      = 0x2808;   # RX Descriptor Length
+int E1000_RDH        = 0x2810;   # RX Descriptor Head
+int E1000_RDT        = 0x2818;   # RX Descriptor Tail
+int E1000_TDBAL      = 0x3800;   # TX Descriptor Base Low
+int E1000_TDBAH      = 0x3804;   # TX Descriptor Base High
+int E1000_TDLEN      = 0x3808;   # TX Descriptor Length
+int E1000_TDH        = 0x3810;   # TX Descriptor Head
+int E1000_TDT        = 0x3818;   # TX Descriptor Tail
+int E1000_RAL0       = 0x5400;   # Receive Address Low (MAC[0])
+int E1000_RAH0       = 0x5404;   # Receive Address High (MAC[0])
+int E1000_MTA        = 0x5200;   # Multicast Table Array (128 DWORDs)
+int E1000_TIPG       = 0x0410;   # TX Inter Packet Gap
+
+# CTRL register bits
+int E1000_CTRL_SLU   = 0x40;       # Set Link Up
+int E1000_CTRL_RST   = 0x04000000; # Device Reset
+
+# RCTL register bits
+int E1000_RCTL_EN    = 0x02;       # Receiver Enable
+int E1000_RCTL_SBP   = 0x04;       # Store Bad Packets
+int E1000_RCTL_UPE   = 0x08;       # Unicast Promiscuous
+int E1000_RCTL_MPE   = 0x10;       # Multicast Promiscuous
+int E1000_RCTL_LBM   = 0x00;       # No Loopback
+int E1000_RCTL_BAM   = 0x8000;     # Broadcast Accept Mode
+int E1000_RCTL_BSIZE = 0x00;       # Buffer Size = 2048 (default)
+int E1000_RCTL_SECRC = 0x04000000; # Strip Ethernet CRC
+
+# TCTL register bits
+int E1000_TCTL_EN    = 0x02;       # Transmitter Enable
+int E1000_TCTL_PSP   = 0x08;       # Pad Short Packets
+int E1000_TCTL_COLD  = 0x003F0000; # Collision distance (full duplex)
+
+# TX descriptor command bits
+int E1000_TXD_CMD_EOP  = 0x01;    # End of Packet
+int E1000_TXD_CMD_IFCS = 0x02;    # Insert FCS
+int E1000_TXD_CMD_RS   = 0x08;    # Report Status
+int E1000_TXD_STAT_DD  = 0x01;    # Descriptor Done
+
+# RX descriptor status bits
+int E1000_RXD_STAT_DD  = 0x01;    # Descriptor Done
+int E1000_RXD_STAT_EOP = 0x02;    # End of Packet
+
+# Interrupt bits
+int E1000_ICR_TXDW   = 0x01;      # TX Descriptor Written Back
+int E1000_ICR_RXT0   = 0x80;      # RX Timer Interrupt
+int E1000_ICR_LSC    = 0x04;      # Link Status Change
+
+# Ring sizes (must be multiple of 8, max 256 for simplicity)
+int E1000_NUM_RX_DESC = 32;
+int E1000_NUM_TX_DESC = 32;
+int E1000_BUF_SIZE    = 2048;
+
+# ============================================================================
+# TX/RX Descriptor Structures (16 bytes each)
+# ============================================================================
+# TX Descriptor layout (legacy):
+#   bytes 0-7:   buffer address (64-bit)
+#   bytes 8-9:   length (16-bit)
+#   byte  10:    CSO (checksum offset)
+#   byte  11:    CMD (command)
+#   byte  12:    status (STA/RSV)
+#   byte  13:    CSS (checksum start)
+#   bytes 14-15: special
+#
+# RX Descriptor layout:
+#   bytes 0-7:   buffer address (64-bit)
+#   bytes 8-9:   length (16-bit, set by HW)
+#   bytes 10-11: checksum
+#   byte  12:    status
+#   byte  13:    errors
+#   bytes 14-15: special
+
+# ============================================================================
+# Driver State
+# ============================================================================
+bool e1000Present = false;
+long e1000MmioBase = 0;          # Memory-mapped I/O base address
+int e1000IrqLine = 0;           # IRQ line from PCI config
+
+# MAC address (6 bytes)
+int e1000Mac0 = 0;               # First 4 bytes of MAC
+int e1000Mac4 = 0;               # Last 2 bytes of MAC (low 16 bits)
+
+# Descriptor ring addresses (physical)
+long rxDescPhys = 0;
+long txDescPhys = 0;
+
+# Descriptor ring virtual addresses
+long rxDescVirt = 0;
+long txDescVirt = 0;
+
+# RX/TX buffer arrays (physical addresses)
+long rxBuffersPhys = 0;
+long txBuffersPhys = 0;
+
+# Current RX/TX tail indices
+int rxTail = 0;
+int txTail = 0;
+
+# Receive callback
+# When a packet arrives, the driver stores it in a ring buffer
+# that can be polled by the network stack.
+
+# Packet receive buffer (circular, 64 packets max)
+int NET_RX_RING_SIZE = 64;
+list<long> rxPacketAddrs = [];   # Buffer addresses
+list<int> rxPacketLens = [];     # Packet lengths
+int rxRingHead = 0;
+int rxRingTail = 0;
+int rxRingCount = 0;
+
+# Last received packet length (file scope — Flux static method access)
+int lastPacketLen = 0;
+
+export class E1000 {
+
+    # ========================================================================
+    # Initialize the E1000 NIC
+    # Called after PCI.enumerate()
+    # ========================================================================
+    public static func init() -> void {
+        # Find the E1000 on the PCI bus
+        int idx = PCI.findDevice(E1000_VENDOR_ID, E1000_DEVICE_ID);
+        if (idx < 0) {
+            idx = PCI.findDevice(E1000_VENDOR_ID, E1000_DEVICE_ID2);
+        }
+        if (idx < 0) {
+            idx = PCI.findDevice(E1000_VENDOR_ID, E1000_DEVICE_ID3);
+        }
+        if (idx < 0) {
+            idx = PCI.findDevice(E1000_VENDOR_ID, E1000_DEVICE_ID4);
+        }
+
+        if (idx < 0) {
+            Console.log("[WARN ] E1000: No Intel NIC found on PCI bus");
+            return;
+        }
+
+        PciDevice dev = PCI.getDevice(idx);
+        e1000MmioBase = dev.bar0;
+        e1000IrqLine = dev.irqLine;
+
+        # Enable bus mastering and memory/IO access
+        PCI.enableBusMaster(dev.bus, dev.device, dev.function);
+
+        # Identity-map the MMIO region (128KB should be enough)
+        # Page-align: mask off low 12 bits
+        long mmioPage = e1000MmioBase & ~((long) 4095);
+        for (long offset = 0; offset < 131072; offset = offset + 4096) {
+            MemoryManager.mapPage(mmioPage + offset, mmioPage + offset, 0x03);
+        }
+
+        Console.log("[  OK  ] E1000: Found at MMIO ${longToHexE1000(e1000MmioBase)}, IRQ ${e1000IrqLine}");
+
+        # Reset the device
+        resetDevice();
+
+        # Read MAC address
+        readMacAddress();
+
+        # Set up receive descriptors
+        initRx();
+
+        # Set up transmit descriptors
+        initTx();
+
+        # Configure interrupts
+        initInterrupts();
+
+        # Set link up
+        int ctrl = readReg(E1000_CTRL);
+        ctrl = ctrl | E1000_CTRL_SLU;
+        writeReg(E1000_CTRL, ctrl);
+
+        e1000Present = true;
+
+        # Log MAC address
+        Console.log("[  OK  ] E1000: MAC ${formatMac()}");
+        Console.log("[  OK  ] E1000: Link up, driver ready");
+    }
+
+    # ========================================================================
+    # Check if the NIC is present and initialized
+    # ========================================================================
+    public static func isPresent() -> bool {
+        return e1000Present;
+    }
+
+    # ========================================================================
+    # Get MAC address bytes
+    # ========================================================================
+    public static func getMac(int index) -> int {
+        if (index < 4) {
+            return (e1000Mac0 >> (index * 8)) & 0xFF;
+        } else {
+            return (e1000Mac4 >> ((index - 4) * 8)) & 0xFF;
+        }
+    }
+
+    # ========================================================================
+    # Send a packet
+    # data: pointer to packet data (including Ethernet header)
+    # length: packet size in bytes
+    # ========================================================================
+    public static func sendPacket(long data, int length) -> bool {
+        if (!e1000Present) return false;
+        if (length > E1000_BUF_SIZE) return false;
+
+        # Calculate descriptor offset
+        long descAddr = txDescVirt + (long)(txTail * 16);
+
+        # Copy packet data into the tx buffer
+        long bufPhys = txBuffersPhys + (long)(txTail * E1000_BUF_SIZE);
+        long bufVirt = bufPhys;   # Identity-mapped
+
+        unsafe {
+            byte* dst = (byte*) bufVirt;
+            byte* src = (byte*) data;
+            for (int i = 0; i < length; i++) {
+                dst[i] = src[i];
+            }
+        }
+
+        # Set up the descriptor
+        unsafe {
+            long* descBufAddr = (long*) descAddr;
+            *descBufAddr = bufPhys;               # Buffer address
+
+            # Length + CMD + Status at offset 8
+            byte* descMeta = (byte*)(descAddr + 8);
+            descMeta[0] = (byte)(length & 0xFF);          # Length low
+            descMeta[1] = (byte)((length >> 8) & 0xFF);   # Length high
+            descMeta[2] = 0;                               # CSO
+            descMeta[3] = (byte)(E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS);  # CMD
+            descMeta[4] = 0;                               # Status (cleared)
+        }
+
+        # Advance tail
+        txTail = (txTail + 1) % E1000_NUM_TX_DESC;
+        writeReg(E1000_TDT, txTail);
+
+        return true;
+    }
+
+    # ========================================================================
+    # Check if there are received packets available
+    # ========================================================================
+    public static func hasPacket() -> bool {
+        return rxRingCount > 0;
+    }
+
+    # ========================================================================
+    # Get the next received packet
+    # Returns: buffer address (caller must copy data), sets packetLen
+    # Returns 0 if no packet available
+    # ========================================================================
+    public static func receivePacket() -> long {
+        if (rxRingCount <= 0) {
+            lastPacketLen = 0;
+            return 0;
+        }
+
+        long addr = rxPacketAddrs[rxRingHead];
+        lastPacketLen = rxPacketLens[rxRingHead];
+        rxRingHead = (rxRingHead + 1) % NET_RX_RING_SIZE;
+        rxRingCount--;
+
+        return addr;
+    }
+
+    public static func getLastPacketLen() -> int {
+        return lastPacketLen;
+    }
+
+    # ========================================================================
+    # Poll for received packets (call from main loop or interrupt)
+    # ========================================================================
+    public static func poll() -> void {
+        if (!e1000Present) return;
+
+        while (true) {
+            long descAddr = rxDescVirt + (long)(rxTail * 16);
+
+            # Check if the descriptor has been filled by the NIC
+            unsafe {
+                byte* status = (byte*)(descAddr + 12);
+                if ((status[0] & (byte) E1000_RXD_STAT_DD) == 0) break;
+
+                # Read packet length
+                byte* lenPtr = (byte*)(descAddr + 8);
+                int pktLen = (int) lenPtr[0] | ((int) lenPtr[1] << 8);
+
+                # Get buffer address
+                long bufPhys = rxBuffersPhys + (long)(rxTail * E1000_BUF_SIZE);
+
+                # Store in receive ring buffer if space available
+                if (rxRingCount < NET_RX_RING_SIZE) {
+                    # Copy packet to a new buffer
+                    long pktBuf = MemoryManager.kmalloc(pktLen);
+                    if (pktBuf != 0) {
+                        byte* dst = (byte*) pktBuf;
+                        byte* src = (byte*) bufPhys;
+                        for (int i = 0; i < pktLen; i++) {
+                            dst[i] = src[i];
+                        }
+                        rxPacketAddrs[rxRingTail] = pktBuf;
+                        rxPacketLens[rxRingTail] = pktLen;
+                        rxRingTail = (rxRingTail + 1) % NET_RX_RING_SIZE;
+                        rxRingCount++;
+                    }
+                }
+
+                # Clear the status and return the descriptor to the NIC
+                status[0] = 0;
+            }
+
+            # Advance tail
+            int oldTail = rxTail;
+            rxTail = (rxTail + 1) % E1000_NUM_RX_DESC;
+            writeReg(E1000_RDT, oldTail);
+        }
+    }
+
+    # ========================================================================
+    # Internal: Read a 32-bit MMIO register
+    # ========================================================================
+    public static func readReg(int reg) -> int {
+        int value = 0;
+        unsafe {
+            int* ptr = (int*)(e1000MmioBase + (long) reg);
+            value = *ptr;
+        }
+        return value;
+    }
+
+    # ========================================================================
+    # Internal: Write a 32-bit MMIO register
+    # ========================================================================
+    public static func writeReg(int reg, int value) -> void {
+        unsafe {
+            int* ptr = (int*)(e1000MmioBase + (long) reg);
+            *ptr = value;
+        }
+    }
+}
+
+# ============================================================================
+# Internal helper functions
+# ============================================================================
+
+func resetDevice() -> void {
+    int ctrl = E1000.readReg(E1000_CTRL);
+    E1000.writeReg(E1000_CTRL, ctrl | E1000_CTRL_RST);
+
+    # Wait for reset to complete (spin with delay)
+    for (int i = 0; i < 100000; i++) {
+        int status = E1000.readReg(E1000_CTRL);
+        if ((status & E1000_CTRL_RST) == 0) break;
+    }
+
+    # Disable interrupts during setup
+    E1000.writeReg(E1000_IMC, 0x7FFFFFFF);
+    E1000.readReg(E1000_ICR);   # Clear pending
+}
+
+func readMacAddress() -> void {
+    # Try reading from RAL0/RAH0 (most QEMU e1000 models set these)
+    e1000Mac0 = E1000.readReg(E1000_RAL0);
+    e1000Mac4 = E1000.readReg(E1000_RAH0);
+
+    if (e1000Mac0 == 0 && e1000Mac4 == 0) {
+        # Try reading from EEPROM
+        e1000Mac0 = eepromRead(0) | (eepromRead(1) << 16);
+        e1000Mac4 = eepromRead(2);
+    }
+}
+
+func eepromRead(int addr) -> int {
+    E1000.writeReg(E1000_EERD, (1) | (addr << 8));
+
+    # Wait for read to complete
+    for (int i = 0; i < 10000; i++) {
+        int val = E1000.readReg(E1000_EERD);
+        if ((val & 0x10) != 0) {
+            return (val >> 16) & 0xFFFF;
+        }
+    }
+    return 0;
+}
+
+func initRx() -> void {
+    # Allocate RX descriptor ring (aligned to 128 bytes)
+    int descSize = E1000_NUM_RX_DESC * 16;   # 16 bytes per descriptor
+    rxDescVirt = MemoryManager.kmalloc(descSize + 128);
+    rxDescVirt = (rxDescVirt + 127) & ~((long) 127);  # 128-byte align
+    rxDescPhys = rxDescVirt;   # Identity-mapped
+
+    # Allocate RX buffers (contiguous)
+    int bufTotal = E1000_NUM_RX_DESC * E1000_BUF_SIZE;
+    rxBuffersPhys = MemoryManager.kmalloc(bufTotal);
+
+    # Initialize descriptors
+    unsafe {
+        for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
+            long descAddr = rxDescVirt + (long)(i * 16);
+            long bufAddr = rxBuffersPhys + (long)(i * E1000_BUF_SIZE);
+
+            # Set buffer address
+            long* addrField = (long*) descAddr;
+            *addrField = bufAddr;
+
+            # Zero status/length fields
+            byte* meta = (byte*)(descAddr + 8);
+            for (int j = 0; j < 8; j++) meta[j] = 0;
+        }
+    }
+
+    # Initialize RX packet ring buffers
+    for (int i = 0; i < NET_RX_RING_SIZE; i++) {
+        rxPacketAddrs.add(0);
+        rxPacketLens.add(0);
+    }
+
+    # Set descriptor ring address
+    E1000.writeReg(E1000_RDBAL, (int)(rxDescPhys & 0x7FFFFFFF));
+    E1000.writeReg(E1000_RDBAH, (int)((rxDescPhys >> 32) & 0x7FFFFFFF));
+    E1000.writeReg(E1000_RDLEN, descSize);
+    E1000.writeReg(E1000_RDH, 0);
+    E1000.writeReg(E1000_RDT, E1000_NUM_RX_DESC - 1);
+
+    # Enable receiver
+    int rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE | E1000_RCTL_SECRC;
+    E1000.writeReg(E1000_RCTL, rctl);
+
+    rxTail = 0;
+}
+
+func initTx() -> void {
+    # Allocate TX descriptor ring (aligned to 128 bytes)
+    int descSize = E1000_NUM_TX_DESC * 16;
+    txDescVirt = MemoryManager.kmalloc(descSize + 128);
+    txDescVirt = (txDescVirt + 127) & ~((long) 127);  # 128-byte align
+    txDescPhys = txDescVirt;
+
+    # Allocate TX buffers
+    int bufTotal = E1000_NUM_TX_DESC * E1000_BUF_SIZE;
+    txBuffersPhys = MemoryManager.kmalloc(bufTotal);
+
+    # Initialize descriptors
+    unsafe {
+        for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
+            long descAddr = txDescVirt + (long)(i * 16);
+
+            # Zero everything
+            byte* meta = (byte*) descAddr;
+            for (int j = 0; j < 16; j++) meta[j] = 0;
+
+            # Set status to done (so first send works)
+            byte* status = (byte*)(descAddr + 12);
+            status[0] = (byte) E1000_TXD_STAT_DD;
+        }
+    }
+
+    # Set descriptor ring address
+    E1000.writeReg(E1000_TDBAL, (int)(txDescPhys & 0x7FFFFFFF));
+    E1000.writeReg(E1000_TDBAH, (int)((txDescPhys >> 32) & 0x7FFFFFFF));
+    E1000.writeReg(E1000_TDLEN, descSize);
+    E1000.writeReg(E1000_TDH, 0);
+    E1000.writeReg(E1000_TDT, 0);
+
+    # Set inter-packet gap
+    E1000.writeReg(E1000_TIPG, (10) | (8 << 10) | (6 << 20));
+
+    # Enable transmitter
+    int tctl = E1000_TCTL_EN | E1000_TCTL_PSP | E1000_TCTL_COLD;
+    E1000.writeReg(E1000_TCTL, tctl);
+
+    txTail = 0;
+}
+
+func initInterrupts() -> void {
+    # Enable RX and link change interrupts
+    E1000.writeReg(E1000_IMS, E1000_ICR_RXT0 | E1000_ICR_LSC | E1000_ICR_TXDW);
+
+    # Clear any pending interrupts
+    E1000.readReg(E1000_ICR);
+
+    # Register the IRQ handler
+    # E1000 typically uses IRQ 11 in QEMU (PCI IRQ line)
+    # We'll register on the actual IRQ line from PCI config
+    int vector = 32 + e1000IrqLine;
+    if (vector >= 32 && vector < 48) {
+        IDT.registerHandler(vector, e1000InterruptHandler);
+    }
+
+    # Clear multicast table
+    for (int i = 0; i < 128; i++) {
+        E1000.writeReg(E1000_MTA + (i * 4), 0);
+    }
+}
+
+# E1000 interrupt handler
+func e1000InterruptHandler(int vector, long errorCode) -> void {
+    int cause = E1000.readReg(E1000_ICR);
+
+    if ((cause & E1000_ICR_RXT0) != 0) {
+        # Received packet(s) — poll them into the ring buffer
+        E1000.poll();
+    }
+
+    # Acknowledge interrupt by reading ICR (auto-clears)
+    # Send EOI to PIC
+    outb(0x20, 0x20);
+    if (e1000IrqLine >= 8) {
+        outb(0xA0, 0x20);
+    }
+}
+
+# Format MAC address as a string
+func formatMac() -> string {
+    string result = "";
+    for (int i = 0; i < 6; i++) {
+        int b = E1000.getMac(i);
+        int hi = (b >> 4) & 0x0F;
+        int lo = b & 0x0F;
+        string hexChars = "0123456789ABCDEF";
+        string h = "${hexChars.charAt(hi)}";
+        string l = "${hexChars.charAt(lo)}";
+        if (i > 0) result = result + ":";
+        result = result + h + l;
+    }
+    return result;
+}
+
+# Convert a long address to hex string for logging
+func longToHexE1000(long value) -> string {
+    string hexChars = "0123456789ABCDEF";
+    string result = "0x";
+    for (int i = 15; i >= 0; i--) {
+        int nibble = (int)((value >> (i * 4)) & 0x0F);
+        string ch = "${hexChars.charAt(nibble)}";
+        result = result + ch;
+    }
+    return result;
+}

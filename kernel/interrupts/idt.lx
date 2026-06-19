@@ -1,0 +1,250 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// IDT — Interrupt Descriptor Table for x86_64
+// kernel/interrupts/idt.lx
+//
+// Sets up the CPU interrupt vector table and exception handlers.
+// Remaps the PIC to avoid conflicts with CPU exceptions.
+// ============================================================================
+
+int IDT_ENTRIES = 256;
+int PIC1_CMD = 0x20;
+int PIC1_DATA = 0x21;
+int PIC2_CMD = 0xA0;
+int PIC2_DATA = 0xA1;
+
+# IDT entry structure (16 bytes for 64-bit mode)
+struct IDTEntry {
+    int offsetLow;        # Offset bits 0-15
+    int selector;         # Code segment selector
+    int ist;              # Interrupt Stack Table offset
+    int typeAttr;         # Type and attributes
+    int offsetMid;        # Offset bits 16-31
+    long offsetHigh;      # Offset bits 32-63
+    int reserved;         # Reserved, must be 0
+}
+
+# IDT pointer structure
+struct IDTPointer {
+    int limit;            # Size of IDT - 1
+    long base;            # Base address of IDT
+}
+
+# Exception names for debugging
+list<string> exceptionNames = [
+    "Division Error",
+    "Debug",
+    "Non-Maskable Interrupt",
+    "Breakpoint",
+    "Overflow",
+    "Bound Range Exceeded",
+    "Invalid Opcode",
+    "Device Not Available",
+    "Double Fault",
+    "Coprocessor Segment Overrun",
+    "Invalid TSS",
+    "Segment Not Present",
+    "Stack-Segment Fault",
+    "General Protection Fault",
+    "Page Fault",
+    "Reserved",
+    "x87 FPU Error",
+    "Alignment Check",
+    "Machine Check",
+    "SIMD Floating-Point Exception"
+];
+
+# Interrupt handler function pointers
+list<func> handlers = [];
+
+export class IDT {
+    # Initialize the IDT and remap PICs
+    # NOTE: The IDT entries and IDTR are already set up by setup_idt in boot.S
+    # (ISR stubs for vectors 0-47). We only need to init the handler table
+    # and remap the PIC here. Do NOT zero or overwrite the IDT!
+    public static func init() -> void {
+        # Initialize handler table
+        for (int i = 0; i < IDT_ENTRIES; i++) {
+            handlers.add(null);
+        }
+
+        # Remap the PIC so IRQs don't collide with exceptions
+        remapPIC();
+    }
+
+    # Register all CPU exception handlers (vectors 0-31)
+    public static func registerExceptionHandlers() -> void {
+        for (int i = 0; i < 32; i++) {
+            registerHandler(i, defaultExceptionHandler);
+        }
+
+        # Register specific exception handlers
+        registerHandler(14, pageFaultHandler);    # Page Fault
+        registerHandler(13, gpfHandler);          # General Protection Fault
+        registerHandler(8, doubleFaultHandler);   # Double Fault
+    }
+
+    # Register a handler for a specific interrupt vector
+    public static func registerHandler(int vector, func handler) -> void {
+        if (vector >= 0 && vector < IDT_ENTRIES) {
+            handlers[vector] = handler;
+        }
+    }
+
+    # Remap PIC: IRQ 0-7 → vectors 32-39, IRQ 8-15 → vectors 40-47
+    private static func remapPIC() -> void {
+        unsafe {
+            # Save masks
+            byte mask1 = inb(PIC1_DATA);
+            byte mask2 = inb(PIC2_DATA);
+
+            # Start initialization sequence (ICW1)
+            outb(PIC1_CMD, 0x11);
+            outb(PIC2_CMD, 0x11);
+
+            # Set vector offsets (ICW2)
+            outb(PIC1_DATA, 0x20);  # IRQ 0-7  → INT 32-39
+            outb(PIC2_DATA, 0x28);  # IRQ 8-15 → INT 40-47
+
+            # Tell PICs about each other (ICW3)
+            outb(PIC1_DATA, 0x04);  # PIC1: slave on IRQ2
+            outb(PIC2_DATA, 0x02);  # PIC2: cascade identity
+
+            # Set 8086 mode (ICW4)
+            outb(PIC1_DATA, 0x01);
+            outb(PIC2_DATA, 0x01);
+
+            # Set interrupt masks — only enable IRQ0 (timer) and IRQ1 (keyboard)
+            # Mask byte: bit=1 means DISABLED. 0xFC = 11111100 → IRQ0,IRQ1 enabled
+            outb(PIC1_DATA, 0xFC);
+            outb(PIC2_DATA, 0xFF);  # Mask all slave PIC interrupts
+        }
+    }
+
+    # Send End of Interrupt signal
+    public static func sendEOI(int irq) -> void {
+        unsafe {
+            if (irq >= 8) {
+                outb(PIC2_CMD, 0x20);  # EOI to slave PIC
+            }
+            outb(PIC1_CMD, 0x20);      # EOI to master PIC
+        }
+    }
+}
+
+# ============================================================================
+# ISR Dispatch — called from assembly ISR stubs in boot.S
+# Must be extern "C" so the assembly `call isr_dispatch` resolves correctly.
+# The transpiler emits extern "C" linkage for this function name.
+# ============================================================================
+export func isr_dispatch(long vector, long errorCode) -> void {
+    # Call registered handler if one exists
+    if (vector >= 0 && vector < IDT_ENTRIES) {
+        func handler = handlers[(int) vector];
+        if (handler != null) {
+            handler((int) vector, errorCode);
+        }
+    }
+
+    # Send EOI for hardware IRQs (vectors 32-47)
+    if (vector >= 32 && vector <= 47) {
+        IDT.sendEOI((int)(vector - 32));
+    }
+}
+
+# ============================================================================
+# Exception Handlers
+# ============================================================================
+
+func defaultExceptionHandler(int vector, long errorCode) -> void {
+    string name = "Unknown";
+    if (vector < exceptionNames.length) {
+        name = exceptionNames[vector];
+    }
+    panic("CPU Exception #$vector: $name (error code: 0x${(string) errorCode})");
+}
+
+func pageFaultHandler(int vector, long errorCode) -> void {
+    long faultAddr;
+    unsafe {
+        asm("mov %%cr2, %0" : "=r"(faultAddr));
+    }
+
+    string reason = "Unknown";
+    if (!(errorCode & 1)) {
+        reason = "Page not present";
+    } elif (errorCode & 2) {
+        reason = "Write violation";
+    } elif (errorCode & 4) {
+        reason = "User-mode access violation";
+    }
+
+    panic("PAGE FAULT at 0x${(string) faultAddr}: $reason");
+}
+
+func gpfHandler(int vector, long errorCode) -> void {
+    panic("GENERAL PROTECTION FAULT (error code: 0x${(string) errorCode})");
+}
+
+func doubleFaultHandler(int vector, long errorCode) -> void {
+    panic("DOUBLE FAULT — system state corrupted. Halting immediately.");
+}
+
+# ============================================================================
+# Port I/O helpers (used throughout kernel)
+# ============================================================================
+export func outb(int port, byte value) -> void {
+    unsafe {
+        asm("outb %0, %1" : : "a"(value), "Nd"(port));
+    }
+}
+
+export func inb(int port) -> byte {
+    unsafe {
+        byte result;
+        asm("inb %1, %0" : "=a"(result) : "Nd"(port));
+        return result;
+    }
+}
+
+export func outw(int port, int value) -> void {
+    unsafe {
+        asm("outw %w0, %w1" : : "a"(value), "Nd"(port));
+    }
+}
+
+export func inw(int port) -> int {
+    unsafe {
+        int result;
+        asm("inw %w1, %w0" : "=a"(result) : "Nd"(port));
+        return result;
+    }
+}
+
+export func outl(int port, int value) -> void {
+    unsafe {
+        asm("outl %0, %w1" : : "a"(value), "Nd"(port));
+    }
+}
+
+export func inl(int port) -> int {
+    unsafe {
+        int result;
+        asm("inl %w1, %0" : "=a"(result) : "Nd"(port));
+        return result;
+    }
+}
+
+# Read 'count' 16-bit words from port into memory buffer
+export func insw(int port, long bufAddr, int count) -> void {
+    unsafe {
+        asm("rep insw" : "+D"(bufAddr), "+c"(count) : "d"(port) : "memory");
+    }
+}
+
+# Write 'count' 16-bit words from memory buffer to port
+export func outsw(int port, long bufAddr, int count) -> void {
+    unsafe {
+        asm("rep outsw" : "+S"(bufAddr), "+c"(count) : "d"(port) : "memory");
+    }
+}

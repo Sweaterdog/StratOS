@@ -1,0 +1,334 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// ATA/IDE Disk Driver — PIO Mode Read/Write
+// kernel/drivers/disk.lx
+//
+// Implements a basic ATA PIO mode disk driver for reading and writing sectors
+// from/to an IDE hard disk. This is the simplest disk I/O method and works
+// with QEMU's default IDE controller.
+//
+// The driver supports:
+//   - LBA28 addressing (up to 128GB)
+//   - PIO data transfer (no DMA)
+//   - Read/Write of 512-byte sectors
+//   - Primary master drive only (for simplicity)
+//
+// ATA registers (primary controller, base 0x1F0):
+//   0x1F0 — Data Register (16-bit read/write)
+//   0x1F1 — Error / Features
+//   0x1F2 — Sector Count
+//   0x1F3 — LBA Low  (bits 0-7)
+//   0x1F4 — LBA Mid  (bits 8-15)
+//   0x1F5 — LBA High (bits 16-23)
+//   0x1F6 — Drive/Head (bits 24-27 + drive select)
+//   0x1F7 — Status / Command
+//   0x3F6 — Alternate Status / Device Control
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+import "kernel/core/console.lx";
+
+# ATA I/O ports — primary controller
+int ATA_DATA       = 0x1F0;
+int ATA_ERROR      = 0x1F1;
+int ATA_FEATURES   = 0x1F1;
+int ATA_SECT_COUNT = 0x1F2;
+int ATA_LBA_LOW    = 0x1F3;
+int ATA_LBA_MID    = 0x1F4;
+int ATA_LBA_HIGH   = 0x1F5;
+int ATA_DRIVE_HEAD = 0x1F6;
+int ATA_STATUS     = 0x1F7;
+int ATA_COMMAND    = 0x1F7;
+int ATA_ALT_STATUS = 0x3F6;
+int ATA_DEV_CTRL   = 0x3F6;
+
+# ATA commands
+int ATA_CMD_READ   = 0x20;   # Read sectors (PIO)
+int ATA_CMD_WRITE  = 0x30;   # Write sectors (PIO)
+int ATA_CMD_FLUSH  = 0xE7;   # Flush write cache
+int ATA_CMD_IDENTIFY = 0xEC; # Identify drive
+
+# ATA status bits
+int ATA_SR_BSY  = 0x80;   # Busy
+int ATA_SR_DRDY = 0x40;   # Drive ready
+int ATA_SR_DF   = 0x20;   # Drive fault
+int ATA_SR_DSC  = 0x10;   # Drive seek complete
+int ATA_SR_DRQ  = 0x08;   # Data request
+int ATA_SR_CORR = 0x04;   # Corrected data
+int ATA_SR_IDX  = 0x02;   # Index
+int ATA_SR_ERR  = 0x01;   # Error
+
+# Sector size
+int SECTOR_SIZE = 512;
+
+# Drive info (filled by identify)
+bool diskPresent = false;
+long diskSectorCount = 0;
+string diskModel = "";
+
+export class Disk {
+
+    # ========================================================================
+    # Initialize the ATA disk driver
+    # Detects the primary master drive and reads its identification
+    # ========================================================================
+    public static func init() -> void {
+        # Probe primary master
+        diskPresent = identify();
+
+        if (diskPresent) {
+            Console.log("[  OK  ] Disk driver: ATA primary master detected");
+        } else {
+            Console.log("[WARN ] Disk driver: No ATA disk found");
+        }
+    }
+
+    # ========================================================================
+    # Check if a disk is present and accessible
+    # ========================================================================
+    public static func isPresent() -> bool {
+        return diskPresent;
+    }
+
+    # ========================================================================
+    # Get total number of sectors on the disk
+    # ========================================================================
+    public static func getSectorCount() -> long {
+        return diskSectorCount;
+    }
+
+    # ========================================================================
+    # Identify the primary master drive
+    # Returns true if a valid ATA drive responds
+    # ========================================================================
+    private static func identify() -> bool {
+        # Select master drive
+        outb(ATA_DRIVE_HEAD, 0xA0);
+        ata400nsDelay();
+
+        # Zero out sector count and LBA registers
+        outb(ATA_SECT_COUNT, 0);
+        outb(ATA_LBA_LOW, 0);
+        outb(ATA_LBA_MID, 0);
+        outb(ATA_LBA_HIGH, 0);
+
+        # Send IDENTIFY command
+        outb(ATA_COMMAND, ATA_CMD_IDENTIFY);
+        ata400nsDelay();
+
+        # Read status
+        byte status = inb(ATA_STATUS);
+        if (status == 0) return false;   # No drive
+
+        # Wait for BSY to clear
+        int timeout = 100000;
+        while ((inb(ATA_STATUS) & ATA_SR_BSY) != 0) {
+            timeout--;
+            if (timeout <= 0) return false;
+        }
+
+        # Check if ATAPI (not an ATA disk)
+        byte mid = inb(ATA_LBA_MID);
+        byte high = inb(ATA_LBA_HIGH);
+        if (mid != 0 || high != 0) return false;  # ATAPI or SATA
+
+        # Wait for DRQ or ERR
+        timeout = 100000;
+        while (true) {
+            status = inb(ATA_STATUS);
+            if ((status & ATA_SR_ERR) != 0) return false;
+            if ((status & ATA_SR_DRQ) != 0) break;
+            timeout--;
+            if (timeout <= 0) return false;
+        }
+
+        # Read 256 words of identification data
+        # We care about:
+        #   Words 60-61: Total addressable sectors (LBA28)
+        #   Words 100-103: Total addressable sectors (LBA48)
+        #   Words 27-46: Model string (40 chars, byte-swapped)
+        unsafe {
+            int identBuf_raw[256];
+            for (int i = 0; i < 256; i++) {
+                identBuf_raw[i] = inw(ATA_DATA);
+            }
+
+            # Extract LBA28 sector count from words 60-61
+            long lo = (long)(identBuf_raw[60] & 0xFFFF);
+            long hi = (long)(identBuf_raw[61] & 0xFFFF);
+            diskSectorCount = (hi << 16) | lo;
+
+            # If LBA48 is supported, use the larger count (words 100-103)
+            long lba48_lo = (long)(identBuf_raw[100] & 0xFFFF);
+            long lba48_mid = (long)(identBuf_raw[101] & 0xFFFF);
+            if (lba48_lo > 0 || lba48_mid > 0) {
+                diskSectorCount = (lba48_mid << 16) | lba48_lo;
+            }
+        }
+
+        return true;
+    }
+
+    # ========================================================================
+    # Read sectors from disk into a memory buffer
+    #
+    # lba    — Starting logical block address (sector number)
+    # count  — Number of sectors to read (max 256)
+    # buffer — Pointer to destination buffer (must hold count * 512 bytes)
+    #
+    # Returns 0 on success, -1 on error
+    # ========================================================================
+    public static func readSectors(long lba, int count, long buffer) -> int {
+        if (!diskPresent) return -1;
+        if (count == 0 || count > 256) return -1;
+
+        # Actual count byte (256 maps to 0)
+        int countByte = count;
+        if (countByte == 256) countByte = 0;
+
+        # Wait for drive to be ready
+        if (ataWaitReady() != 0) return -1;
+
+        # Select drive + LBA mode + upper 4 LBA bits
+        int head = (int)((lba >> 24) & 0x0F);
+        outb(ATA_DRIVE_HEAD, (byte)(0xE0 | head));  # 0xE0 = LBA + master
+        ata400nsDelay();
+
+        # Set sector count and LBA
+        outb(ATA_SECT_COUNT, (byte) countByte);
+        outb(ATA_LBA_LOW,   (byte)(lba & 0xFF));
+        outb(ATA_LBA_MID,   (byte)((lba >> 8) & 0xFF));
+        outb(ATA_LBA_HIGH,  (byte)((lba >> 16) & 0xFF));
+
+        # Send READ command
+        outb(ATA_COMMAND, ATA_CMD_READ);
+
+        # Read sectors one at a time
+        unsafe {
+            int offset = 0;
+            for (int s = 0; s < count; s++) {
+                # Wait for DRQ
+                if (ataWaitDrq() != 0) return -1;
+
+                # Read 256 words (512 bytes) from data port
+                # Using rep insw for efficiency
+                int wordCount = 256;
+                long dstAddr = buffer + (long) offset;
+                insw(ATA_DATA, dstAddr, wordCount);
+
+                offset = offset + SECTOR_SIZE;
+            }
+        }
+
+        return 0;
+    }
+
+    # ========================================================================
+    # Write sectors from memory buffer to disk
+    #
+    # lba    — Starting logical block address (sector number)
+    # count  — Number of sectors to write (max 256)
+    # buffer — Pointer to source buffer (must hold count * 512 bytes)
+    #
+    # Returns 0 on success, -1 on error
+    # ========================================================================
+    public static func writeSectors(long lba, int count, long buffer) -> int {
+        if (!diskPresent) return -1;
+        if (count == 0 || count > 256) return -1;
+
+        int countByte = count;
+        if (countByte == 256) countByte = 0;
+
+        # Wait for drive to be ready
+        if (ataWaitReady() != 0) return -1;
+
+        # Select drive + LBA mode + upper 4 LBA bits
+        int head = (int)((lba >> 24) & 0x0F);
+        outb(ATA_DRIVE_HEAD, (byte)(0xE0 | head));
+        ata400nsDelay();
+
+        # Set sector count and LBA
+        outb(ATA_SECT_COUNT, (byte) countByte);
+        outb(ATA_LBA_LOW,   (byte)(lba & 0xFF));
+        outb(ATA_LBA_MID,   (byte)((lba >> 8) & 0xFF));
+        outb(ATA_LBA_HIGH,  (byte)((lba >> 16) & 0xFF));
+
+        # Send WRITE command
+        outb(ATA_COMMAND, ATA_CMD_WRITE);
+
+        # Write sectors one at a time
+        unsafe {
+            int offset = 0;
+            for (int s = 0; s < count; s++) {
+                # Wait for DRQ
+                if (ataWaitDrq() != 0) return -1;
+
+                # Write 256 words (512 bytes) to data port
+                long srcAddr = buffer + (long) offset;
+                outsw(ATA_DATA, srcAddr, 256);
+
+                offset = offset + SECTOR_SIZE;
+            }
+        }
+
+        # Flush write cache
+        outb(ATA_COMMAND, ATA_CMD_FLUSH);
+        if (ataWaitReady() != 0) return -1;
+
+        return 0;
+    }
+
+    # ========================================================================
+    # Read a single sector into the provided buffer
+    # Convenience wrapper around readSectors
+    # ========================================================================
+    public static func readSector(long lba, long buffer) -> int {
+        return readSectors(lba, 1, buffer);
+    }
+
+    # ========================================================================
+    # Write a single sector from the provided buffer
+    # Convenience wrapper around writeSectors
+    # ========================================================================
+    public static func writeSector(long lba, long buffer) -> int {
+        return writeSectors(lba, 1, buffer);
+    }
+}
+
+# ============================================================================
+# ATA helper functions
+# ============================================================================
+
+# Wait for BSY to clear and DRDY to be set
+func ataWaitReady() -> int {
+    int timeout = 500000;
+    while (true) {
+        byte status = inb(ATA_STATUS);
+        if ((status & ATA_SR_BSY) == 0 && (status & ATA_SR_DRDY) != 0) return 0;
+        if ((status & (ATA_SR_ERR | ATA_SR_DF)) != 0) return -1;
+        timeout--;
+        if (timeout <= 0) return -1;
+    }
+    return -1;
+}
+
+# Wait for DRQ (data request ready)
+func ataWaitDrq() -> int {
+    int timeout = 500000;
+    while (true) {
+        byte status = inb(ATA_STATUS);
+        if ((status & ATA_SR_BSY) == 0 && (status & ATA_SR_DRQ) != 0) return 0;
+        if ((status & (ATA_SR_ERR | ATA_SR_DF)) != 0) return -1;
+        timeout--;
+        if (timeout <= 0) return -1;
+    }
+    return -1;
+}
+
+# 400ns delay: reading alt status 4 times = ~400ns on standard ATA
+func ata400nsDelay() -> void {
+    inb(ATA_ALT_STATUS);
+    inb(ATA_ALT_STATUS);
+    inb(ATA_ALT_STATUS);
+    inb(ATA_ALT_STATUS);
+}

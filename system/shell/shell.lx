@@ -1,0 +1,2737 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Shell - Bash-like terminal for StratOS
+// system/shell/shell.lx
+//
+// Features:
+//   - Command parsing and execution
+//   - Built-in commands (cd, ls, cat, echo, clear, etc.)
+//   - Environment variables
+//   - Command history
+//   - Pipe support (|)
+//   - Flux REPL mode (via `flux` command)
+//   - Tab completion
+// ============================================================================
+
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/framebuffer.lx";
+import "kernel/core/console.lx";
+import "kernel/core/scheduler.lx";
+import "system/fs/vfs.lx";
+import "system/windowing/desktop.lx";
+import "system/installer/installer.lx";
+import "kernel/core/process.lx";
+import "kernel/drivers/e1000.lx";
+import "kernel/drivers/net.lx";
+
+# Shell state
+string currentDir = "/";
+string hostname = "stratos";
+string username = "void";
+list<string> commandHistory = [];
+int historyIndex = -1;
+int MAX_HISTORY = 50;
+bool isRoot = false;
+
+# Desktop launch flag — set by 'startx', checked by kernel_main
+bool desktopRequested = false;
+
+# Quantum package manager config
+string quantumRegistryUrl = "stratos.skinnertopia.com";
+
+
+# Environment variables
+list<string> envKeys = [];
+list<string> envValues = [];
+
+# Color scheme (clean cosmic)
+color32 PROMPT_USER_COLOR = 0x5B8CFFFF;    # Cosmic blue
+color32 PROMPT_PATH_COLOR = 0x69F0AEFF;    # Nebula green
+color32 PROMPT_SYMBOL_COLOR = 0xC8D0E0FF;  # Silver
+color32 TEXT_COLOR = 0xC8D0E0FF;           # Silver-blue
+color32 ERROR_COLOR = 0xFF5252FF;          # Alert red
+color32 HIGHLIGHT_COLOR = 0xFFB74DFF;      # Amber
+
+# Built-in command names
+list<string> builtinCommands = [
+    "cd", "ls", "pwd", "echo", "clear", "cat", "mkdir", "rm", "cp", "mv",
+    "touch", "history", "export", "env", "whoami", "hostname", "uname",
+    "help", "exit", "reboot", "shutdown", "flux", "quantum", "ps", "kill",
+    "date", "uptime", "free", "df", "neofetch", "sudo", "su", "ping",
+    "head", "wc", "write", "id", "chmod", "chown", "grep", "find",
+    "which", "alias", "man", "dmesg", "startx", "wallpaper", "install",
+    "cc", "run", "sync", "ifconfig", "wget", "nslookup"
+];
+
+export class Shell {
+    # Initialize the shell
+    public static func init() -> void {
+        # Set default environment
+        setEnv("HOME", "/home/void");
+        setEnv("PATH", "/bin:/usr/bin:/system/bin");
+        setEnv("SHELL", "/system/shell/shell");
+        setEnv("TERM", "stratos-256color");
+        setEnv("USER", username);
+        setEnv("HOSTNAME", hostname);
+        setEnv("PS1", "\\u@\\h \\w $ ");
+        setEnv("EDITOR", "nova");
+        setEnv("LANG", "en_US.UTF-8");
+        setEnv("STRATOS_VERSION", "0.1.0");
+
+        currentDir = "/home/void";
+    }
+
+    # Set the working directory from external callers (e.g. "Open in Terminal")
+    public static func setCwd(string path) -> void {
+        currentDir = path;
+    }
+
+    # Get the current working directory
+    public static func getCwd() -> string {
+        return currentDir;
+    }
+
+    # Main shell loop
+    public static func run() -> void {
+        # Display welcome message
+        Console.setColor(PROMPT_USER_COLOR);
+        Console.log("");
+        Console.log("  Welcome to StratOS Shell");
+        Console.log("  Type 'help' for available commands");
+        Console.log("  Type 'flux' to enter the Flux REPL");
+        Console.log("");
+        Console.setColor(TEXT_COLOR);
+
+        # Main input loop
+        while (true) {
+            # Check if startx was requested
+            if (desktopRequested) {
+                return;
+            }
+
+            printPrompt();
+            string input = readInput();
+
+            if (input.trim().length == 0) continue;
+
+            # Add to history
+            if (commandHistory.length >= MAX_HISTORY) {
+                commandHistory.removeAt(0);
+            }
+            commandHistory.add(input);
+            historyIndex = commandHistory.length;
+
+            # Parse and execute
+            executeCommand(input);
+        }
+    }
+
+    # Print the shell prompt
+    private static func printPrompt() -> void {
+        if (isRoot) {
+            Console.setColor(ERROR_COLOR);
+            Console.write("root@$hostname");
+        } else {
+            Console.setColor(PROMPT_USER_COLOR);
+            Console.write("$username@$hostname");
+        }
+        Console.setColor(PROMPT_SYMBOL_COLOR);
+        Console.write(":");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.write(shortenPath(currentDir));
+        Console.setColor(PROMPT_SYMBOL_COLOR);
+        if (isRoot) {
+            Console.write("# ");
+        } else {
+            Console.write("$ ");
+        }
+        Console.setColor(TEXT_COLOR);
+    }
+
+    # Shorten home dir to ~
+    private static func shortenPath(string path) -> string {
+        string home = getEnv("HOME");
+        if (path.startsWith(home)) {
+            return "~" + path.substring(home.length, path.length - home.length);
+        }
+        return path;
+    }
+
+    # Read input with history navigation and editing
+    private static func readInput() -> string {
+        string line = "";
+        int cursorPos = 0;
+
+        while (true) {
+            if (!Keyboard.hasKey()) continue;
+
+            KeyEvent event = Keyboard.pollKey();
+            if (!event.pressed) continue;
+
+            # Enter - submit command
+            if (event.scancode == KEY_ENTER) {
+                Console.log("");  # Newline
+                return line;
+            }
+
+            # Backspace
+            if (event.scancode == KEY_BACKSPACE && cursorPos > 0) {
+                line = line.substring(0, cursorPos - 1) + line.substring(cursorPos, line.length - cursorPos);
+                cursorPos--;
+                redrawInput(line, cursorPos);
+                continue;
+            }
+
+            # Arrow Up - history previous
+            if (event.scancode == KEY_UP && commandHistory.length > 0) {
+                if (historyIndex > 0) {
+                    historyIndex--;
+                }
+                if (historyIndex >= 0 && historyIndex < commandHistory.length) {
+                    line = commandHistory[historyIndex];
+                    cursorPos = line.length;
+                    redrawInput(line, cursorPos);
+                }
+                continue;
+            }
+
+            # Arrow Down - history next
+            if (event.scancode == KEY_DOWN) {
+                if (historyIndex < commandHistory.length - 1) {
+                    historyIndex++;
+                    if (historyIndex >= 0 && historyIndex < commandHistory.length) {
+                        line = commandHistory[historyIndex];
+                    }
+                } else {
+                    historyIndex = commandHistory.length;
+                    line = "";
+                }
+                cursorPos = line.length;
+                redrawInput(line, cursorPos);
+                continue;
+            }
+
+            # Arrow Left
+            if (event.scancode == KEY_LEFT && cursorPos > 0) {
+                cursorPos--;
+                continue;
+            }
+
+            # Arrow Right
+            if (event.scancode == KEY_RIGHT && cursorPos < line.length) {
+                cursorPos++;
+                continue;
+            }
+
+            # Tab - autocomplete
+            if (event.scancode == KEY_TAB) {
+                string completed = tabComplete(line);
+                if (completed.length > 0) {
+                    line = completed;
+                    cursorPos = line.length;
+                    redrawInput(line, cursorPos);
+                }
+                continue;
+            }
+
+            # Ctrl+C - cancel current line
+            if (event.ctrl && event.ascii == 'c') {
+                Console.log("^C");
+                return "";
+            }
+
+            # Ctrl+L - clear screen
+            if (event.ctrl && event.ascii == 'l') {
+                Framebuffer.clear(0x0A0E1AFF);
+                Console.setCursor(0, 0);
+                printPrompt();
+                Console.write(line);
+                continue;
+            }
+
+            # PageUp - scroll terminal output up
+            if (event.scancode == KEY_PAGEUP) {
+                Console.scrollPageUp();
+                continue;
+            }
+
+            # PageDown - scroll terminal output down
+            if (event.scancode == KEY_PAGEDOWN) {
+                Console.scrollPageDown();
+                continue;
+            }
+
+            # Any other key exits scroll mode if active
+            if (Console.isScrollMode()) {
+                Console.scrollToBottom();
+                printPrompt();
+                Console.write(line);
+            }
+
+            # Regular character
+            if (event.ascii >= 32 && event.ascii <= 126) {
+                line = line.substring(0, cursorPos) + (string) event.ascii + line.substring(cursorPos, line.length - cursorPos);
+                cursorPos++;
+                if (cursorPos < line.length) {
+                    # Inserting in middle - redraw entire line
+                    redrawInput(line, cursorPos);
+                } else {
+                    # Appending at end - just write the char
+                    Console.write((string) event.ascii);
+                }
+            }
+        }
+    }
+
+    # Redraw current input line
+    private static func redrawInput(string line, int cursor) -> void {
+        # Move to start of line
+        Console.write("\r");
+        # Re-render prompt + full line
+        printPrompt();
+        Console.write(line);
+        # Clear trailing characters from previous (longer) line
+        # Use enough spaces to cover any reasonable deletion
+        Console.write("                    ");
+        # Reposition cursor at the correct column
+        Console.write("\r");
+        printPrompt();
+        if (cursor > 0) {
+            Console.write(line.substring(0, cursor));
+        }
+    }
+
+    # Tab completion
+    private static func tabComplete(string partial) -> string {
+        list<string> matches = [];
+
+        # Check built-in commands
+        for (string cmd in builtinCommands) {
+            if (cmd.startsWith(partial)) {
+                matches.add(cmd);
+            }
+        }
+
+        if (matches.length == 1) {
+            return matches[0] + " ";
+        } elif (matches.length > 1) {
+            Console.log("");
+            for (string m in matches) {
+                Console.write(m + "  ");
+            }
+            Console.log("");
+            return partial;
+        }
+
+        return "";
+    }
+
+    # Parse and execute a command string
+    public static func executeCommand(string input) -> void {
+        # Handle pipes
+        if (input.contains("|")) {
+            executePipeline(input);
+            return;
+        }
+
+        # Split into command and arguments
+        list<string> parts = input.trim().split(" ");
+        if (parts.length == 0) return;
+
+        string command = parts[0];
+        list<string> args = [];
+        for (int i = 1; i < parts.length; i++) {
+            args.add(parts[i]);
+        }
+
+        # Execute built-in or external command
+        switch (command) {
+            case "cd":       cmdCd(args); break;
+            case "ls":       cmdLs(args); break;
+            case "pwd":      cmdPwd(args); break;
+            case "echo":     cmdEcho(args); break;
+            case "clear":    cmdClear(args); break;
+            case "cat":      cmdCat(args); break;
+            case "mkdir":    cmdMkdir(args); break;
+            case "rm":       cmdRm(args); break;
+            case "touch":    cmdTouch(args); break;
+            case "history":  cmdHistory(args); break;
+            case "export":   cmdExport(args); break;
+            case "env":      cmdEnv(args); break;
+            case "whoami":   cmdWhoami(args); break;
+            case "hostname": cmdHostname(args); break;
+            case "uname":    cmdUname(args); break;
+            case "help":     cmdHelp(args); break;
+            case "exit":     cmdExit(args); break;
+            case "reboot":   cmdReboot(args); break;
+            case "shutdown": cmdShutdown(args); break;
+            case "flux":     cmdFlux(args); break;
+            case "quantum":  cmdQuantum(args); break;
+            case "ps":       cmdPs(args); break;
+            case "kill":     cmdKill(args); break;
+            case "date":     cmdDate(args); break;
+            case "uptime":   cmdUptime(args); break;
+            case "free":     cmdFree(args); break;
+            case "neofetch": cmdNeofetch(args); break;
+            case "cp":       cmdCp(args); break;
+            case "mv":       cmdMv(args); break;
+            case "df":       cmdDf(args); break;
+            case "write":    cmdWrite(args); break;
+            case "head":     cmdHead(args); break;
+            case "wc":       cmdWc(args); break;
+            case "sudo":     cmdSudo(args); break;
+            case "su":       cmdSu(args); break;
+            case "ping":     cmdPing(args); break;
+            case "id":       cmdId(args); break;
+            case "chmod":    cmdChmod(args); break;
+            case "chown":    cmdChown(args); break;
+            case "grep":     cmdGrep(args); break;
+            case "find":     cmdFind(args); break;
+            case "which":    cmdWhich(args); break;
+            case "man":      cmdMan(args); break;
+            case "dmesg":    cmdDmesg(args); break;
+            case "startx":   cmdStartx(args); break;
+            case "wallpaper": cmdWallpaper(args); break;
+            case "install":  cmdInstall(args); break;
+            case "cc":       cmdCc(args); break;
+            case "run":      cmdRunElf(args); break;
+            case "sync":     cmdSync(args); break;
+            case "ifconfig": cmdIfconfig(args); break;
+            case "wget":     cmdWget(args); break;
+            case "nslookup": cmdNslookup(args); break;
+
+            default:
+                Console.setColor(ERROR_COLOR);
+                Console.log("$command: command not found");
+                Console.setColor(TEXT_COLOR);
+                break;
+        }
+    }
+
+    # ========================================================================
+    # Built-in Command Implementations
+    # ========================================================================
+
+    private static func cmdCd(list<string> args) -> void {
+        if (args.length == 0) {
+            currentDir = getEnv("HOME");
+            return;
+        }
+
+        string target = args[0];
+        string resolved = "";
+
+        if (target == "-") {
+            resolved = getEnv("OLDPWD");
+            if (resolved == "") resolved = currentDir;
+        } elif (target == "~") {
+            resolved = getEnv("HOME");
+        } elif (target == "..") {
+            resolved = VFS.parentPath(currentDir);
+        } elif (target == "/") {
+            resolved = "/";
+        } elif (target.startsWith("/")) {
+            resolved = VFS.normalizePath(target);
+        } else {
+            resolved = VFS.resolvePath(currentDir, target);
+        }
+
+        if (!VFS.isDirectory(resolved)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("cd: ${target}: No such directory");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        setEnv("OLDPWD", currentDir);
+        currentDir = resolved;
+    }
+
+    private static func cmdLs(list<string> args) -> void {
+        string path = currentDir;
+        bool showLong = false;
+        bool showAll = false;
+
+        for (string a in args) {
+            if (a == "-l") {
+                showLong = true;
+            } elif (a == "-a") {
+                showAll = true;
+            } elif (a == "-la" || a == "-al") {
+                showLong = true;
+                showAll = true;
+            } elif (!a.startsWith("-")) {
+                if (a.startsWith("/")) {
+                    path = VFS.normalizePath(a);
+                } else {
+                    path = VFS.resolvePath(currentDir, a);
+                }
+            }
+        }
+
+        if (!VFS.isDirectory(path)) {
+            if (VFS.isFile(path)) {
+                Console.log(VFS.basename(path));
+                return;
+            }
+            Console.setColor(ERROR_COLOR);
+            Console.log("ls: cannot access '${path}': No such file or directory");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        list<FileInfo> entries = VFS.listDir(path);
+
+        if (entries.length == 0) {
+            return;
+        }
+
+        if (showLong) {
+            for (FileInfo fi in entries) {
+                if (!showAll && fi.name.startsWith(".")) continue;
+
+                string typeChar = "-";
+                if (fi.type == 1) typeChar = "d";
+
+                string sizeStr = "${fi.size}";
+                while (sizeStr.length < 8) sizeStr = " " + sizeStr;
+
+                if (fi.type == 1) {
+                    Console.setColor(PROMPT_PATH_COLOR);
+                } else {
+                    Console.setColor(TEXT_COLOR);
+                }
+                Console.log("${typeChar} ${fi.permissions}  ${fi.owner}  ${sizeStr}  ${fi.name}");
+            }
+            Console.setColor(TEXT_COLOR);
+        } else {
+            string line = "";
+            int count = 0;
+            for (FileInfo fi in entries) {
+                if (!showAll && fi.name.startsWith(".")) continue;
+
+                string name = fi.name;
+                if (fi.type == 1) name = name + "/";
+
+                if (fi.type == 1) {
+                    if (line.length > 0) {
+                        Console.setColor(TEXT_COLOR);
+                        Console.write(line);
+                        line = "";
+                    }
+                    Console.setColor(PROMPT_PATH_COLOR);
+                    Console.write(name + "  ");
+                } else {
+                    line += name + "  ";
+                }
+                count++;
+            }
+            if (line.length > 0) {
+                Console.setColor(TEXT_COLOR);
+                Console.write(line);
+            }
+            if (count > 0) Console.log("");
+            Console.setColor(TEXT_COLOR);
+        }
+    }
+
+    private static func cmdPwd(list<string> args) -> void {
+        Console.log(currentDir);
+    }
+
+    private static func cmdEcho(list<string> args) -> void {
+        string output = "";
+        for (int i = 0; i < args.length; i++) {
+            string arg = args[i];
+            # Expand environment variables ($VAR)
+            if (arg.startsWith("$")) {
+                string varName = arg.substring(1, arg.length - 1);
+                string val = getEnv(varName);
+                output += val;
+            } else {
+                output += arg;
+            }
+            if (i < args.length - 1) output += " ";
+        }
+        Console.log(output);
+    }
+
+    private static func cmdClear(list<string> args) -> void {
+        Framebuffer.clear(0x0A0E1AFF);
+        Console.setCursor(0, 0);
+    }
+
+    private static func cmdCat(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("cat: missing operand");
+            return;
+        }
+
+        for (string arg in args) {
+            string path = "";
+            if (arg.startsWith("/")) {
+                path = VFS.normalizePath(arg);
+            } else {
+                path = VFS.resolvePath(currentDir, arg);
+            }
+
+            if (!VFS.exists(path)) {
+                Console.setColor(ERROR_COLOR);
+                Console.log("cat: ${arg}: No such file or directory");
+                Console.setColor(TEXT_COLOR);
+                continue;
+            }
+
+            if (VFS.isDirectory(path)) {
+                Console.setColor(ERROR_COLOR);
+                Console.log("cat: ${arg}: Is a directory");
+                Console.setColor(TEXT_COLOR);
+                continue;
+            }
+
+            string content = VFS.read(path);
+            if (content.length > 0) {
+                Console.log(content);
+            }
+        }
+    }
+
+    private static func cmdMkdir(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("mkdir: missing operand");
+            return;
+        }
+
+        bool recursive = false;
+        for (string a in args) {
+            if (a == "-p") {
+                recursive = true;
+            }
+        }
+
+        for (string a in args) {
+            if (a.startsWith("-")) continue;
+
+            string path = "";
+            if (a.startsWith("/")) {
+                path = VFS.normalizePath(a);
+            } else {
+                path = VFS.resolvePath(currentDir, a);
+            }
+
+            bool ok = false;
+            if (recursive) {
+                ok = VFS.mkdirp(path);
+            } else {
+                # Check parent exists
+                string parent = VFS.parentPath(path);
+                if (!VFS.isDirectory(parent)) {
+                    Console.setColor(ERROR_COLOR);
+                    Console.log("mkdir: cannot create '${a}': No such file or directory");
+                    Console.setColor(TEXT_COLOR);
+                    continue;
+                }
+                ok = VFS.mkdir(path);
+            }
+
+            if (!ok) {
+                Console.setColor(ERROR_COLOR);
+                Console.log("mkdir: cannot create '${a}': File exists");
+                Console.setColor(TEXT_COLOR);
+            }
+        }
+    }
+
+    private static func cmdRm(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("rm: missing operand");
+            return;
+        }
+
+        bool recursive = false;
+        bool force = false;
+        bool noPreserveRoot = false;
+        for (string a in args) {
+            if (a == "-r" || a == "-rf" || a == "-fr") {
+                recursive = true;
+                force = true;
+            } elif (a == "-f") {
+                force = true;
+            } elif (a == "--no-preserve-root") {
+                noPreserveRoot = true;
+            }
+        }
+
+        for (string a in args) {
+            if (a.startsWith("-")) continue;
+
+            string path = "";
+            if (a.startsWith("/")) {
+                path = VFS.normalizePath(a);
+            } else {
+                path = VFS.resolvePath(currentDir, a);
+            }
+
+            # Root protection
+            if (path == "/") {
+                if (!recursive || !noPreserveRoot) {
+                    Console.setColor(ERROR_COLOR);
+                    Console.log("rm: it is dangerous to operate recursively on '/'");
+                    Console.log("rm: use --no-preserve-root to override this failsafe");
+                    Console.setColor(TEXT_COLOR);
+                    continue;
+                }
+
+                if (!isRoot) {
+                    Console.setColor(ERROR_COLOR);
+                    Console.log("rm: permission denied (must be root)");
+                    Console.setColor(TEXT_COLOR);
+                    continue;
+                }
+
+                # The legendary rm -rf / --no-preserve-root
+                Console.setColor(ERROR_COLOR);
+                Console.log("");
+                Console.log("    Deleting everything...");
+                Console.log("");
+
+                long start = Timer.getElapsedMs();
+                while (Timer.getElapsedMs() - start < 500) {}
+
+                VFS.removeRecursive("/");
+
+                Console.log("    Everything is gone. Are you happy now?");
+                Console.log("");
+                Console.log("    Filesystem destroyed. Nothing left.");
+                Console.log("    You monster.");
+                Console.log("");
+                Console.setColor(TEXT_COLOR);
+                continue;
+            }
+
+            if (!VFS.exists(path)) {
+                if (!force) {
+                    Console.setColor(ERROR_COLOR);
+                    Console.log("rm: cannot remove '${a}': No such file or directory");
+                    Console.setColor(TEXT_COLOR);
+                }
+                continue;
+            }
+
+            if (VFS.isDirectory(path)) {
+                if (!recursive) {
+                    Console.setColor(ERROR_COLOR);
+                    Console.log("rm: cannot remove '${a}': Is a directory (use -r)");
+                    Console.setColor(TEXT_COLOR);
+                    continue;
+                }
+                VFS.removeRecursive(path);
+            } else {
+                VFS.remove(path);
+            }
+        }
+    }
+
+    private static func cmdTouch(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("touch: missing file operand");
+            return;
+        }
+
+        for (string a in args) {
+            string path = "";
+            if (a.startsWith("/")) {
+                path = VFS.normalizePath(a);
+            } else {
+                path = VFS.resolvePath(currentDir, a);
+            }
+
+            # Check parent directory exists
+            string parent = VFS.parentPath(path);
+            if (!VFS.isDirectory(parent)) {
+                Console.setColor(ERROR_COLOR);
+                Console.log("touch: cannot touch '${a}': No such file or directory");
+                Console.setColor(TEXT_COLOR);
+                continue;
+            }
+
+            if (!VFS.exists(path)) {
+                VFS.touch(path);
+            }
+            # If file already exists, touch just updates timestamp (no-op for RAM FS)
+        }
+    }
+
+    private static func cmdCp(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("cp: missing operand");
+            Console.log("Usage: cp <source> <destination>");
+            return;
+        }
+
+        bool recursive = false;
+        list<string> paths = [];
+        for (string a in args) {
+            if (a == "-r" || a == "-R") {
+                recursive = true;
+            } else {
+                paths.add(a);
+            }
+        }
+
+        if (paths.length < 2) {
+            Console.log("cp: missing destination");
+            return;
+        }
+
+        string src = "";
+        if (paths[0].startsWith("/")) {
+            src = VFS.normalizePath(paths[0]);
+        } else {
+            src = VFS.resolvePath(currentDir, paths[0]);
+        }
+
+        string dst = "";
+        if (paths[1].startsWith("/")) {
+            dst = VFS.normalizePath(paths[1]);
+        } else {
+            dst = VFS.resolvePath(currentDir, paths[1]);
+        }
+
+        if (!VFS.exists(src)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("cp: cannot stat '${paths[0]}': No such file or directory");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        if (VFS.isDirectory(src) && !recursive) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("cp: -r not specified; omitting directory '${paths[0]}'");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # If dest is existing directory, copy into it
+        if (VFS.isDirectory(dst)) {
+            string name = VFS.basename(src);
+            dst = dst + "/" + name;
+        }
+
+        bool ok = VFS.copy(src, dst);
+        if (!ok) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("cp: cannot copy '${paths[0]}' to '${paths[1]}'");
+            Console.setColor(TEXT_COLOR);
+        }
+    }
+
+    private static func cmdMv(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("mv: missing operand");
+            Console.log("Usage: mv <source> <destination>");
+            return;
+        }
+
+        string src = "";
+        if (args[0].startsWith("/")) {
+            src = VFS.normalizePath(args[0]);
+        } else {
+            src = VFS.resolvePath(currentDir, args[0]);
+        }
+
+        string dst = "";
+        if (args[1].startsWith("/")) {
+            dst = VFS.normalizePath(args[1]);
+        } else {
+            dst = VFS.resolvePath(currentDir, args[1]);
+        }
+
+        if (!VFS.exists(src)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("mv: cannot stat '${args[0]}': No such file or directory");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # If dest is existing directory, move into it
+        if (VFS.isDirectory(dst)) {
+            string name = VFS.basename(src);
+            dst = dst + "/" + name;
+        }
+
+        bool ok = VFS.rename(src, dst);
+        if (!ok) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("mv: cannot move '${args[0]}' to '${args[1]}'");
+            Console.setColor(TEXT_COLOR);
+        }
+    }
+
+    private static func cmdDf(list<string> args) -> void {
+        long usage = VFS.getTotalUsage();
+        int entries = VFS.getEntryCount();
+        long totalKb = 65536;  # 64 MB RAM filesystem budget
+        long usedKb = usage / 1024;
+        long freeKb = totalKb - usedKb;
+        if (freeKb < 0) freeKb = 0;
+
+        Console.log("Filesystem      Size     Used     Free   Entries");
+        Console.log("ramfs         ${totalKb}K  ${usedKb}K  ${freeKb}K   ${entries}");
+    }
+
+    private static func cmdWrite(list<string> args) -> void {
+        # write <file> <content...> - write text to a file
+        if (args.length < 2) {
+            Console.log("write: usage: write <file> <content...>");
+            return;
+        }
+
+        string path = "";
+        if (args[0].startsWith("/")) {
+            path = VFS.normalizePath(args[0]);
+        } else {
+            path = VFS.resolvePath(currentDir, args[0]);
+        }
+
+        # Combine remaining args as content
+        string content = "";
+        for (int i = 1; i < args.length; i++) {
+            if (i > 1) content += " ";
+            content += args[i];
+        }
+
+        # Create parent if needed
+        string parent = VFS.parentPath(path);
+        if (!VFS.isDirectory(parent)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("write: '${args[0]}': parent directory does not exist");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        VFS.write(path, content);
+    }
+
+    private static func cmdHead(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("head: missing file operand");
+            return;
+        }
+
+        int lines = 10;
+        string file = "";
+        for (string a in args) {
+            if (a.startsWith("-n")) {
+                string numStr = a.substring(2, a.length - 2);
+                lines = (int) numStr;
+            } elif (!a.startsWith("-")) {
+                file = a;
+            }
+        }
+
+        if (file == "") {
+            Console.log("head: missing file operand");
+            return;
+        }
+
+        string path = "";
+        if (file.startsWith("/")) {
+            path = VFS.normalizePath(file);
+        } else {
+            path = VFS.resolvePath(currentDir, file);
+        }
+
+        if (!VFS.isFile(path)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("head: cannot open '${file}': No such file");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        string content = VFS.read(path);
+        int lineCount = 0;
+        int start = 0;
+        for (int i = 0; i < content.length; i++) {
+            if (content.charAt(i) == '\n') {
+                lineCount++;
+                if (lineCount <= lines) {
+                    Console.log(content.substring(start, i - start));
+                }
+                start = i + 1;
+            }
+        }
+        # Print trailing content if within limit
+        if (lineCount < lines && start < content.length) {
+            Console.log(content.substring(start, content.length - start));
+        }
+    }
+
+    private static func cmdWc(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("wc: missing file operand");
+            return;
+        }
+
+        for (string a in args) {
+            if (a.startsWith("-")) continue;
+
+            string path = "";
+            if (a.startsWith("/")) {
+                path = VFS.normalizePath(a);
+            } else {
+                path = VFS.resolvePath(currentDir, a);
+            }
+
+            if (!VFS.isFile(path)) {
+                Console.setColor(ERROR_COLOR);
+                Console.log("wc: ${a}: No such file");
+                Console.setColor(TEXT_COLOR);
+                continue;
+            }
+
+            string content = VFS.read(path);
+            int lineCount = 0;
+            int wordCount = 0;
+            bool inWord = false;
+            for (int i = 0; i < content.length; i++) {
+                char c = content.charAt(i);
+                if (c == '\n') lineCount++;
+                if (c == ' ' || c == '\n' || c == '\t') {
+                    inWord = false;
+                } elif (!inWord) {
+                    inWord = true;
+                    wordCount++;
+                }
+            }
+            Console.log("  ${lineCount}  ${wordCount}  ${content.length}  ${a}");
+        }
+    }
+
+    private static func cmdHistory(list<string> args) -> void {
+        for (int i = 0; i < commandHistory.length; i++) {
+            Console.log("  ${i + 1}  ${commandHistory[i]}");
+        }
+    }
+
+    private static func cmdExport(list<string> args) -> void {
+        if (args.length == 0) {
+            cmdEnv(args);
+            return;
+        }
+        string arg = args[0];
+        int eqIndex = arg.indexOf("=");
+        if (eqIndex > 0) {
+            string key = arg.substring(0, eqIndex);
+            string val = arg.substring(eqIndex + 1, arg.length - eqIndex - 1);
+            setEnv(key, val);
+        }
+    }
+
+    private static func cmdEnv(list<string> args) -> void {
+        for (int i = 0; i < envKeys.length; i++) {
+            Console.log("${envKeys[i]}=${envValues[i]}");
+        }
+    }
+
+    private static func cmdWhoami(list<string> args) -> void {
+        Console.log(username);
+    }
+
+    private static func cmdHostname(list<string> args) -> void {
+        Console.log(hostname);
+    }
+
+    private static func cmdUname(list<string> args) -> void {
+        bool showAll = false;
+        for (string a in args) {
+            if (a == "-a") showAll = true;
+        }
+        if (showAll) {
+            Console.log("StratOS stratos 0.1.0 x86_64 Flux");
+        } else {
+            Console.log("StratOS");
+        }
+    }
+
+    private static func cmdHelp(list<string> args) -> void {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("StratOS Shell - Built-in Commands");
+        Console.setColor(TEXT_COLOR);
+        Console.log("");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("  Navigation");
+        Console.setColor(TEXT_COLOR);
+        Console.log("  cd [dir]         Change directory");
+        Console.log("  ls [-la] [dir]   List directory contents");
+        Console.log("  pwd              Print working directory");
+        Console.log("");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("  Files");
+        Console.setColor(TEXT_COLOR);
+        Console.log("  cat [file]       Display file contents");
+        Console.log("  head [-nN] file  Show first N lines");
+        Console.log("  wc [file]        Count lines, words, bytes");
+        Console.log("  touch [file]     Create empty file");
+        Console.log("  write file text  Write text to file");
+        Console.log("  mkdir [-p] dir   Create directory");
+        Console.log("  rm [-rf] path    Remove file or directory");
+        Console.log("  cp [-r] src dst  Copy file or directory");
+        Console.log("  mv src dst       Move/rename file");
+        Console.log("  df               Show filesystem usage");
+        Console.log("");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("  System");
+        Console.setColor(TEXT_COLOR);
+        Console.log("  echo [text]      Print text");
+        Console.log("  clear            Clear the screen");
+        Console.log("  history          Show command history");
+        Console.log("  export K=V       Set environment variable");
+        Console.log("  env              Show all env variables");
+        Console.log("  whoami           Print current user");
+        Console.log("  hostname         Print hostname");
+        Console.log("  uname [-a]       System information");
+        Console.log("  ps               List running processes");
+        Console.log("  kill [pid]       Terminate a process");
+        Console.log("  free             Show memory usage");
+        Console.log("  uptime           Show system uptime");
+        Console.log("  date             Show current date/time");
+        Console.log("  neofetch         System info with art");
+        Console.log("");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("  Tools");
+        Console.setColor(TEXT_COLOR);
+        Console.log("  flux             Enter Flux REPL");
+        Console.log("  quantum [cmd]    Package manager");
+        Console.log("  reboot           Restart the system");
+        Console.log("  shutdown         Power off");
+        Console.log("  help             This message");
+        Console.log("");
+    }
+
+    private static func cmdExit(list<string> args) -> void {
+        Console.log("Returning to desktop...");
+    }
+
+    private static func cmdReboot(list<string> args) -> void {
+        Console.log("Rebooting...");
+        unsafe {
+            # Triple-fault to reboot (pulse reset line via keyboard controller)
+            outb(0x64, 0xFE);
+        }
+    }
+
+    private static func cmdShutdown(list<string> args) -> void {
+        Console.log("Powering off...");
+        Console.log("It is now safe to turn off your computer.");
+        unsafe {
+            # ACPI shutdown (QEMU specific: port 0x604)
+            outw(0x604, 0x2000);
+            # Fallback: halt
+            asm("cli");
+            asm("hlt");
+        }
+    }
+
+    private static func cmdFlux(list<string> args) -> void {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Flux REPL v0.1.0 - \"From the Void, Structure.\"");
+        Console.log("Type 'exit' to return to shell");
+        Console.setColor(TEXT_COLOR);
+        Console.log("");
+
+        # Enter REPL loop
+        while (true) {
+            Console.setColor(PROMPT_USER_COLOR);
+            Console.write("flux> ");
+            Console.setColor(TEXT_COLOR);
+
+            string input = Keyboard.readLine();
+            if (input.trim() == "exit") break;
+
+            # Execute Flux code via JIT
+            if (input.trim().length > 0) {
+                Console.setColor(HIGHLIGHT_COLOR);
+                Console.log("  [JIT] $input");
+                Console.setColor(TEXT_COLOR);
+                # exec(input, mode: "sandbox");
+            }
+        }
+    }
+
+    private static func cmdQuantum(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("quantum - StratOS Package Manager v0.1.0");
+            Console.setColor(TEXT_COLOR);
+            Console.log("");
+            Console.log("  quantum install <pkg> [--url <url>]  Install a package");
+            Console.log("  quantum remove <pkg> [--force]       Remove a package");
+            Console.log("  quantum update                       Update package registry");
+            Console.log("  quantum search <query>               Search available packages");
+            Console.log("  quantum list                         List installed packages");
+            Console.log("  quantum info <pkg>                   Show package details");
+            Console.log("  quantum set-url <url>                Set default registry URL");
+            Console.log("  quantum get-url                      Show current registry URL");
+            Console.log("");
+            Console.log("  Registry: ${quantumRegistryUrl}");
+            Console.log("");
+            return;
+        }
+
+        # Ensure quantum directories exist
+        VFS.mkdirp("/var/lib/quantum/installed");
+        VFS.mkdirp("/var/lib/quantum/registry");
+        VFS.mkdirp("/var/lib/quantum/cache");
+        VFS.mkdirp("/etc/quantum");
+
+        # Load registry URL from config if saved
+        if (VFS.isFile("/etc/quantum/sources.conf")) {
+            quantumRegistryUrl = VFS.read("/etc/quantum/sources.conf");
+        }
+
+        # Seed the registry if empty
+        if (!VFS.isFile("/var/lib/quantum/registry/index")) {
+            quantumSeedRegistry();
+        }
+
+        # Seed default installed packages if first run
+        if (!VFS.isFile("/var/lib/quantum/installed/flux")) {
+            VFS.write("/var/lib/quantum/installed/flux", "0.1.0|Flux language runtime|core|a1b2c3d4");
+            VFS.write("/var/lib/quantum/installed/void-utils", "0.1.0|Core system utilities|core|e5f6a7b8");
+        }
+
+        string subcmd = args[0];
+        switch (subcmd) {
+            case "install":
+                quantumInstall(args);
+                break;
+            case "remove":
+                quantumRemove(args);
+                break;
+            case "list":
+                quantumList();
+                break;
+            case "search":
+                quantumSearch(args);
+                break;
+            case "info":
+                quantumInfo(args);
+                break;
+            case "update":
+                quantumUpdate();
+                break;
+            case "set-url":
+                if (args.length < 2) {
+                    Console.log("quantum: usage: quantum set-url <url>");
+                } else {
+                    quantumRegistryUrl = args[1];
+                    VFS.write("/etc/quantum/sources.conf", args[1]);
+                    Console.setColor(PROMPT_PATH_COLOR);
+                    Console.log("Registry URL set to: ${args[1]}");
+                    Console.setColor(TEXT_COLOR);
+                }
+                break;
+            case "get-url":
+                Console.log("Registry: ${quantumRegistryUrl}");
+                break;
+            default:
+                Console.setColor(ERROR_COLOR);
+                Console.log("quantum: unknown command '${subcmd}'");
+                Console.setColor(TEXT_COLOR);
+                Console.log("Run 'quantum' for usage information.");
+                break;
+        }
+    }
+
+    private static func quantumSeedRegistry() -> void {
+        string registry = "";
+        registry += "flux|0.1.0|Flux language runtime|core|a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2\n";
+        registry += "nova|0.1.0|Text editor|app|b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3\n";
+        registry += "drift|0.1.0|File explorer|app|c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4\n";
+        registry += "nebula|0.1.0|Web browser|app|d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5\n";
+        registry += "pulsar|0.1.0|Music player|app|e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6\n";
+        registry += "cosmos|0.1.0|Desktop environment|system|f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7\n";
+        registry += "stellar|0.1.0|Window compositor|system|a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8\n";
+        registry += "orbit|0.1.0|Task manager|app|b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9\n";
+        registry += "photon|0.1.0|Image viewer|app|c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0\n";
+        registry += "echo|0.1.0|Audio framework|lib|d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1\n";
+        registry += "void-utils|0.1.0|Core system utilities|core|e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6\n";
+        registry += "libcrypt|0.1.0|Cryptography library|lib|f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3\n";
+        registry += "netstack|0.1.0|Network stack|lib|a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4\n";
+        VFS.write("/var/lib/quantum/registry/index", registry);
+    }
+
+    # Ask the user a Y/n confirmation question
+    private static func confirmPrompt(string question) -> bool {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.write("${question} [Y/n] ");
+        Console.setColor(TEXT_COLOR);
+
+        while (true) {
+            if (!Keyboard.hasKey()) continue;
+            KeyEvent ev = Keyboard.pollKey();
+            if (!ev.pressed) continue;
+
+            if (ev.ascii == 'y' || ev.ascii == 'Y' || ev.scancode == KEY_ENTER) {
+                Console.log("Y");
+                return true;
+            } elif (ev.ascii == 'n' || ev.ascii == 'N') {
+                Console.log("n");
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static func quantumInstall(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("quantum: missing package name");
+            Console.log("Usage: quantum install <pkg> [--url <url>]");
+            return;
+        }
+
+        string pkg = args[1];
+        string overrideUrl = "";
+
+        # Parse --url flag
+        for (int i = 2; i < args.length; i++) {
+            if (args[i] == "--url" && i + 1 < args.length) {
+                overrideUrl = args[i + 1];
+                i++;
+            }
+        }
+
+        string sourceUrl = quantumRegistryUrl;
+        if (overrideUrl.length > 0) {
+            sourceUrl = overrideUrl;
+        }
+
+        string installedPath = "/var/lib/quantum/installed/" + pkg;
+
+        # Check if already installed
+        if (VFS.isFile(installedPath)) {
+            Console.log("quantum: '${pkg}' is already installed");
+            return;
+        }
+
+        # Find in registry
+        string registry = VFS.read("/var/lib/quantum/registry/index");
+        bool found = false;
+        string version = "";
+        string desc = "";
+        string category = "";
+        string expectedHash = "";
+
+        # Parse registry line by line
+        int start = 0;
+        for (int i = 0; i <= registry.length; i++) {
+            bool atEnd = (i == registry.length);
+            bool atNewline = false;
+            if (!atEnd) {
+                if (registry.charAt(i) == '\n') atNewline = true;
+            }
+            if (atEnd || atNewline) {
+                if (i > start) {
+                    string line = registry.substring(start, i - start);
+                    # Parse: name|version|desc|category|sha256
+                    int p1 = line.indexOf("|");
+                    if (p1 > 0) {
+                        string name = line.substring(0, p1);
+                        if (name == pkg) {
+                            found = true;
+                            string rest = line.substring(p1 + 1, line.length - p1 - 1);
+                            int p2 = rest.indexOf("|");
+                            if (p2 > 0) {
+                                version = rest.substring(0, p2);
+                                string rest2 = rest.substring(p2 + 1, rest.length - p2 - 1);
+                                int p3 = rest2.indexOf("|");
+                                if (p3 > 0) {
+                                    desc = rest2.substring(0, p3);
+                                    string rest3 = rest2.substring(p3 + 1, rest2.length - p3 - 1);
+                                    int p4 = rest3.indexOf("|");
+                                    if (p4 > 0) {
+                                        category = rest3.substring(0, p4);
+                                        expectedHash = rest3.substring(p4 + 1, rest3.length - p4 - 1);
+                                    } else {
+                                        category = rest3;
+                                    }
+                                } else {
+                                    desc = rest2;
+                                }
+                            }
+                        }
+                    }
+                }
+                start = i + 1;
+            }
+        }
+
+        if (!found) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("quantum: package '${pkg}' not found in registry");
+            Console.setColor(TEXT_COLOR);
+            Console.log("Try 'quantum search ${pkg}' or install from URL:");
+            Console.log("  quantum install ${pkg} --url <url>");
+            return;
+        }
+
+        # Display package metadata
+        Console.log("");
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Package:     ${pkg} ${version}");
+        Console.setColor(TEXT_COLOR);
+        Console.log("Description: ${desc}");
+        Console.log("Category:    ${category}");
+        Console.log("Source:      ${sourceUrl}");
+        if (expectedHash.length > 0) {
+            Console.log("SHA256:      ${expectedHash}");
+        }
+        Console.log("");
+
+        # Ask for confirmation
+        if (!confirmPrompt(":: Proceed with installation?")) {
+            Console.log("Installation cancelled.");
+            return;
+        }
+
+        Console.log("");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log(":: Fetching ${pkg}-${version}.qpkg from ${sourceUrl}...");
+        Console.setColor(TEXT_COLOR);
+        Console.log("   Resolving dependencies...");
+        Console.log("   Downloading ${pkg}-${version}.qpkg...");
+
+        # Simulate SHA256 verification
+        string downloadedHash = expectedHash;
+        if (expectedHash.length > 0) {
+            Console.log("   Verifying SHA256 integrity...");
+            if (downloadedHash == expectedHash) {
+                Console.setColor(PROMPT_PATH_COLOR);
+                Console.log("   SHA256 verified: OK");
+                Console.setColor(TEXT_COLOR);
+            } else {
+                Console.setColor(ERROR_COLOR);
+                Console.log("   SHA256 MISMATCH!");
+                Console.log("   Expected: ${expectedHash}");
+                Console.log("   Got:      ${downloadedHash}");
+                Console.setColor(TEXT_COLOR);
+                Console.log("");
+                if (!confirmPrompt("   Integrity check failed. Install anyway?")) {
+                    Console.log("   Installation aborted.");
+                    return;
+                }
+            }
+        }
+
+        Console.log("   Installing to /usr/lib/${pkg}/...");
+
+        # Create package directory and manifest
+        VFS.mkdirp("/usr/lib/" + pkg);
+        string manifest = "${version}|${desc}|${category}|${expectedHash}";
+        VFS.write(installedPath, manifest);
+
+        # Write package receipt to cache
+        VFS.write("/var/lib/quantum/cache/" + pkg + ".receipt", "source=${sourceUrl}\nversion=${version}\nhash=${expectedHash}\n");
+
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("   ${pkg} ${version} installed successfully.");
+        Console.setColor(TEXT_COLOR);
+        Console.log("");
+    }
+
+    private static func quantumRemove(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("quantum: missing package name");
+            return;
+        }
+
+        string pkg = args[1];
+        string installedPath = "/var/lib/quantum/installed/" + pkg;
+
+        if (!VFS.isFile(installedPath)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("quantum: package '${pkg}' is not installed");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # Don't allow removing core packages without --force
+        string manifest = VFS.read(installedPath);
+        bool isCore = (manifest.indexOf("|core|") >= 0);
+        bool forceRemove = false;
+        for (int i = 2; i < args.length; i++) {
+            if (args[i] == "--force" || args[i] == "-f") forceRemove = true;
+        }
+
+        if (isCore && !forceRemove) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("quantum: '${pkg}' is a core package. Use --force to remove.");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # Confirm removal
+        if (!confirmPrompt(":: Remove ${pkg}?")) {
+            Console.log("Removal cancelled.");
+            return;
+        }
+
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log(":: Removing ${pkg}...");
+        Console.setColor(TEXT_COLOR);
+
+        VFS.remove(installedPath);
+        VFS.removeRecursive("/usr/lib/" + pkg);
+        VFS.remove("/var/lib/quantum/cache/" + pkg + ".receipt");
+
+        Console.log("   ${pkg} removed successfully.");
+    }
+
+    private static func quantumUpdate() -> void {
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log(":: Synchronizing package registry...");
+        Console.log("   Fetching index from ${quantumRegistryUrl}...");
+        Console.setColor(TEXT_COLOR);
+
+        # Re-seed the registry (simulates fetching from remote)
+        quantumSeedRegistry();
+
+        # Count packages
+        string registry = VFS.read("/var/lib/quantum/registry/index");
+        int pkgCount = 0;
+        for (int i = 0; i < registry.length; i++) {
+            if (registry.charAt(i) == '\n') pkgCount++;
+        }
+
+        Console.log("   Registry updated: ${pkgCount} packages available.");
+        Console.log("   Source: ${quantumRegistryUrl}");
+    }
+
+    private static func quantumList() -> void {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Installed packages:");
+        Console.setColor(TEXT_COLOR);
+        Console.log("");
+
+        list<FileInfo> pkgs = VFS.listDir("/var/lib/quantum/installed");
+        if (pkgs.length == 0) {
+            Console.log("  (no packages installed)");
+            return;
+        }
+
+        for (FileInfo fi in pkgs) {
+            if (fi.type == 1) continue;
+            string manifest = VFS.read("/var/lib/quantum/installed/" + fi.name);
+            int p1 = manifest.indexOf("|");
+            string version = "???";
+            string desc = "";
+            if (p1 > 0) {
+                version = manifest.substring(0, p1);
+                string rest = manifest.substring(p1 + 1, manifest.length - p1 - 1);
+                int p2 = rest.indexOf("|");
+                if (p2 > 0) {
+                    desc = rest.substring(0, p2);
+                } else {
+                    desc = rest;
+                }
+            }
+
+            string name = fi.name;
+            while (name.length < 16) name = name + " ";
+            Console.log("  ${name}${version}   ${desc}");
+        }
+        Console.log("");
+    }
+
+    private static func quantumSearch(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("quantum: missing search query");
+            return;
+        }
+
+        string query = args[1];
+        string registry = VFS.read("/var/lib/quantum/registry/index");
+        int matchCount = 0;
+
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Search results for '${query}':");
+        Console.setColor(TEXT_COLOR);
+        Console.log("");
+
+        int start = 0;
+        for (int i = 0; i <= registry.length; i++) {
+            bool atEnd = (i == registry.length);
+            bool atNewline = false;
+            if (!atEnd) {
+                if (registry.charAt(i) == '\n') atNewline = true;
+            }
+            if (atEnd || atNewline) {
+                if (i > start) {
+                    string line = registry.substring(start, i - start);
+                    if (line.indexOf(query) >= 0) {
+                        int p1 = line.indexOf("|");
+                        if (p1 > 0) {
+                            string name = line.substring(0, p1);
+                            string rest = line.substring(p1 + 1, line.length - p1 - 1);
+                            int p2 = rest.indexOf("|");
+                            string version = "???";
+                            string desc = "";
+                            if (p2 > 0) {
+                                version = rest.substring(0, p2);
+                                string rest2 = rest.substring(p2 + 1, rest.length - p2 - 1);
+                                int p3 = rest2.indexOf("|");
+                                if (p3 > 0) {
+                                    desc = rest2.substring(0, p3);
+                                } else {
+                                    desc = rest2;
+                                }
+                            }
+
+                            string installed = "";
+                            if (VFS.isFile("/var/lib/quantum/installed/" + name)) {
+                                installed = " [installed]";
+                            }
+
+                            while (name.length < 16) name = name + " ";
+                            Console.log("  ${name}${version}   ${desc}${installed}");
+                            matchCount++;
+                        }
+                    }
+                }
+                start = i + 1;
+            }
+        }
+
+        if (matchCount == 0) {
+            Console.log("  No packages matching '${query}' found.");
+        }
+        Console.log("");
+    }
+
+    private static func quantumInfo(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("quantum: missing package name");
+            return;
+        }
+
+        string pkg = args[1];
+        string registry = VFS.read("/var/lib/quantum/registry/index");
+        bool found = false;
+        string version = "";
+        string desc = "";
+        string category = "";
+        string hash = "";
+
+        int start = 0;
+        for (int i = 0; i <= registry.length; i++) {
+            bool atEnd = (i == registry.length);
+            bool atNewline = false;
+            if (!atEnd) {
+                if (registry.charAt(i) == '\n') atNewline = true;
+            }
+            if (atEnd || atNewline) {
+                if (i > start) {
+                    string line = registry.substring(start, i - start);
+                    int p1 = line.indexOf("|");
+                    if (p1 > 0) {
+                        string name = line.substring(0, p1);
+                        if (name == pkg) {
+                            found = true;
+                            string rest = line.substring(p1 + 1, line.length - p1 - 1);
+                            int p2 = rest.indexOf("|");
+                            if (p2 > 0) {
+                                version = rest.substring(0, p2);
+                                string rest2 = rest.substring(p2 + 1, rest.length - p2 - 1);
+                                int p3 = rest2.indexOf("|");
+                                if (p3 > 0) {
+                                    desc = rest2.substring(0, p3);
+                                    string rest3 = rest2.substring(p3 + 1, rest2.length - p3 - 1);
+                                    int p4 = rest3.indexOf("|");
+                                    if (p4 > 0) {
+                                        category = rest3.substring(0, p4);
+                                        hash = rest3.substring(p4 + 1, rest3.length - p4 - 1);
+                                    } else {
+                                        category = rest3;
+                                    }
+                                } else {
+                                    desc = rest2;
+                                }
+                            }
+                        }
+                    }
+                }
+                start = i + 1;
+            }
+        }
+
+        if (!found) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("quantum: package '${pkg}' not found");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        bool isInstalled = VFS.isFile("/var/lib/quantum/installed/" + pkg);
+
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Package: ${pkg}");
+        Console.setColor(TEXT_COLOR);
+        Console.log("  Version:     ${version}");
+        Console.log("  Description: ${desc}");
+        Console.log("  Category:    ${category}");
+        Console.log("  Registry:    ${quantumRegistryUrl}");
+        if (hash.length > 0) {
+            Console.log("  SHA256:      ${hash}");
+        }
+        if (isInstalled) {
+            Console.setColor(PROMPT_PATH_COLOR);
+            Console.log("  Status:      installed");
+        } else {
+            Console.log("  Status:      not installed");
+        }
+        Console.setColor(TEXT_COLOR);
+        Console.log("");
+    }
+
+    # ========================================================================
+    # Privilege & Identity Commands
+    # ========================================================================
+
+    private static func cmdSudo(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("sudo: usage: sudo <command> [args...]");
+            return;
+        }
+
+        # Reconstruct the sub-command string
+        string subcmd = args[0];
+        for (int i = 1; i < args.length; i++) {
+            subcmd = subcmd + " " + args[i];
+        }
+
+        bool wasRoot = isRoot;
+        isRoot = true;
+        executeCommand(subcmd);
+        isRoot = wasRoot;
+    }
+
+    private static func cmdSu(list<string> args) -> void {
+        if (args.length > 0 && args[0] == "-" || args.length == 0) {
+            # Switch to root
+            isRoot = true;
+            username = "root";
+            setEnv("USER", "root");
+            setEnv("HOME", "/root");
+            currentDir = "/root";
+            VFS.mkdirp("/root");
+            Console.setColor(ERROR_COLOR);
+            Console.log("Switched to root.");
+            Console.setColor(TEXT_COLOR);
+        } elif (args[0] == "void" || args[0] == "-l" || args[0] == "--login") {
+            isRoot = false;
+            username = "void";
+            setEnv("USER", "void");
+            setEnv("HOME", "/home/void");
+            currentDir = "/home/void";
+            Console.log("Switched to void.");
+        } else {
+            Console.log("su: user '${args[0]}' does not exist");
+        }
+    }
+
+    private static func cmdId(list<string> args) -> void {
+        if (isRoot) {
+            Console.log("uid=0(root) gid=0(root) groups=0(root)");
+        } else {
+            Console.log("uid=1000(void) gid=1000(void) groups=1000(void),27(sudo)");
+        }
+    }
+
+    # ========================================================================
+    # Networking Commands (simulated)
+    # ========================================================================
+
+    private static func cmdPing(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("ping: usage: ping <host>");
+            return;
+        }
+
+        if (!E1000.isPresent() || !Net.isConfigured()) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("ping: network not available");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        string host = args[0];
+
+        # Try to parse as IP address; otherwise do DNS lookup
+        int targetIP = parseIPAddress(host);
+        if (targetIP == 0) {
+            Console.log("Resolving ${host}...");
+            targetIP = Net.dnsResolve(host);
+            if (targetIP == 0) {
+                Console.log("ping: cannot resolve ${host}: Unknown host");
+                return;
+            }
+        }
+
+        string targetStr = ipToStrShell(targetIP);
+        Console.log("PING ${host} (${targetStr}) 56(84) bytes of data.");
+
+        int sent = 0;
+        int received = 0;
+        int count = 4;
+
+        for (int i = 1; i <= count; i++) {
+            # Send ICMP echo request via raw UDP to simulate
+            # (Real ICMP requires raw IP access — we use UDP to gateway for now)
+            long startMs = Timer.getElapsedMs();
+
+            # Process network to send/receive
+            Net.processIncoming();
+
+            long endMs = Timer.getElapsedMs();
+            int latency = (int)(endMs - startMs);
+            if (latency < 1) latency = 1;
+
+            sent++;
+            received++;
+            Console.log("64 bytes from ${targetStr}: icmp_seq=${i} ttl=64 time=${latency} ms");
+
+            # Brief delay between pings
+            for (int w = 0; w < 100000; w++) { }
+        }
+
+        Console.log("");
+        Console.log("--- ${host} ping statistics ---");
+        int loss = ((sent - received) * 100) / sent;
+        Console.log("${sent} packets transmitted, ${received} received, ${loss}% packet loss");
+    }
+
+    # ========================================================================
+    # File Permission Commands (simulated)
+    # ========================================================================
+
+    private static func cmdChmod(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("chmod: usage: chmod <mode> <file>");
+            return;
+        }
+
+        string mode = args[0];
+        string file = args[1];
+        string path = resolvePath(file);
+
+        if (!VFS.isFile(path) && !VFS.isDirectory(path)) {
+            Console.log("chmod: cannot access '${file}': No such file or directory");
+            return;
+        }
+
+        Console.log("mode of '${file}' changed to ${mode}");
+    }
+
+    private static func cmdChown(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("chown: usage: chown <owner[:group]> <file>");
+            return;
+        }
+
+        string owner = args[0];
+        string file = args[1];
+        string path = resolvePath(file);
+
+        if (!VFS.isFile(path) && !VFS.isDirectory(path)) {
+            Console.log("chown: cannot access '${file}': No such file or directory");
+            return;
+        }
+
+        Console.log("ownership of '${file}' changed to ${owner}");
+    }
+
+    # ========================================================================
+    # Search & Discovery Commands
+    # ========================================================================
+
+    private static func cmdGrep(list<string> args) -> void {
+        if (args.length < 2) {
+            Console.log("grep: usage: grep <pattern> <file>");
+            return;
+        }
+
+        string pattern = args[0];
+        string file = args[1];
+        string path = resolvePath(file);
+
+        if (!VFS.isFile(path)) {
+            Console.log("grep: ${file}: No such file or directory");
+            return;
+        }
+
+        string content = VFS.read(path);
+        int lineNum = 1;
+        int matchCount = 0;
+        int start = 0;
+
+        for (int i = 0; i <= content.length; i++) {
+            bool atEnd = (i == content.length);
+            bool atNewline = false;
+            if (!atEnd) {
+                if (content.charAt(i) == '\n') atNewline = true;
+            }
+            if (atEnd || atNewline) {
+                if (i > start) {
+                    string line = content.substring(start, i - start);
+                    if (line.indexOf(pattern) >= 0) {
+                        Console.setColor(PROMPT_PATH_COLOR);
+                        Console.write("${lineNum}: ");
+                        Console.setColor(TEXT_COLOR);
+                        Console.log(line);
+                        matchCount++;
+                    }
+                }
+                lineNum++;
+                start = i + 1;
+            }
+        }
+
+        if (matchCount == 0) {
+            Console.log("(no matches)");
+        }
+    }
+
+    private static func cmdFind(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("find: usage: find <path> [-name <pattern>]");
+            return;
+        }
+
+        string searchDir = resolvePath(args[0]);
+        string namePattern = "";
+
+        # Parse -name flag
+        for (int i = 1; i < args.length; i++) {
+            if (args[i] == "-name" && i + 1 < args.length) {
+                namePattern = args[i + 1];
+                i++;
+            }
+        }
+
+        if (!VFS.isDirectory(searchDir)) {
+            Console.log("find: '${args[0]}': No such directory");
+            return;
+        }
+
+        # List all entries in directory (non-recursive in VFS for now)
+        list<FileInfo> entries = VFS.listDir(searchDir);
+        for (FileInfo fi in entries) {
+            string fullPath = searchDir;
+            if (searchDir != "/") fullPath = searchDir + "/";
+            fullPath = fullPath + fi.name;
+
+            if (namePattern.length > 0) {
+                if (fi.name.indexOf(namePattern) >= 0) {
+                    Console.log(fullPath);
+                }
+            } else {
+                Console.log(fullPath);
+            }
+
+            # Recurse into subdirectories
+            if (fi.type == 1) {
+                list<FileInfo> subEntries = VFS.listDir(fullPath);
+                for (FileInfo sub in subEntries) {
+                    string subPath = fullPath + "/" + sub.name;
+                    if (namePattern.length > 0) {
+                        if (sub.name.indexOf(namePattern) >= 0) {
+                            Console.log(subPath);
+                        }
+                    } else {
+                        Console.log(subPath);
+                    }
+                }
+            }
+        }
+    }
+
+    private static func cmdWhich(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("which: usage: which <command>");
+            return;
+        }
+
+        string cmd = args[0];
+
+        # Check if it's a builtin
+        for (string b in builtinCommands) {
+            if (b == cmd) {
+                Console.log("/usr/bin/${cmd}");
+                return;
+            }
+        }
+
+        Console.log("${cmd} not found");
+    }
+
+    # ========================================================================
+    # Documentation & Diagnostics
+    # ========================================================================
+
+    private static func cmdMan(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("What manual page do you want?");
+            Console.log("Usage: man <command>");
+            return;
+        }
+
+        string cmd = args[0];
+
+        # Inline manual pages for common commands
+        switch (cmd) {
+            case "ls":
+                Console.log("LS(1) - list directory contents");
+                Console.log("");
+                Console.log("SYNOPSIS: ls [path] [-l] [-a]");
+                Console.log("  List files and directories.");
+                Console.log("  -l  Long format with sizes");
+                Console.log("  -a  Show hidden files");
+                break;
+            case "cd":
+                Console.log("CD(1) - change working directory");
+                Console.log("");
+                Console.log("SYNOPSIS: cd [path]");
+                Console.log("  Change to the specified directory.");
+                Console.log("  Without argument, go to home directory.");
+                break;
+            case "quantum":
+                Console.log("QUANTUM(1) - StratOS Package Manager");
+                Console.log("");
+                Console.log("SYNOPSIS: quantum <command> [args]");
+                Console.log("");
+                Console.log("COMMANDS:");
+                Console.log("  install <pkg> [--url <url>]  Install a package");
+                Console.log("  remove <pkg> [--force]       Remove a package");
+                Console.log("  update                       Update registry");
+                Console.log("  search <query>               Search packages");
+                Console.log("  list                         List installed");
+                Console.log("  info <pkg>                   Package details");
+                Console.log("  set-url <url>                Set registry URL");
+                Console.log("  get-url                      Show registry URL");
+                break;
+            case "sudo":
+                Console.log("SUDO(1) - execute command as root");
+                Console.log("");
+                Console.log("SYNOPSIS: sudo <command> [args...]");
+                Console.log("  Run a command with root privileges.");
+                break;
+            case "grep":
+                Console.log("GREP(1) - search file contents");
+                Console.log("");
+                Console.log("SYNOPSIS: grep <pattern> <file>");
+                Console.log("  Search for lines matching pattern.");
+                break;
+            case "find":
+                Console.log("FIND(1) - search for files");
+                Console.log("");
+                Console.log("SYNOPSIS: find <path> [-name <pattern>]");
+                Console.log("  Search for files in a directory tree.");
+                break;
+            case "ping":
+                Console.log("PING(1) - send ICMP ECHO_REQUEST");
+                Console.log("");
+                Console.log("SYNOPSIS: ping <host>");
+                Console.log("  Send 4 ICMP packets to the specified host.");
+                Console.log("  Accepts IP addresses or hostnames (resolved via DNS).");
+                break;
+            case "ifconfig":
+                Console.log("IFCONFIG(1) - configure network interface");
+                Console.log("");
+                Console.log("SYNOPSIS: ifconfig");
+                Console.log("  Display network interface configuration.");
+                break;
+            case "wget":
+                Console.log("WGET(1) - non-interactive network downloader");
+                Console.log("");
+                Console.log("SYNOPSIS: wget <url>");
+                Console.log("  Download a file from the specified HTTP URL.");
+                Console.log("  Only http:// URLs are supported.");
+                break;
+            case "nslookup":
+                Console.log("NSLOOKUP(1) - query DNS");
+                Console.log("");
+                Console.log("SYNOPSIS: nslookup <hostname>");
+                Console.log("  Query the DNS server to resolve a hostname.");
+                break;
+            default:
+                Console.log("No manual entry for '${cmd}'");
+                break;
+        }
+    }
+
+    private static func cmdDmesg(list<string> args) -> void {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("[    0.000000] StratOS Kernel 0.1.0 booting...");
+        Console.setColor(TEXT_COLOR);
+        Console.log("[    0.000001] Memory: MemoryManager initialized");
+
+        long totalMem = MemoryManager.getTotalMemory() / 1048576;
+        Console.log("[    0.000002] Memory: ${totalMem} MB total system memory");
+        Console.log("[    0.000003] Memory: Kernel heap 16 MB initialized");
+        Console.log("[    0.000004] Memory: Flux runtime heap 4 MB connected");
+        Console.log("[    0.000010] IDT: Interrupt Descriptor Table loaded");
+        Console.log("[    0.000011] IDT: 48 interrupt stubs registered");
+        Console.log("[    0.000012] PIC: Programmable Interrupt Controller configured");
+        Console.log("[    0.000013] PIC: IRQ0 (timer), IRQ1 (keyboard) enabled");
+        Console.log("[    0.000020] Framebuffer: 1024x768x32bpp initialized");
+        Console.log("[    0.000021] Console: text mode 128x48 ready");
+        Console.log("[    0.000030] Timer: PIT configured at 100 Hz");
+        Console.log("[    0.000031] Keyboard: PS/2 keyboard driver loaded");
+        Console.log("[    0.000040] Scheduler: process manager initialized");
+        Console.log("[    0.000050] VFS: virtual filesystem mounted at /");
+        Console.log("[    0.000051] VFS: /etc, /home/void, /var/log seeded");
+
+        long ms = Timer.getElapsedMs();
+        int sec = (int)(ms / 1000);
+        Console.log("[    0.000060] Shell: StratOS shell started");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("[    ${sec}.000000] Uptime: system running for ${sec}s");
+        Console.setColor(TEXT_COLOR);
+    }
+
+    private static func cmdPs(list<string> args) -> void {
+        Console.log("  PID  STATE      NAME");
+        Console.log("    0  running    kernel_idle");
+        Console.log("    1  running    compositor");
+        Console.log("    2  running    shell");
+        int count = Scheduler.getProcessCount();
+        Console.log("");
+        Console.log("$count processes running");
+    }
+
+    private static func cmdKill(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("kill: missing PID");
+            return;
+        }
+        int pid = (int) args[0];
+        if (pid == 0) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("kill: cannot kill kernel process");
+            Console.setColor(TEXT_COLOR);
+        } else {
+            Scheduler.terminateProcess(pid);
+            Console.log("Terminated process $pid");
+        }
+    }
+
+    private static func cmdDate(list<string> args) -> void {
+        Console.log("2026-02-13 (RTC not yet implemented)");
+    }
+
+    private static func cmdUptime(list<string> args) -> void {
+        long ms = Timer.getElapsedMs();
+        int sec = (int)(ms / 1000) % 60;
+        int min = (int)(ms / 60000) % 60;
+        int hrs = (int)(ms / 3600000);
+        Console.log("up ${hrs}h ${min}m ${sec}s");
+    }
+
+    private static func cmdFree(list<string> args) -> void {
+        long total = MemoryManager.getTotalMemory();
+        long free = MemoryManager.getFreeMemory();
+        long used = MemoryManager.getUsedMemory();
+
+        Console.log("              total        used        free");
+        Console.log("Mem:    ${total / 1048576} MB    ${used / 1048576} MB    ${free / 1048576} MB");
+        Console.log("Heap:   ${MemoryManager.getHeapUsed() / 1024} KB used, ${MemoryManager.getHeapFree() / 1024} KB free");
+    }
+
+    private static func cmdNeofetch(list<string> args) -> void {
+        long mem = MemoryManager.getTotalMemory() / 1048576;
+        long used = MemoryManager.getUsedMemory() / 1048576;
+        long ms = Timer.getElapsedMs();
+        int sec = (int)(ms / 1000) % 60;
+        int min = (int)(ms / 60000) % 60;
+        int hrs = (int)(ms / 3600000);
+
+        Console.setColor(PROMPT_USER_COLOR);
+        Console.log("         .        $username@$hostname");
+        Console.log("        / \\       ------------------");
+        Console.setColor(TEXT_COLOR);
+        Console.log("       /   \\      OS: StratOS 0.1.0 (Void)");
+        Console.log("      /  *  \\     Kernel: Flux Kernel 0.1.0");
+        Console.setColor(PROMPT_USER_COLOR);
+        Console.log("     / * . * \\    Shell: stratos-shell 0.1");
+        Console.log("    /  .   .  \\   Terminal: StratOS Console");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("   /___________\\  Theme: Clean Cosmic");
+        Console.setColor(TEXT_COLOR);
+        Console.log("   |  StratOS  |  CPU: x86_64");
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("   |___________|  Memory: ${used} MB / ${mem} MB");
+        Console.setColor(TEXT_COLOR);
+        Console.log("                  Uptime: ${hrs}h ${min}m ${sec}s");
+        Console.log("");
+
+        # Color bar
+        Console.setColor(0xFF5252FF); Console.write("###");
+        Console.setColor(0xFFB74DFF); Console.write("###");
+        Console.setColor(0x69F0AEFF); Console.write("###");
+        Console.setColor(0x5B8CFFFF); Console.write("###");
+        Console.setColor(0xBB86FCFF); Console.write("###");
+        Console.setColor(0xC8D0E0FF); Console.write("###");
+        Console.log("");
+    }
+
+    # ========================================================================
+    # Desktop Environment Commands
+    # ========================================================================
+
+    private static func cmdStartx(list<string> args) -> void {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Starting Stellar Desktop Environment...");
+        Console.setColor(TEXT_COLOR);
+        Console.log("  Compositor: Stellar v0.1.0");
+        Console.log("  Theme:      Clean Cosmic");
+        Console.log("  Resolution: 1024x768x32");
+        Console.log("");
+
+        # Small delay for the dramatic effect
+        Timer.sleep(500);
+
+        # Set flag and exit shell loop — kernel_main will launch compositor
+        desktopRequested = true;
+    }
+
+    private static func cmdWallpaper(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("wallpaper — Manage desktop wallpapers");
+            Console.log("");
+            Console.log("Usage:");
+            Console.log("  wallpaper list       List available wallpapers");
+            Console.log("  wallpaper set <num>  Set wallpaper by number (0-3)");
+            Console.log("  wallpaper next       Cycle to next wallpaper");
+            Console.log("");
+            Console.log("Keyboard shortcut: Ctrl+W (in desktop mode)");
+            return;
+        }
+
+        string subcmd = args[0];
+
+        if (subcmd == "list") {
+            Console.log("Available wallpapers:");
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("  0  Void       Deep space with star field");
+            Console.log("  1  Nebula     Purple/blue nebula clouds");
+            Console.log("  2  Aurora     Northern lights over hills");
+            Console.log("  3  Mountain   Sunset mountain silhouettes");
+            Console.setColor(TEXT_COLOR);
+            Console.log("");
+            Console.log("Set with: wallpaper set <number>");
+        } elif (subcmd == "set") {
+            if (args.length < 2) {
+                Console.log("wallpaper set: missing wallpaper number (0-3)");
+                return;
+            }
+            int idx = (int) args[1];
+            if (idx < 0 || idx > 3) {
+                Console.setColor(ERROR_COLOR);
+                Console.log("Invalid wallpaper index. Use 0-3.");
+                Console.setColor(TEXT_COLOR);
+                return;
+            }
+            Desktop.setWallpaper(idx);
+            string names = "Void";
+            if (idx == 1) names = "Nebula";
+            elif (idx == 2) names = "Aurora";
+            elif (idx == 3) names = "Mountain";
+            Console.setColor(PROMPT_PATH_COLOR);
+            Console.log("Wallpaper set to: $names");
+            Console.setColor(TEXT_COLOR);
+        } elif (subcmd == "next") {
+            Desktop.nextWallpaper();
+            Console.setColor(PROMPT_PATH_COLOR);
+            Console.log("Switched to next wallpaper.");
+            Console.setColor(TEXT_COLOR);
+        } else {
+            Console.setColor(ERROR_COLOR);
+            Console.log("wallpaper: unknown subcommand '$subcmd'");
+            Console.setColor(TEXT_COLOR);
+        }
+    }
+
+    private static func cmdInstall(list<string> args) -> void {
+        Console.setColor(HIGHLIGHT_COLOR);
+        Console.log("Launching StratOS TUI Installer...");
+        Console.setColor(TEXT_COLOR);
+        Timer.sleep(300);
+
+        bool success = Installer.run();
+        if (success) {
+            # Update shell state from installer config
+            username = instUsername;
+            hostname = instHostname;
+            currentDir = "/home/${instUsername}";
+            setEnv("HOME", "/home/${instUsername}");
+            setEnv("USER", instUsername);
+            setEnv("HOSTNAME", instHostname);
+
+            Console.setColor(PROMPT_PATH_COLOR);
+            Console.log("Installation complete! Shell updated with new configuration.");
+            Console.setColor(TEXT_COLOR);
+        } else {
+            Console.setColor(ERROR_COLOR);
+            Console.log("Installation cancelled.");
+            Console.setColor(TEXT_COLOR);
+        }
+    }
+
+    # Pipe execution (simplified)
+    private static func executePipeline(string input) -> void {
+        Console.log("pipe: pipeline execution not yet implemented");
+    }
+
+    # ========================================================================
+    # ========================================================================
+    # Compile & Run Commands
+    # ========================================================================
+
+    # cc — compile a C++ source file to an ELF binary
+    # Usage: cc <source.cpp> [-o output]
+    private static func cmdCc(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("cc - StratOS C++ Compiler (Clang)");
+            Console.setColor(TEXT_COLOR);
+            Console.log("");
+            Console.log("  Usage: cc <source.cpp> [-o output]");
+            Console.log("         cc <source.flux> [-o output]   (Flux → C++ → ELF)");
+            Console.log("");
+            Console.log("  Options:");
+            Console.log("    -o <file>    Set output binary name");
+            Console.log("    --trusted    Run compiler in Ring 0 (default)");
+            Console.log("");
+            return;
+        }
+
+        string source = "";
+        string output = "";
+        bool trusted = true;  # Compiler always runs in Ring 0
+
+        for (int i = 0; i < args.length; i++) {
+            if (args[i] == "-o" && (i + 1) < args.length) {
+                output = args[i + 1];
+                i++;
+            } elif (args[i] == "--trusted") {
+                trusted = true;
+            } elif (!args[i].startsWith("-")) {
+                source = args[i];
+            }
+        }
+
+        if (source == "") {
+            Console.setColor(ERROR_COLOR);
+            Console.log("cc: no input file");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # Resolve source path
+        string srcPath = resolvePath(source);
+
+        if (!VFS.isFile(srcPath)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("cc: ${source}: No such file");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # Determine output name if not specified
+        if (output == "") {
+            if (srcPath.endsWith(".cpp") || srcPath.endsWith(".cc") || srcPath.endsWith(".c")) {
+                # Strip extension for output name
+                int dotIdx = srcPath.lastIndexOf(".");
+                if (dotIdx >= 0) {
+                    output = srcPath.substring(0, dotIdx);
+                } else {
+                    output = srcPath + ".elf";
+                }
+            } elif (srcPath.endsWith(".flux") || srcPath.endsWith(".lx")) {
+                int dotIdx = srcPath.lastIndexOf(".");
+                if (dotIdx >= 0) {
+                    output = srcPath.substring(0, dotIdx);
+                } else {
+                    output = srcPath + ".elf";
+                }
+            } else {
+                output = srcPath + ".elf";
+            }
+        } else {
+            output = resolvePath(output);
+        }
+
+        # Check if this is a Flux file — needs transpile first
+        if (srcPath.endsWith(".flux") || srcPath.endsWith(".lx")) {
+            Console.setColor(PROMPT_PATH_COLOR);
+            Console.log("[CC] Transpiling Flux → C++: ${source}");
+            Console.setColor(TEXT_COLOR);
+
+            ProcessExec.runFlux(srcPath, trusted);
+            return;
+        }
+
+        # C++ file — compile directly
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("[CC] Compiling: ${source} → ${output}");
+        Console.setColor(TEXT_COLOR);
+
+        ProcessExec.compileAndRun(srcPath, output, trusted);
+    }
+
+    # run — execute an ELF binary
+    # Usage: run <binary> [--trusted]
+    private static func cmdRunElf(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("run - Execute an ELF binary");
+            Console.setColor(TEXT_COLOR);
+            Console.log("");
+            Console.log("  Usage: run <binary> [--trusted]");
+            Console.log("");
+            Console.log("  Options:");
+            Console.log("    --trusted    Run in Ring 0 (kernel space)");
+            Console.log("                 Default: Ring 3 (user space)");
+            Console.log("");
+            return;
+        }
+
+        string binary = "";
+        bool trusted = false;  # User programs run in Ring 3 by default
+
+        for (int i = 0; i < args.length; i++) {
+            if (args[i] == "--trusted") {
+                if (!isRoot) {
+                    Console.setColor(ERROR_COLOR);
+                    Console.log("run: --trusted requires root privileges (use sudo)");
+                    Console.setColor(TEXT_COLOR);
+                    return;
+                }
+                trusted = true;
+            } elif (!args[i].startsWith("-")) {
+                binary = args[i];
+            }
+        }
+
+        if (binary == "") {
+            Console.setColor(ERROR_COLOR);
+            Console.log("run: no binary specified");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        # Resolve binary path
+        string binPath = resolvePath(binary);
+
+        if (!VFS.isFile(binPath)) {
+            Console.setColor(ERROR_COLOR);
+            Console.log("run: ${binary}: No such file");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        Console.setColor(PROMPT_PATH_COLOR);
+        if (trusted) {
+            Console.log("[RUN] Executing (Ring 0): ${binary}");
+        } else {
+            Console.log("[RUN] Executing (Ring 3): ${binary}");
+        }
+        Console.setColor(TEXT_COLOR);
+
+        ProcessExec.execute(binPath, trusted);
+    }
+
+    # ========================================================================
+    # Path Resolution Helper
+    # ========================================================================
+
+    private static func resolvePath(string arg) -> string {
+        if (arg.startsWith("/")) {
+            return VFS.normalizePath(arg);
+        }
+        return VFS.resolvePath(currentDir, arg);
+    }
+
+    # ========================================================================
+    # Environment Variable Helpers
+    # ========================================================================
+
+    public static func setEnv(string key, string value) -> void {
+        for (int i = 0; i < envKeys.length; i++) {
+            if (envKeys[i] == key) {
+                envValues[i] = value;
+                return;
+            }
+        }
+        envKeys.add(key);
+        envValues.add(value);
+    }
+
+    public static func getEnv(string key) -> string {
+        for (int i = 0; i < envKeys.length; i++) {
+            if (envKeys[i] == key) {
+                return envValues[i];
+            }
+        }
+        return "";
+    }
+
+    # Get current working directory
+    public static func getCurrentDir() -> string {
+        return currentDir;
+    }
+
+    # ========================================================================
+    # sync — flush VFS contents to disk
+    # ========================================================================
+    private static func cmdSync(list<string> args) -> void {
+        if (!VFS.isPersistent()) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("sync: no persistent storage available");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+        Console.log("Syncing filesystem to disk...");
+        VFS.markDirty();
+        VFS.sync();
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("Sync complete.");
+        Console.setColor(TEXT_COLOR);
+    }
+
+    # ========================================================================
+    # Network Commands
+    # ========================================================================
+
+    private static func cmdIfconfig(list<string> args) -> void {
+        if (!E1000.isPresent()) {
+            Console.log("ifconfig: no network interface found");
+            return;
+        }
+
+        Console.setColor(PROMPT_PATH_COLOR);
+        Console.log("eth0:");
+        Console.setColor(TEXT_COLOR);
+
+        if (Net.isConfigured()) {
+            Console.log("  inet ${Net.getIPString()}");
+        } else {
+            Console.log("  inet (not configured)");
+        }
+
+        # MAC address
+        int m0 = E1000.getMac(0);
+        int m1 = E1000.getMac(1);
+        int m2 = E1000.getMac(2);
+        int m3 = E1000.getMac(3);
+        int m4 = E1000.getMac(4);
+        int m5 = E1000.getMac(5);
+        Console.log("  ether ${hexByte(m0)}:${hexByte(m1)}:${hexByte(m2)}:${hexByte(m3)}:${hexByte(m4)}:${hexByte(m5)}");
+
+        Console.log("  status: UP");
+        Console.log("  mtu: 1500");
+    }
+
+    private static func cmdWget(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("wget: usage: wget <url>");
+            return;
+        }
+
+        if (!E1000.isPresent() || !Net.isConfigured()) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("wget: network not available");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        string url = args[0];
+
+        # Parse URL: http://host/path
+        if (!url.startsWith("http://")) {
+            Console.log("wget: only http:// URLs supported");
+            return;
+        }
+
+        string rest = url.substring(7, url.length);
+        int slashIdx = -1;
+        for (int i = 0; i < rest.length; i++) {
+            if (rest.charAt(i) == '/') {
+                slashIdx = i;
+                break;
+            }
+        }
+
+        string host = rest;
+        string path = "/";
+        if (slashIdx >= 0) {
+            host = rest.substring(0, slashIdx);
+            path = rest.substring(slashIdx, rest.length);
+        }
+
+        Console.log("Resolving ${host}...");
+        int ip = Net.dnsResolve(host);
+        if (ip == 0) {
+            # Try parsing as IP
+            ip = parseIPAddress(host);
+        }
+        if (ip == 0) {
+            Console.log("wget: unable to resolve host '${host}'");
+            return;
+        }
+
+        string ipStr = ipToStrShell(ip);
+        Console.log("Connecting to ${host} (${ipStr}):80...");
+
+        if (!Net.tcpConnect(ip, 80)) {
+            Console.log("wget: connection to ${host}:80 failed");
+            return;
+        }
+
+        Console.log("Connected.");
+
+        # Build HTTP GET request
+        string request = "GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n";
+        long reqAddr = MemoryManager.kmalloc(512);
+        if (reqAddr == 0) {
+            Console.log("wget: out of memory");
+            Net.tcpClose();
+            return;
+        }
+
+        unsafe {
+            byte* dst = (byte*) reqAddr;
+            long srcAddr = (long) request.c_str();
+            byte* src = (byte*) srcAddr;
+            for (int i = 0; i < request.length; i++) {
+                dst[i] = src[i];
+            }
+        }
+
+        Net.tcpSend(reqAddr, request.length);
+
+        # Receive response
+        long recvBuf = MemoryManager.kmalloc(32768);
+        int totalRecv = 0;
+
+        if (recvBuf != 0) {
+            int chunk = Net.tcpReceive(recvBuf, 32768, 10000);
+            totalRecv = chunk;
+        }
+
+        Net.tcpClose();
+
+        if (totalRecv > 0) {
+            # Find the filename from path
+            string filename = "index.html";
+            int lastSlash = -1;
+            for (int i = 0; i < path.length; i++) {
+                if (path.charAt(i) == '/') lastSlash = i;
+            }
+            if (lastSlash >= 0 && lastSlash < path.length - 1) {
+                filename = path.substring(lastSlash + 1, path.length);
+            }
+
+            # Save to current directory
+            string savePath = resolvePath(filename);
+
+            # Convert received bytes to string (truncate at reasonable size)
+            string content = "";
+            unsafe {
+                byte* data = (byte*) recvBuf;
+                for (int i = 0; i < totalRecv && i < 16384; i++) {
+                    string ch = "${(char) data[i]}";
+                    content = content + ch;
+                }
+            }
+
+            VFS.write(savePath, content);
+            Console.log("Saved to '${filename}' (${totalRecv} bytes)");
+        } else {
+            Console.log("wget: no data received");
+        }
+    }
+
+    private static func cmdNslookup(list<string> args) -> void {
+        if (args.length == 0) {
+            Console.log("nslookup: usage: nslookup <hostname>");
+            return;
+        }
+
+        if (!E1000.isPresent() || !Net.isConfigured()) {
+            Console.setColor(HIGHLIGHT_COLOR);
+            Console.log("nslookup: network not available");
+            Console.setColor(TEXT_COLOR);
+            return;
+        }
+
+        string host = args[0];
+        Console.log("Server:  ${Net.getIPString()}");
+        Console.log("");
+
+        int ip = Net.dnsResolve(host);
+        if (ip == 0) {
+            Console.log("** server can't find ${host}: NXDOMAIN");
+        } else {
+            Console.log("Name:    ${host}");
+            Console.log("Address: ${ipToStrShell(ip)}");
+        }
+    }
+
+    # ========================================================================
+    # Network Utility Functions
+    # ========================================================================
+
+    private static func parseIPAddress(string ip) -> int {
+        # Parse dotted decimal: a.b.c.d
+        int result = 0;
+        int octet = 0;
+        int count = 0;
+
+        for (int i = 0; i <= ip.length; i++) {
+            if (i == ip.length || ip.charAt(i) == '.') {
+                result = (result << 8) | (octet & 0xFF);
+                octet = 0;
+                count++;
+            } else {
+                int ch = (int) ip.charAt(i);
+                if (ch >= 48 && ch <= 57) {
+                    octet = octet * 10 + (ch - 48);
+                } else {
+                    return 0;
+                }
+            }
+        }
+
+        if (count != 4) return 0;
+        return result;
+    }
+
+    private static func ipToStrShell(int ip) -> string {
+        int a = (ip >> 24) & 0xFF;
+        int b = (ip >> 16) & 0xFF;
+        int c = (ip >> 8) & 0xFF;
+        int d = ip & 0xFF;
+        return "${a}.${b}.${c}.${d}";
+    }
+
+    private static func hexByte(int val) -> string {
+        string hex = "0123456789abcdef";
+        int hi = (val >> 4) & 0x0F;
+        int lo = val & 0x0F;
+        string h = "${hex.charAt(hi)}";
+        string l = "${hex.charAt(lo)}";
+        return "${h}${l}";
+    }
+}

@@ -1,0 +1,1239 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Void Browser — Internal page browser for StratOS
+// apps/browser/browser.lx
+//
+// Features:
+//   - Tab bar with multiple tabs
+//   - URL/address bar with navigation buttons
+//   - Internal stratos:// pages (home, about, help)
+//   - Scroll support
+//   - Mouse click on tabs, nav buttons, links
+//   - Keyboard nav (arrows to scroll, Ctrl+T new tab, Ctrl+W close tab)
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/e1000.lx";
+import "kernel/drivers/net.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "apps/browser/wiki.lx";
+
+# Browser state
+string browserUrl = "stratos://home";
+string browserTitle = "Home";
+int browserScrollY = 0;
+
+# Tab storage (parallel arrays, max 6 tabs)
+int browserTabCount = 1;
+int browserActiveTab = 0;
+string tabUrl0  = "stratos://home"; string tabTitle0  = "Home"; int tabScrollY0  = 0;
+string tabUrl1  = ""; string tabTitle1  = ""; int tabScrollY1  = 0;
+string tabUrl2  = ""; string tabTitle2  = ""; int tabScrollY2  = 0;
+string tabUrl3  = ""; string tabTitle3  = ""; int tabScrollY3  = 0;
+string tabUrl4  = ""; string tabTitle4  = ""; int tabScrollY4  = 0;
+string tabUrl5  = ""; string tabTitle5  = ""; int tabScrollY5  = 0;
+
+# URL input mode
+bool browserUrlEditing = false;
+string browserUrlInput = "";
+
+# Bookmarks (parallel arrays, max 8)
+int bookmarkCount = 3;
+string bmkUrl0  = "stratos://home";    string bmkLabel0 = "Home";
+string bmkUrl1  = "stratos://help";    string bmkLabel1 = "Help";
+string bmkUrl2  = "stratos://about";   string bmkLabel2 = "About";
+string bmkUrl3  = ""; string bmkLabel3 = "";
+string bmkUrl4  = ""; string bmkLabel4 = "";
+string bmkUrl5  = ""; string bmkLabel5 = "";
+string bmkUrl6  = ""; string bmkLabel6 = "";
+string bmkUrl7  = ""; string bmkLabel7 = "";
+bool browserShowBookmarks = true;
+
+# Layout
+int BR_TAB_H     = 28;
+int BR_TOOLBAR_H = 36;
+int BR_TAB_W     = 140;
+int BR_BOOKMARK_H = 22;
+
+# Search engine state
+bool homeSearchEditing = false;
+string homeSearchInput = "";
+string searchQuery = "";
+int currentWikiId = -1;
+
+# ── HTTP page state ──────────────────────────────────────────────────────────
+# When we fetch an http:// URL, we store up to 128 lines of plain text here.
+# The browser renders these lines with drawText; it is NOT an HTML engine.
+int HTTP_MAX_LINES   = 128;
+int httpLineCount    = 0;
+bool httpLoading     = false;
+bool httpError       = false;
+string httpErrorMsg  = "";
+string httpHost      = "";
+int httpStatusCode   = 0;
+
+# Parallel string arrays for fetched content lines (max 128)
+string hl0   = ""; string hl1   = ""; string hl2   = ""; string hl3   = "";
+string hl4   = ""; string hl5   = ""; string hl6   = ""; string hl7   = "";
+string hl8   = ""; string hl9   = ""; string hl10  = ""; string hl11  = "";
+string hl12  = ""; string hl13  = ""; string hl14  = ""; string hl15  = "";
+string hl16  = ""; string hl17  = ""; string hl18  = ""; string hl19  = "";
+string hl20  = ""; string hl21  = ""; string hl22  = ""; string hl23  = "";
+string hl24  = ""; string hl25  = ""; string hl26  = ""; string hl27  = "";
+string hl28  = ""; string hl29  = ""; string hl30  = ""; string hl31  = "";
+string hl32  = ""; string hl33  = ""; string hl34  = ""; string hl35  = "";
+string hl36  = ""; string hl37  = ""; string hl38  = ""; string hl39  = "";
+string hl40  = ""; string hl41  = ""; string hl42  = ""; string hl43  = "";
+string hl44  = ""; string hl45  = ""; string hl46  = ""; string hl47  = "";
+string hl48  = ""; string hl49  = ""; string hl50  = ""; string hl51  = "";
+string hl52  = ""; string hl53  = ""; string hl54  = ""; string hl55  = "";
+string hl56  = ""; string hl57  = ""; string hl58  = ""; string hl59  = "";
+string hl60  = ""; string hl61  = ""; string hl62  = ""; string hl63  = "";
+string hl64  = ""; string hl65  = ""; string hl66  = ""; string hl67  = "";
+string hl68  = ""; string hl69  = ""; string hl70  = ""; string hl71  = "";
+string hl72  = ""; string hl73  = ""; string hl74  = ""; string hl75  = "";
+string hl76  = ""; string hl77  = ""; string hl78  = ""; string hl79  = "";
+string hl80  = ""; string hl81  = ""; string hl82  = ""; string hl83  = "";
+string hl84  = ""; string hl85  = ""; string hl86  = ""; string hl87  = "";
+string hl88  = ""; string hl89  = ""; string hl90  = ""; string hl91  = "";
+string hl92  = ""; string hl93  = ""; string hl94  = ""; string hl95  = "";
+string hl96  = ""; string hl97  = ""; string hl98  = ""; string hl99  = "";
+string hl100 = ""; string hl101 = ""; string hl102 = ""; string hl103 = "";
+string hl104 = ""; string hl105 = ""; string hl106 = ""; string hl107 = "";
+string hl108 = ""; string hl109 = ""; string hl110 = ""; string hl111 = "";
+string hl112 = ""; string hl113 = ""; string hl114 = ""; string hl115 = "";
+string hl116 = ""; string hl117 = ""; string hl118 = ""; string hl119 = "";
+string hl120 = ""; string hl121 = ""; string hl122 = ""; string hl123 = "";
+string hl124 = ""; string hl125 = ""; string hl126 = ""; string hl127 = "";
+
+export class BrowserApp {
+    # Initialize the browser
+    public static func init() -> void {
+        browserUrl = "stratos://home";
+        browserTitle = "Home";
+        browserScrollY = 0;
+        browserTabCount = 1;
+        browserActiveTab = 0;
+        tabUrl0 = "stratos://home";
+        tabTitle0 = "Home";
+        tabScrollY0 = 0;
+        browserUrlEditing = false;
+        browserUrlInput = "";
+        homeSearchEditing = false;
+        homeSearchInput = "";
+        searchQuery = "";
+        currentWikiId = -1;
+    }
+
+    # Process a keyboard event from the compositor
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Home page search bar mode
+        if (homeSearchEditing) {
+            handleHomeSearch(event);
+            return;
+        }
+
+        # URL editing mode
+        if (browserUrlEditing) {
+            handleUrlInput(event);
+            return;
+        }
+
+        # Ctrl shortcuts
+        if (event.ctrl) {
+            if (event.ascii == 't') {
+                newTab();
+                return;
+            }
+            if (event.ascii == 'w') {
+                closeTab(browserActiveTab);
+                return;
+            }
+            if (event.ascii == 'l') {
+                # Focus URL bar (clear for fresh input)
+                browserUrlEditing = true;
+                browserUrlInput = "";
+                return;
+            }
+            if (event.ascii == 'r') {
+                navigate(browserUrl);
+                return;
+            }
+            if (event.ascii == 'd') {
+                # Add current page to bookmarks
+                addBookmark(browserUrl, browserTitle);
+                return;
+            }
+            if (event.ascii == 'b') {
+                # Toggle bookmark bar
+                browserShowBookmarks = !browserShowBookmarks;
+                return;
+            }
+            return;
+        }
+
+        # Navigation  
+        if (event.scancode == KEY_UP) {
+            browserScrollY = browserScrollY - 40;
+            if (browserScrollY < 0) browserScrollY = 0;
+            return;
+        }
+        if (event.scancode == KEY_DOWN) {
+            browserScrollY = browserScrollY + 40;
+            return;
+        }
+        if (event.scancode == 73) {
+            # Page Up
+            browserScrollY = browserScrollY - 300;
+            if (browserScrollY < 0) browserScrollY = 0;
+            return;
+        }
+        if (event.scancode == 81) {
+            # Page Down
+            browserScrollY = browserScrollY + 300;
+            return;
+        }
+    }
+
+    # Process a mouse click in the content area
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        # Tab bar region
+        if (relY < BR_TAB_H) {
+            int clickedTab = relX / BR_TAB_W;
+            if (clickedTab >= 0 && clickedTab < browserTabCount) {
+                switchTab(clickedTab);
+            } elif (relX >= browserTabCount * BR_TAB_W && relX < browserTabCount * BR_TAB_W + 30) {
+                # New tab button (+)
+                newTab();
+            }
+            return;
+        }
+
+        # Toolbar region
+        if (relY < BR_TAB_H + BR_TOOLBAR_H) {
+            int toolRelX = relX;
+            int toolRelY = relY - BR_TAB_H;
+            # Back button (x: 8..36)
+            if (toolRelX >= 8 && toolRelX < 36) {
+                # Go back (no history stack in simplified version)
+                return;
+            }
+            # Forward button (x: 40..68)
+            if (toolRelX >= 40 && toolRelX < 68) {
+                return;
+            }
+            # Reload button (x: 72..100)
+            if (toolRelX >= 72 && toolRelX < 100) {
+                navigate(browserUrl);
+                return;
+            }
+            # URL bar (x: 110+)
+            if (toolRelX >= 110) {
+                browserUrlEditing = true;
+                browserUrlInput = "";
+                return;
+            }
+            return;
+        }
+
+        # Page content area — handle link clicks
+        # Account for bookmark bar height
+        int charW = TextRender.getCharWidth();
+        int bmkH = 0;
+        if (browserShowBookmarks && bookmarkCount > 0) bmkH = BR_BOOKMARK_H;
+
+        # Bookmark bar click
+        if (browserShowBookmarks && bookmarkCount > 0 && relY >= BR_TAB_H + BR_TOOLBAR_H && relY < BR_TAB_H + BR_TOOLBAR_H + BR_BOOKMARK_H) {
+            int bx = 8;
+            for (int i = 0; i < bookmarkCount; i++) {
+                string label = getBmkLabel(i);
+                if (label.length > 12) label = label.substring(0, 12);
+                int labelW = label.length * charW + 16;
+                if (relX >= bx && relX < bx + labelW) {
+                    navigate(getBmkUrl(i));
+                    return;
+                }
+                bx = bx + labelW + 4;
+            }
+            return;
+        }
+
+        int pageRelY = relY - BR_TAB_H - BR_TOOLBAR_H - bmkH + browserScrollY;
+        if (browserUrl == "stratos://home") {
+            # Home page search bar (at ~204px page absolute)
+            if (pageRelY >= 204 && pageRelY < 240) {
+                int searchW = 400;
+                if (searchW > contentW - 40) searchW = contentW - 40;
+                int searchBarX = contentW / 2 - searchW / 2;
+                if (relX >= searchBarX && relX < searchBarX + searchW) {
+                    homeSearchEditing = true;
+                    homeSearchInput = "";
+                    return;
+                }
+            }
+            # Quick links at a known Y position (~260px from page top)
+            if (pageRelY >= 260 && pageRelY < 340) {
+                int linkIdx = (relX - contentW / 2 + 240) / 120;
+                if (linkIdx == 0) navigate("stratos://about");
+                elif (linkIdx == 1) navigate("stratos://help");
+                elif (linkIdx == 2) navigate("stratos://settings");
+                elif (linkIdx == 3) navigate("stratos://changelog");
+            }
+        } elif (browserUrl.indexOf("stratos://search") == 0) {
+            # Search results — click to navigate to wiki article
+            string clickUrl = Wiki.handleSearchClick(searchQuery, pageRelY);
+            if (clickUrl.length > 0) {
+                navigate(clickUrl);
+            }
+        }
+    }
+
+    # Draw the browser UI
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        # ---- Tab bar ----
+        int tabY = y;
+        Framebuffer.fillRect(x, tabY, w, BR_TAB_H, 0x080C14FF);
+
+        for (int i = 0; i < browserTabCount; i++) {
+            int tx = x + i * BR_TAB_W;
+            bool isActive = (i == browserActiveTab);
+            color32 tabBg = isActive ? 0x0D1117FF : 0x080C14FF;
+
+            Framebuffer.fillRect(tx, tabY + 4, BR_TAB_W - 2, BR_TAB_H - 4, tabBg);
+            if (isActive) {
+                Framebuffer.drawHLine(tx, tabY + 4, BR_TAB_W - 2, Theme.textAccent);
+            }
+
+            # Tab title
+            string tabTitleStr = getTabTitle(i);
+            if (tabTitleStr.length > 14) tabTitleStr = tabTitleStr.substring(0, 14);
+            color32 tabTextColor = isActive ? 0xE6EDF3FF : 0x6B7280FF;
+            TextRender.drawText(tabTitleStr, tx + 8, tabY + 8, tabTextColor);
+
+            # Close button on active tab
+            if (isActive && browserTabCount > 1) {
+                int closeX = tx + BR_TAB_W - 18;
+                int closeY = tabY + BR_TAB_H / 2;
+                Framebuffer.drawLine(closeX - 3, closeY - 3, closeX + 3, closeY + 3, 0x6B7280FF);
+                Framebuffer.drawLine(closeX + 3, closeY - 3, closeX - 3, closeY + 3, 0x6B7280FF);
+            }
+        }
+
+        # New tab button (+)
+        int plusX = x + browserTabCount * BR_TAB_W + 4;
+        Framebuffer.fillRoundedRect(plusX, tabY + 6, 22, 18, 3, 0x1A2332FF);
+        TextRender.drawText("+", plusX + 7, tabY + 8, 0x6B7280FF);
+
+        # ---- Toolbar ----
+        int toolY = y + BR_TAB_H;
+        Framebuffer.fillRect(x, toolY, w, BR_TOOLBAR_H, 0x101824FF);
+        Framebuffer.drawHLine(x, toolY + BR_TOOLBAR_H - 1, w, 0x1A2332FF);
+
+        int btnY = toolY + 6;
+        # Back button
+        Framebuffer.fillRoundedRect(x + 8, btnY, 28, 24, 4, 0x1A2332FF);
+        TextRender.drawText("<", x + 18, btnY + 4, 0x8B949EFF);
+
+        # Forward button
+        Framebuffer.fillRoundedRect(x + 40, btnY, 28, 24, 4, 0x1A2332FF);
+        TextRender.drawText(">", x + 50, btnY + 4, 0x8B949EFF);
+
+        # Reload button
+        Framebuffer.fillRoundedRect(x + 72, btnY, 28, 24, 4, 0x1A2332FF);
+        TextRender.drawText("R", x + 82, btnY + 4, 0x8B949EFF);
+
+        # URL bar
+        int urlX = x + 110;
+        int urlW = w - 130;
+        color32 urlBorder = browserUrlEditing ? Theme.textAccent : 0x1A2332FF;
+        Framebuffer.fillRoundedRect(urlX, btnY, urlW, 24, 12, 0x0A0E1AFF);
+        Framebuffer.drawRoundedRect(urlX, btnY, urlW, 24, 12, urlBorder);
+
+        # URL text
+        string displayUrl = browserUrlEditing ? browserUrlInput : browserUrl;
+        if (displayUrl.length * charW > urlW - 20) {
+            int maxChars = (urlW - 20) / charW;
+            displayUrl = displayUrl.substring(0, maxChars);
+        }
+        TextRender.drawText(displayUrl, urlX + 12, btnY + 4, 0xC9D1D9FF);
+
+        # URL editing cursor
+        if (browserUrlEditing) {
+            int cursorX = urlX + 12 + browserUrlInput.length * charW;
+            Framebuffer.fillRect(cursorX, btnY + 4, 2, charH, Theme.textAccent);
+        }
+
+        # ---- Bookmark bar ----
+        int bmkBarY = y + BR_TAB_H + BR_TOOLBAR_H;
+        int bmkBarH = 0;
+        if (browserShowBookmarks && bookmarkCount > 0) {
+            bmkBarH = BR_BOOKMARK_H;
+            Framebuffer.fillRect(x, bmkBarY, w, bmkBarH, 0x101824FF);
+            Framebuffer.drawHLine(x, bmkBarY + bmkBarH - 1, w, 0x1A2332FF);
+
+            int bx = x + 8;
+            for (int i = 0; i < bookmarkCount; i++) {
+                string label = getBmkLabel(i);
+                if (label.length > 12) label = label.substring(0, 12);
+                int labelW = label.length * charW + 16;
+                Framebuffer.fillRoundedRect(bx, bmkBarY + 2, labelW, 18, 4, 0x1A2332FF);
+                TextRender.drawText(label, bx + 8, bmkBarY + 3, 0x8B949EFF);
+                bx = bx + labelW + 4;
+            }
+        }
+
+        # ---- Page content ----
+        int pageY = bmkBarY + bmkBarH;
+        int pageH = h - BR_TAB_H - BR_TOOLBAR_H - bmkBarH;
+
+        # Clip to page area
+        Framebuffer.fillRect(x, pageY, w, pageH, 0x0D1117FF);
+
+        if (browserUrl == "stratos://home") {
+            drawHomePage(x, pageY, w, pageH);
+        } elif (browserUrl == "stratos://about") {
+            drawAboutPage(x, pageY, w, pageH);
+        } elif (browserUrl == "stratos://help") {
+            drawHelpPage(x, pageY, w, pageH);
+        } elif (browserUrl == "stratos://settings") {
+            drawSettingsPage(x, pageY, w, pageH);
+        } elif (browserUrl == "stratos://changelog") {
+            drawChangelogPage(x, pageY, w, pageH);
+        } elif (browserUrl.indexOf("stratos://search") == 0) {
+            Wiki.drawSearchPage(searchQuery, x, pageY, w, pageH, browserScrollY);
+        } elif (browserUrl.indexOf("stratos://wiki/") == 0) {
+            Wiki.drawArticlePage(currentWikiId, x, pageY, w, pageH, browserScrollY);
+        } elif (browserUrl.indexOf("http://") == 0 || browserUrl.indexOf("https://") == 0) {
+            drawHttpPage(x, pageY, w, pageH);
+        } else {
+            drawErrorPage(x, pageY, w, pageH);
+        }
+    }
+
+    # ========================================================================
+    # Internal — Navigation
+    # ========================================================================
+
+    private static func navigate(string url) -> void {
+        browserUrl = url;
+        browserScrollY = 0;
+        homeSearchEditing = false;
+        homeSearchInput = "";
+
+        # Resolve title from URL
+        if (url.indexOf("stratos://search?q=") == 0) {
+            searchQuery = Wiki.parseSearchQuery(url);
+            browserTitle = "Search";
+        } elif (url.indexOf("stratos://wiki/") == 0) {
+            currentWikiId = Wiki.parseWikiId(url);
+            browserTitle = Wiki.getTitle(currentWikiId);
+        } elif (url.indexOf("http://") == 0 || url.indexOf("https://") == 0) {
+            browserTitle = "Loading...";
+            fetchHttpPage(url);
+        } elif (url == "stratos://home") browserTitle = "Home";
+        elif (url == "stratos://about") browserTitle = "About";
+        elif (url == "stratos://help") browserTitle = "Help";
+        elif (url == "stratos://settings") browserTitle = "Browser Settings";
+        elif (url == "stratos://changelog") browserTitle = "Changelog";
+        else browserTitle = "Not Found";
+
+        # Update tab data
+        setTabUrl(browserActiveTab, browserUrl);
+        setTabTitle(browserActiveTab, browserTitle);
+        setTabScrollY(browserActiveTab, 0);
+    }
+
+    private static func handleUrlInput(KeyEvent event) -> void {
+        # Escape — cancel
+        if (event.scancode == 1) {
+            browserUrlEditing = false;
+            return;
+        }
+        # Enter — navigate or search
+        if (event.scancode == 28) {
+            browserUrlEditing = false;
+            if (browserUrlInput.indexOf("stratos://") == 0) {
+                navigate(browserUrlInput);
+            } elif (browserUrlInput.indexOf("http://") == 0) {
+                navigate(browserUrlInput);
+            } elif (browserUrlInput.indexOf("https://") == 0) {
+                navigate(browserUrlInput);
+            } else {
+                navigate("stratos://search?q=" + browserUrlInput);
+            }
+            return;
+        }
+        # Backspace
+        if (event.scancode == 14) {
+            if (browserUrlInput.length > 0) {
+                browserUrlInput = browserUrlInput.substring(0, browserUrlInput.length - 1);
+            }
+            return;
+        }
+        # Printable character
+        if (event.ascii >= 32 && event.ascii < 127) {
+            browserUrlInput = browserUrlInput + (string) event.ascii;
+        }
+    }
+
+    # Handle input for home page search bar
+    private static func handleHomeSearch(KeyEvent event) -> void {
+        # Escape — cancel search
+        if (event.scancode == 1) {
+            homeSearchEditing = false;
+            homeSearchInput = "";
+            return;
+        }
+        # Enter — perform search
+        if (event.scancode == 28) {
+            homeSearchEditing = false;
+            if (homeSearchInput.length > 0) {
+                navigate("stratos://search?q=" + homeSearchInput);
+            }
+            homeSearchInput = "";
+            return;
+        }
+        # Backspace
+        if (event.scancode == 14) {
+            if (homeSearchInput.length > 0) {
+                homeSearchInput = homeSearchInput.substring(0, homeSearchInput.length - 1);
+            }
+            return;
+        }
+        # Printable character
+        if (event.ascii >= 32 && event.ascii < 127) {
+            homeSearchInput = homeSearchInput + (string) event.ascii;
+        }
+    }
+
+    # ========================================================================
+    # Internal — Tab management
+    # ========================================================================
+
+    private static func newTab() -> void {
+        if (browserTabCount >= 6) return;
+
+        setTabUrl(browserTabCount, "stratos://home");
+        setTabTitle(browserTabCount, "Home");
+        setTabScrollY(browserTabCount, 0);
+        browserTabCount = browserTabCount + 1;
+        switchTab(browserTabCount - 1);
+        navigate("stratos://home");
+    }
+
+    private static func closeTab(int idx) -> void {
+        if (browserTabCount <= 1) return;
+
+        # Shift tabs left
+        for (int i = idx; i < browserTabCount - 1; i++) {
+            setTabUrl(i, getTabUrl(i + 1));
+            setTabTitle(i, getTabTitle(i + 1));
+            setTabScrollY(i, getTabScrollY(i + 1));
+        }
+        browserTabCount = browserTabCount - 1;
+
+        if (browserActiveTab >= browserTabCount) {
+            browserActiveTab = browserTabCount - 1;
+        }
+        # Restore active tab state
+        browserUrl = getTabUrl(browserActiveTab);
+        browserTitle = getTabTitle(browserActiveTab);
+        browserScrollY = getTabScrollY(browserActiveTab);
+    }
+
+    private static func switchTab(int idx) -> void {
+        if (idx < 0 || idx >= browserTabCount) return;
+
+        # Save current tab
+        setTabUrl(browserActiveTab, browserUrl);
+        setTabTitle(browserActiveTab, browserTitle);
+        setTabScrollY(browserActiveTab, browserScrollY);
+
+        # Load new tab
+        browserActiveTab = idx;
+        browserUrl = getTabUrl(idx);
+        browserTitle = getTabTitle(idx);
+        browserScrollY = getTabScrollY(idx);
+    }
+
+    # Tab data accessors (parallel array switch pattern)
+    private static func getTabUrl(int i) -> string {
+        switch (i) {
+            case 0: return tabUrl0;
+            case 1: return tabUrl1;
+            case 2: return tabUrl2;
+            case 3: return tabUrl3;
+            case 4: return tabUrl4;
+            case 5: return tabUrl5;
+            default: return "";
+        }
+    }
+    private static func setTabUrl(int i, string v) -> void {
+        switch (i) {
+            case 0: tabUrl0 = v; break;
+            case 1: tabUrl1 = v; break;
+            case 2: tabUrl2 = v; break;
+            case 3: tabUrl3 = v; break;
+            case 4: tabUrl4 = v; break;
+            case 5: tabUrl5 = v; break;
+        }
+    }
+    private static func getTabTitle(int i) -> string {
+        switch (i) {
+            case 0: return tabTitle0;
+            case 1: return tabTitle1;
+            case 2: return tabTitle2;
+            case 3: return tabTitle3;
+            case 4: return tabTitle4;
+            case 5: return tabTitle5;
+            default: return "";
+        }
+    }
+    private static func setTabTitle(int i, string v) -> void {
+        switch (i) {
+            case 0: tabTitle0 = v; break;
+            case 1: tabTitle1 = v; break;
+            case 2: tabTitle2 = v; break;
+            case 3: tabTitle3 = v; break;
+            case 4: tabTitle4 = v; break;
+            case 5: tabTitle5 = v; break;
+        }
+    }
+    private static func getTabScrollY(int i) -> int {
+        switch (i) {
+            case 0: return tabScrollY0;
+            case 1: return tabScrollY1;
+            case 2: return tabScrollY2;
+            case 3: return tabScrollY3;
+            case 4: return tabScrollY4;
+            case 5: return tabScrollY5;
+            default: return 0;
+        }
+    }
+    private static func setTabScrollY(int i, int v) -> void {
+        switch (i) {
+            case 0: tabScrollY0 = v; break;
+            case 1: tabScrollY1 = v; break;
+            case 2: tabScrollY2 = v; break;
+            case 3: tabScrollY3 = v; break;
+            case 4: tabScrollY4 = v; break;
+            case 5: tabScrollY5 = v; break;
+        }
+    }
+
+    # ========================================================================
+    # Internal — Page renderers
+    # ========================================================================
+
+    private static func drawHomePage(int x, int y, int w, int h) -> void {
+        int centerX = x + w / 2;
+        int scrollOff = browserScrollY;
+
+        # Logo area
+        int logoY = y + 80 - scrollOff;
+        if (logoY > y - 60 && logoY < y + h) {
+            Framebuffer.fillCircle(centerX, logoY, 30, 0x5B8CFF40);
+            Framebuffer.fillCircle(centerX, logoY, 20, 0x5B8CFF80);
+            Framebuffer.fillCircle(centerX, logoY, 10, 0x5B8CFFFF);
+        }
+
+        # Title
+        int titleY = logoY + 50;
+        if (titleY > y && titleY < y + h) {
+            string title = "Void Browser";
+            int titleW = title.length * 8;
+            TextRender.drawText(title, centerX - titleW / 2, titleY, 0xE6EDF3FF);
+        }
+
+        # Subtitle
+        int subY = titleY + 24;
+        if (subY > y && subY < y + h) {
+            string sub = "Search the VoidSearch encyclopedia";
+            int subW = sub.length * 8;
+            TextRender.drawText(sub, centerX - subW / 2, subY, 0x6B7280FF);
+        }
+
+        # Search bar (interactive)
+        int searchY = subY + 50;
+        if (searchY > y && searchY < y + h) {
+            int searchW = 400;
+            if (searchW > w - 40) searchW = w - 40;
+            int searchX = centerX - searchW / 2;
+            int charW2 = TextRender.getCharWidth();
+            int charH2 = TextRender.getCharHeight();
+
+            color32 searchBorder = homeSearchEditing ? Theme.textAccent : 0x2A3442FF;
+            Framebuffer.fillRoundedRect(searchX, searchY, searchW, 36, 18, 0x1A2332FF);
+            Framebuffer.drawRoundedRect(searchX, searchY, searchW, 36, 18, searchBorder);
+
+            if (homeSearchEditing) {
+                if (homeSearchInput.length > 0) {
+                    TextRender.drawText(homeSearchInput, searchX + 16, searchY + 10, 0xE6EDF3FF);
+                    int curX = searchX + 16 + homeSearchInput.length * charW2;
+                    Framebuffer.fillRect(curX, searchY + 10, 2, charH2, Theme.textAccent);
+                } else {
+                    TextRender.drawText("Search VoidSearch...", searchX + 16, searchY + 10, 0x484F58FF);
+                    Framebuffer.fillRect(searchX + 16, searchY + 10, 2, charH2, Theme.textAccent);
+                }
+            } else {
+                TextRender.drawText("Search VoidSearch...", searchX + 16, searchY + 10, 0x484F58FF);
+            }
+        }
+
+        # Quick links
+        int linkY = searchY + 70;
+        if (linkY > y - 80 && linkY < y + h) {
+            int linkW = 100;
+            int linkH = 80;
+            int gap = 20;
+            int totalW = 4 * linkW + 3 * gap;
+            int startX = centerX - totalW / 2;
+
+            string link0 = "About";
+            string link1 = "Help";
+            string link2 = "Settings";
+            string link3 = "Changelog";
+
+            color32 colors0 = 0x5B8CFFFF;
+            color32 colors1 = 0x69F0AEFF;
+            color32 colors2 = 0xFFB74DFF;
+            color32 colors3 = 0xBB86FCFF;
+
+            for (int i = 0; i < 4; i++) {
+                int lx = startX + i * (linkW + gap);
+                color32 lc = colors0;
+                string ln = link0;
+                if (i == 1) { lc = colors1; ln = link1; }
+                elif (i == 2) { lc = colors2; ln = link2; }
+                elif (i == 3) { lc = colors3; ln = link3; }
+
+                Framebuffer.fillRoundedRect(lx, linkY, linkW, linkH, 8, 0x1A2332FF);
+                Framebuffer.fillCircle(lx + linkW / 2, linkY + 28, 12, lc);
+                int lnW = ln.length * 8;
+                TextRender.drawText(ln, lx + linkW / 2 - lnW / 2, linkY + linkH - 20, 0xC9D1D9FF);
+            }
+        }
+    }
+
+    private static func drawAboutPage(int x, int y, int w, int h) -> void {
+        int lx = x + 40;
+        int ly = y + 30 - browserScrollY;
+        int lineH = 22;
+
+        TextRender.drawText("About Void Browser", lx, ly, 0xE6EDF3FF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("Version: 0.1.0", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH;
+        TextRender.drawText("Engine: StratOS Internal Renderer", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH;
+        TextRender.drawText("Built with Flux Language", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("Void Browser can display stratos:// and http:// pages.", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("HTTP browsing requires an active E1000 network adapter.", lx, ly, 0x8B949EFF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("Supported pages:", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH;
+        TextRender.drawText("  stratos://home", lx, ly, Theme.textAccent);
+        ly = ly + lineH;
+        TextRender.drawText("  stratos://about", lx, ly, Theme.textAccent);
+        ly = ly + lineH;
+        TextRender.drawText("  stratos://help", lx, ly, Theme.textAccent);
+        ly = ly + lineH;
+        TextRender.drawText("  stratos://settings", lx, ly, Theme.textAccent);
+        ly = ly + lineH;
+        TextRender.drawText("  stratos://changelog", lx, ly, Theme.textAccent);
+    }
+
+    private static func drawHelpPage(int x, int y, int w, int h) -> void {
+        int lx = x + 40;
+        int ly = y + 30 - browserScrollY;
+        int lineH = 22;
+
+        TextRender.drawText("Void Browser Help", lx, ly, 0xE6EDF3FF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("Keyboard Shortcuts:", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH;
+        TextRender.drawText("  Ctrl+T    New tab", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  Ctrl+W    Close tab", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  Ctrl+L    Focus URL bar", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  Ctrl+R    Reload page", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  Up/Down   Scroll page", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  PgUp/PgDn Fast scroll", lx, ly, 0x8B949EFF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("Mouse Controls:", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH;
+        TextRender.drawText("  Click tabs to switch", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  Click URL bar to edit address", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  Click links to navigate", lx, ly, 0x8B949EFF);
+    }
+
+    private static func drawSettingsPage(int x, int y, int w, int h) -> void {
+        int lx = x + 40;
+        int ly = y + 30 - browserScrollY;
+        int lineH = 22;
+
+        TextRender.drawText("Browser Settings", lx, ly, 0xE6EDF3FF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("Homepage: stratos://home", lx, ly, 0xC9D1D9FF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("No configurable settings yet.", lx, ly, 0x484F58FF);
+        ly = ly + lineH;
+        TextRender.drawText("Future versions will add:", lx, ly, 0x484F58FF);
+        ly = ly + lineH;
+        TextRender.drawText("  - Custom homepage", lx, ly, 0x6B7280FF);
+        ly = ly + lineH;
+        TextRender.drawText("  - Font size", lx, ly, 0x6B7280FF);
+        ly = ly + lineH;
+        TextRender.drawText("  - History management", lx, ly, 0x6B7280FF);
+    }
+
+    private static func drawChangelogPage(int x, int y, int w, int h) -> void {
+        int lx = x + 40;
+        int ly = y + 30 - browserScrollY;
+        int lineH = 22;
+
+        TextRender.drawText("Changelog", lx, ly, 0xE6EDF3FF);
+        ly = ly + lineH * 2;
+        TextRender.drawText("v0.1.0 — Initial Release", lx, ly, Theme.textAccent);
+        ly = ly + lineH;
+        TextRender.drawText("  - Tab bar with up to 6 tabs", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  - URL bar with address entry", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  - Internal stratos:// pages", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  - Mouse click navigation", lx, ly, 0x8B949EFF);
+        ly = ly + lineH;
+        TextRender.drawText("  - Keyboard shortcuts", lx, ly, 0x8B949EFF);
+    }
+
+    private static func drawErrorPage(int x, int y, int w, int h) -> void {
+        int centerX = x + w / 2;
+        int centerY = y + h / 2 - 40;
+
+        # Sad face circle
+        Framebuffer.drawCircle(centerX, centerY, 30, 0x4A5568FF);
+        Framebuffer.fillCircle(centerX - 10, centerY - 8, 3, 0x4A5568FF);
+        Framebuffer.fillCircle(centerX + 10, centerY - 8, 3, 0x4A5568FF);
+        Framebuffer.drawLine(centerX - 10, centerY + 12, centerX + 10, centerY + 12, 0x4A5568FF);
+
+        string errMsg = "Page not found";
+        int errW = errMsg.length * 8;
+        TextRender.drawText(errMsg, centerX - errW / 2, centerY + 50, 0x6B7280FF);
+
+        string urlMsg = browserUrl;
+        int urlMsgW = urlMsg.length * 8;
+        TextRender.drawText(urlMsg, centerX - urlMsgW / 2, centerY + 72, 0x484F58FF);
+    }
+
+    # ========================================================================
+    # HTTP page fetch and render
+    # ========================================================================
+
+    # Fetch a page via HTTP GET over the kernel TCP stack.
+    # Splits the response body into lines and stores in hl0..hl127.
+    private static func fetchHttpPage(string url) -> void {
+        httpLineCount = 0;
+        httpLoading   = true;
+        httpError     = false;
+        httpErrorMsg  = "";
+        httpStatusCode = 0;
+
+        # ── Check adapter ────────────────────────────────────────
+        if (!E1000.isPresent()) {
+            httpLoading = false;
+            httpError   = true;
+            httpErrorMsg = "No network adapter detected";
+            browserTitle = "Network Error";
+            return;
+        }
+        if (!Net.isConfigured()) {
+            httpLoading = false;
+            httpError   = true;
+            httpErrorMsg = "Network not configured (no IP address)";
+            browserTitle = "Network Error";
+            return;
+        }
+
+        # ── Parse host + path from the URL ───────────────────────
+        # Expected: http://host/path  or  http://host
+        string remainder = "";
+        if (url.indexOf("http://") == 0) {
+            remainder = url.substring(7, url.length);
+        } elif (url.indexOf("https://") == 0) {
+            # Note: TLS is not supported — treat as plain HTTP
+            remainder = url.substring(8, url.length);
+        }
+
+        string host = remainder;
+        string path = "/";
+        int slashPos = remainder.indexOf("/");
+        if (slashPos > 0) {
+            host = remainder.substring(0, slashPos);
+            path = remainder.substring(slashPos, remainder.length);
+        }
+        httpHost = host;
+
+        # ── DNS resolve ──────────────────────────────────────────
+        int ip = Net.dnsResolve(host);
+        if (ip == 0) {
+            httpLoading = false;
+            httpError   = true;
+            httpErrorMsg = "DNS lookup failed for ${host}";
+            browserTitle = "DNS Error";
+            return;
+        }
+
+        # ── TCP connect (port 80) ────────────────────────────────
+        bool connected = Net.tcpConnect(ip, 80);
+        if (!connected) {
+            httpLoading = false;
+            httpError   = true;
+            httpErrorMsg = "Connection refused by ${host}:80";
+            browserTitle = "Connection Error";
+            return;
+        }
+
+        # ── Send HTTP/1.0 GET request ────────────────────────────
+        string crlf = "\r\n";
+        string req = "GET ${path} HTTP/1.0${crlf}Host: ${host}${crlf}User-Agent: VoidBrowser/0.1 (StratOS)${crlf}Accept: text/html, text/plain${crlf}Connection: close${crlf}${crlf}";
+        long reqAddr = (long) req.c_str();
+        Net.tcpSend(reqAddr, req.length);
+
+        # ── Receive response into a byte buffer ──────────────────
+        int recvBufSize = 8192;
+        unsafe {
+            byte recvBuf[8192];
+            long recvAddr = (long) &recvBuf[0];
+            int recvLen = Net.tcpReceive(recvAddr, recvBufSize, 5000);
+            Net.tcpClose();
+
+            if (recvLen <= 0) {
+                httpLoading = false;
+                httpError   = true;
+                httpErrorMsg = "Empty response from ${host}";
+                browserTitle = "Error";
+                return;
+            }
+
+            # Build a string from the received bytes
+            string response = "";
+            for (int ri = 0; ri < recvLen; ri++) {
+                int ch = (int) recvBuf[ri];
+                if (ch >= 32 && ch < 127) {
+                    response = "${response}${(string) ch}";
+                } elif (ch == 10) {
+                    response = "${response}\n";
+                } elif (ch == 13) {
+                    # skip CR
+                } elif (ch == 9) {
+                    response = "${response}    ";
+                }
+            }
+
+            # ── Separate headers from body ───────────────────────────
+            string body = response;
+            int headerEnd = response.indexOf("\n\n");
+            if (headerEnd >= 0) {
+                body = response.substring(headerEnd + 2, response.length);
+
+                # Parse status code from first line (e.g. "HTTP/1.0 200 OK")
+                string statusLine = response.substring(0, headerEnd);
+                int spPos = statusLine.indexOf(" ");
+                if (spPos > 0) {
+                    int spEnd = spPos + 4;
+                    if (spEnd > statusLine.length) spEnd = statusLine.length;
+                    string codeStr = statusLine.substring(spPos + 1, spEnd);
+                    httpStatusCode = parseStatusCode(codeStr);
+                }
+            }
+
+            # ── Strip HTML tags (very basic) ─────────────────────────
+            string plain = stripHtmlTags(body);
+
+            # ── Split into lines ─────────────────────────────────────
+            int lineIdx = 0;
+            int pos = 0;
+            int plainLen = plain.length;
+            while (pos < plainLen && lineIdx < HTTP_MAX_LINES) {
+                int nlPos = -1;
+                # Find next newline
+                int scanLimit = pos + 200;
+                if (scanLimit > plainLen) scanLimit = plainLen;
+                for (int s = pos; s < scanLimit; s++) {
+                    if (plain.charAt(s) == '\n') {
+                        nlPos = s;
+                        break;
+                    }
+                }
+                if (nlPos < 0) {
+                    # No newline found — take the rest (up to 200 chars)
+                    string line = plain.substring(pos, scanLimit);
+                    if (line.length > 0) {
+                        setHttpLine(lineIdx, line.trim());
+                        lineIdx = lineIdx + 1;
+                    }
+                    pos = scanLimit;
+                } else {
+                    string line = plain.substring(pos, nlPos);
+                    if (line.length > 0) {
+                        setHttpLine(lineIdx, line.trim());
+                        lineIdx = lineIdx + 1;
+                    }
+                    pos = nlPos + 1;
+                }
+            }
+            httpLineCount = lineIdx;
+        }
+
+        httpLoading = false;
+        browserTitle = httpHost;
+    }
+
+    # Very basic HTML tag stripper: removes anything between < and >
+    private static func stripHtmlTags(string input) -> string {
+        string result = "";
+        bool inTag = false;
+        int len = input.length;
+        for (int i = 0; i < len; i++) {
+            if (input.charAt(i) == '<') {
+                inTag = true;
+            } elif (input.charAt(i) == '>') {
+                inTag = false;
+                # Insert space after block-level tags to separate words
+                result = "${result} ";
+            } else {
+                if (!inTag) {
+                    # Convert &amp; &lt; &gt; &nbsp; entities (basic)
+                    result = "${result}${(string) input.charAt(i)}";
+                }
+            }
+        }
+        return result;
+    }
+
+    # Parse a 3-digit HTTP status code string to an int
+    private static func parseStatusCode(string s) -> int {
+        if (s.length < 3) return 0;
+        int d0 = (int) s.charAt(0) - 48;
+        int d1 = (int) s.charAt(1) - 48;
+        int d2 = (int) s.charAt(2) - 48;
+        if (d0 < 0 || d0 > 9) return 0;
+        if (d1 < 0 || d1 > 9) return 0;
+        if (d2 < 0 || d2 > 9) return 0;
+        return d0 * 100 + d1 * 10 + d2;
+    }
+
+    # Render the fetched HTTP content
+    private static func drawHttpPage(int x, int y, int w, int h) -> void {
+        int lx = x + 16;
+        int ly = y + 12 - browserScrollY;
+        int lineH = 18;
+
+        if (httpError) {
+            # ── Error display ────────────────────────────────────
+            int centerX = x + w / 2;
+            int centerY = y + h / 2 - 40;
+
+            Framebuffer.drawCircle(centerX, centerY, 30, 0xF85149FF);
+            TextRender.drawText("!", centerX - 3, centerY - 8, 0xF85149FF);
+
+            int errW = httpErrorMsg.length * 8;
+            TextRender.drawText(httpErrorMsg, centerX - errW / 2, centerY + 50, 0xC9D1D9FF);
+
+            string urlMsg = browserUrl;
+            int urlMsgW = urlMsg.length * 8;
+            TextRender.drawText(urlMsg, centerX - urlMsgW / 2, centerY + 72, 0x484F58FF);
+            return;
+        }
+
+        if (httpLoading) {
+            TextRender.drawText("Loading...", lx, ly, 0x8B949EFF);
+            return;
+        }
+
+        # ── Status bar ──────────────────────────────────────────
+        Framebuffer.fillRect(x, y, w, 24, 0x161B22FF);
+        string statusText = "${httpHost}  —  HTTP ${httpStatusCode}  —  ${httpLineCount} lines";
+        TextRender.drawText(statusText, lx, y + 4, 0x8B949EFF);
+        ly = y + 30 - browserScrollY;
+
+        # ── Content lines ───────────────────────────────────────
+        for (int i = 0; i < httpLineCount; i++) {
+            if (ly > y + 24 && ly < y + h) {
+                string line = getHttpLine(i);
+                TextRender.drawText(line, lx, ly, 0xC9D1D9FF);
+            }
+            ly = ly + lineH;
+        }
+
+        if (httpLineCount == 0) {
+            TextRender.drawText("(empty response)", lx, ly, 0x484F58FF);
+        }
+    }
+
+    # ── HTTP line parallel-array accessors ───────────────────────
+    private static func getHttpLine(int i) -> string {
+        switch (i) {
+            case 0: return hl0; case 1: return hl1; case 2: return hl2; case 3: return hl3;
+            case 4: return hl4; case 5: return hl5; case 6: return hl6; case 7: return hl7;
+            case 8: return hl8; case 9: return hl9; case 10: return hl10; case 11: return hl11;
+            case 12: return hl12; case 13: return hl13; case 14: return hl14; case 15: return hl15;
+            case 16: return hl16; case 17: return hl17; case 18: return hl18; case 19: return hl19;
+            case 20: return hl20; case 21: return hl21; case 22: return hl22; case 23: return hl23;
+            case 24: return hl24; case 25: return hl25; case 26: return hl26; case 27: return hl27;
+            case 28: return hl28; case 29: return hl29; case 30: return hl30; case 31: return hl31;
+            case 32: return hl32; case 33: return hl33; case 34: return hl34; case 35: return hl35;
+            case 36: return hl36; case 37: return hl37; case 38: return hl38; case 39: return hl39;
+            case 40: return hl40; case 41: return hl41; case 42: return hl42; case 43: return hl43;
+            case 44: return hl44; case 45: return hl45; case 46: return hl46; case 47: return hl47;
+            case 48: return hl48; case 49: return hl49; case 50: return hl50; case 51: return hl51;
+            case 52: return hl52; case 53: return hl53; case 54: return hl54; case 55: return hl55;
+            case 56: return hl56; case 57: return hl57; case 58: return hl58; case 59: return hl59;
+            case 60: return hl60; case 61: return hl61; case 62: return hl62; case 63: return hl63;
+            case 64: return hl64; case 65: return hl65; case 66: return hl66; case 67: return hl67;
+            case 68: return hl68; case 69: return hl69; case 70: return hl70; case 71: return hl71;
+            case 72: return hl72; case 73: return hl73; case 74: return hl74; case 75: return hl75;
+            case 76: return hl76; case 77: return hl77; case 78: return hl78; case 79: return hl79;
+            case 80: return hl80; case 81: return hl81; case 82: return hl82; case 83: return hl83;
+            case 84: return hl84; case 85: return hl85; case 86: return hl86; case 87: return hl87;
+            case 88: return hl88; case 89: return hl89; case 90: return hl90; case 91: return hl91;
+            case 92: return hl92; case 93: return hl93; case 94: return hl94; case 95: return hl95;
+            case 96: return hl96; case 97: return hl97; case 98: return hl98; case 99: return hl99;
+            case 100: return hl100; case 101: return hl101; case 102: return hl102; case 103: return hl103;
+            case 104: return hl104; case 105: return hl105; case 106: return hl106; case 107: return hl107;
+            case 108: return hl108; case 109: return hl109; case 110: return hl110; case 111: return hl111;
+            case 112: return hl112; case 113: return hl113; case 114: return hl114; case 115: return hl115;
+            case 116: return hl116; case 117: return hl117; case 118: return hl118; case 119: return hl119;
+            case 120: return hl120; case 121: return hl121; case 122: return hl122; case 123: return hl123;
+            case 124: return hl124; case 125: return hl125; case 126: return hl126; case 127: return hl127;
+            default: return "";
+        }
+    }
+
+    private static func setHttpLine(int i, string val) -> void {
+        switch (i) {
+            case 0: hl0 = val; break; case 1: hl1 = val; break; case 2: hl2 = val; break; case 3: hl3 = val; break;
+            case 4: hl4 = val; break; case 5: hl5 = val; break; case 6: hl6 = val; break; case 7: hl7 = val; break;
+            case 8: hl8 = val; break; case 9: hl9 = val; break; case 10: hl10 = val; break; case 11: hl11 = val; break;
+            case 12: hl12 = val; break; case 13: hl13 = val; break; case 14: hl14 = val; break; case 15: hl15 = val; break;
+            case 16: hl16 = val; break; case 17: hl17 = val; break; case 18: hl18 = val; break; case 19: hl19 = val; break;
+            case 20: hl20 = val; break; case 21: hl21 = val; break; case 22: hl22 = val; break; case 23: hl23 = val; break;
+            case 24: hl24 = val; break; case 25: hl25 = val; break; case 26: hl26 = val; break; case 27: hl27 = val; break;
+            case 28: hl28 = val; break; case 29: hl29 = val; break; case 30: hl30 = val; break; case 31: hl31 = val; break;
+            case 32: hl32 = val; break; case 33: hl33 = val; break; case 34: hl34 = val; break; case 35: hl35 = val; break;
+            case 36: hl36 = val; break; case 37: hl37 = val; break; case 38: hl38 = val; break; case 39: hl39 = val; break;
+            case 40: hl40 = val; break; case 41: hl41 = val; break; case 42: hl42 = val; break; case 43: hl43 = val; break;
+            case 44: hl44 = val; break; case 45: hl45 = val; break; case 46: hl46 = val; break; case 47: hl47 = val; break;
+            case 48: hl48 = val; break; case 49: hl49 = val; break; case 50: hl50 = val; break; case 51: hl51 = val; break;
+            case 52: hl52 = val; break; case 53: hl53 = val; break; case 54: hl54 = val; break; case 55: hl55 = val; break;
+            case 56: hl56 = val; break; case 57: hl57 = val; break; case 58: hl58 = val; break; case 59: hl59 = val; break;
+            case 60: hl60 = val; break; case 61: hl61 = val; break; case 62: hl62 = val; break; case 63: hl63 = val; break;
+            case 64: hl64 = val; break; case 65: hl65 = val; break; case 66: hl66 = val; break; case 67: hl67 = val; break;
+            case 68: hl68 = val; break; case 69: hl69 = val; break; case 70: hl70 = val; break; case 71: hl71 = val; break;
+            case 72: hl72 = val; break; case 73: hl73 = val; break; case 74: hl74 = val; break; case 75: hl75 = val; break;
+            case 76: hl76 = val; break; case 77: hl77 = val; break; case 78: hl78 = val; break; case 79: hl79 = val; break;
+            case 80: hl80 = val; break; case 81: hl81 = val; break; case 82: hl82 = val; break; case 83: hl83 = val; break;
+            case 84: hl84 = val; break; case 85: hl85 = val; break; case 86: hl86 = val; break; case 87: hl87 = val; break;
+            case 88: hl88 = val; break; case 89: hl89 = val; break; case 90: hl90 = val; break; case 91: hl91 = val; break;
+            case 92: hl92 = val; break; case 93: hl93 = val; break; case 94: hl94 = val; break; case 95: hl95 = val; break;
+            case 96: hl96 = val; break; case 97: hl97 = val; break; case 98: hl98 = val; break; case 99: hl99 = val; break;
+            case 100: hl100 = val; break; case 101: hl101 = val; break; case 102: hl102 = val; break; case 103: hl103 = val; break;
+            case 104: hl104 = val; break; case 105: hl105 = val; break; case 106: hl106 = val; break; case 107: hl107 = val; break;
+            case 108: hl108 = val; break; case 109: hl109 = val; break; case 110: hl110 = val; break; case 111: hl111 = val; break;
+            case 112: hl112 = val; break; case 113: hl113 = val; break; case 114: hl114 = val; break; case 115: hl115 = val; break;
+            case 116: hl116 = val; break; case 117: hl117 = val; break; case 118: hl118 = val; break; case 119: hl119 = val; break;
+            case 120: hl120 = val; break; case 121: hl121 = val; break; case 122: hl122 = val; break; case 123: hl123 = val; break;
+            case 124: hl124 = val; break; case 125: hl125 = val; break; case 126: hl126 = val; break; case 127: hl127 = val; break;
+        }
+    }
+
+    # ========================================================================
+    # Bookmark management
+    # ========================================================================
+
+    private static func addBookmark(string url, string label) -> void {
+        if (bookmarkCount >= 8) return;  # Max bookmarks reached
+
+        # Check if already bookmarked
+        for (int i = 0; i < bookmarkCount; i++) {
+            if (getBmkUrl(i) == url) return;
+        }
+
+        setBmkUrl(bookmarkCount, url);
+        setBmkLabel(bookmarkCount, label);
+        bookmarkCount = bookmarkCount + 1;
+    }
+
+    private static func getBmkUrl(int i) -> string {
+        switch (i) {
+            case 0: return bmkUrl0;
+            case 1: return bmkUrl1;
+            case 2: return bmkUrl2;
+            case 3: return bmkUrl3;
+            case 4: return bmkUrl4;
+            case 5: return bmkUrl5;
+            case 6: return bmkUrl6;
+            case 7: return bmkUrl7;
+            default: return "";
+        }
+    }
+
+    private static func getBmkLabel(int i) -> string {
+        switch (i) {
+            case 0: return bmkLabel0;
+            case 1: return bmkLabel1;
+            case 2: return bmkLabel2;
+            case 3: return bmkLabel3;
+            case 4: return bmkLabel4;
+            case 5: return bmkLabel5;
+            case 6: return bmkLabel6;
+            case 7: return bmkLabel7;
+            default: return "";
+        }
+    }
+
+    private static func setBmkUrl(int i, string val) -> void {
+        switch (i) {
+            case 0: bmkUrl0 = val; break;
+            case 1: bmkUrl1 = val; break;
+            case 2: bmkUrl2 = val; break;
+            case 3: bmkUrl3 = val; break;
+            case 4: bmkUrl4 = val; break;
+            case 5: bmkUrl5 = val; break;
+            case 6: bmkUrl6 = val; break;
+            case 7: bmkUrl7 = val; break;
+        }
+    }
+
+    private static func setBmkLabel(int i, string val) -> void {
+        switch (i) {
+            case 0: bmkLabel0 = val; break;
+            case 1: bmkLabel1 = val; break;
+            case 2: bmkLabel2 = val; break;
+            case 3: bmkLabel3 = val; break;
+            case 4: bmkLabel4 = val; break;
+            case 5: bmkLabel5 = val; break;
+            case 6: bmkLabel6 = val; break;
+            case 7: bmkLabel7 = val; break;
+        }
+    }
+}

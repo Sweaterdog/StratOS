@@ -1,0 +1,657 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// QuickNotes — Simple notepad app for StratOS
+// apps/notes/notes.lx
+//
+// Features:
+//   - Multi-line text editing
+//   - Note list sidebar with multiple notes
+//   - VFS save/load
+//   - Auto-save indicator
+//   - Keyboard and mouse controls
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/fs/vfs.lx";
+
+# Editor state
+int NOTES_MAX_LINES = 128;
+int notesLineCount = 1;
+int notesCursorRow = 0;
+int notesCursorCol = 0;
+int notesScrollY = 0;
+bool notesModified = false;
+
+# Text buffer: parallel string array (switch accessor)
+string noteLine0  = "";  string noteLine1  = "";  string noteLine2  = "";
+string noteLine3  = "";  string noteLine4  = "";  string noteLine5  = "";
+string noteLine6  = "";  string noteLine7  = "";  string noteLine8  = "";
+string noteLine9  = "";  string noteLine10 = "";  string noteLine11 = "";
+string noteLine12 = "";  string noteLine13 = "";  string noteLine14 = "";
+string noteLine15 = "";  string noteLine16 = "";  string noteLine17 = "";
+string noteLine18 = "";  string noteLine19 = "";  string noteLine20 = "";
+string noteLine21 = "";  string noteLine22 = "";  string noteLine23 = "";
+string noteLine24 = "";  string noteLine25 = "";  string noteLine26 = "";
+string noteLine27 = "";  string noteLine28 = "";  string noteLine29 = "";
+string noteLine30 = "";  string noteLine31 = "";
+
+int NOTES_MAX_BUF = 32;
+
+# Note list state (parallel arrays, max 6 notes)
+int notesCount = 3;
+int notesSelected = 0;
+string noteListName0 = "Welcome";      string noteListPath0 = "/home/user/notes/welcome.txt";
+string noteListName1 = "TODO";         string noteListPath1 = "/home/user/notes/todo.txt";
+string noteListName2 = "Ideas";        string noteListPath2 = "/home/user/notes/ideas.txt";
+string noteListName3 = "";             string noteListPath3 = "";
+string noteListName4 = "";             string noteListPath4 = "";
+string noteListName5 = "";             string noteListPath5 = "";
+
+# View
+int NOTES_SIDEBAR_W = 150;
+int notesView = 0;  # 0 = editor, always for now
+string notesStatusMsg = "";
+int notesStatusTimer = 0;
+
+# Rename state
+bool notesRenaming = false;
+string notesRenameBuffer = "";
+int notesRenameIdx = -1;
+
+export class NotesApp {
+    # Initialize the notes app
+    public static func init() -> void {
+        notesCursorRow = 0;
+        notesCursorCol = 0;
+        notesScrollY = 0;
+        notesModified = false;
+        notesLineCount = 1;
+        notesStatusMsg = "";
+        notesStatusTimer = 0;
+
+        # Set default content for the welcome note
+        setLine(0, "Welcome to QuickNotes!");
+        setLine(1, "");
+        setLine(2, "This is a simple notepad for StratOS.");
+        setLine(3, "");
+        setLine(4, "Keyboard shortcuts:");
+        setLine(5, "  Ctrl+S — Save current note");
+        setLine(6, "  Ctrl+N — New note");
+        setLine(7, "  Ctrl+O — Open note");
+        setLine(8, "  Up/Down — Navigate notes list");
+        setLine(9, "");
+        setLine(10, "Start typing to edit!");
+        notesLineCount = 11;
+    }
+
+    # Process a keyboard event
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Handle rename input mode
+        if (notesRenaming) {
+            handleRenameInput(event);
+            return;
+        }
+
+        # Ctrl shortcuts
+        if (event.ctrl) {
+            if (event.ascii == 's') {
+                saveCurrentNote();
+                return;
+            }
+            if (event.ascii == 'n') {
+                newNote();
+                return;
+            }
+            return;
+        }
+
+        # F2 — rename current note
+        if (event.scancode == 60) {
+            startRename();
+            return;
+        }
+
+        int sc = event.scancode;
+
+        # Arrow keys
+        if (sc == KEY_UP) {
+            if (notesCursorRow > 0) notesCursorRow = notesCursorRow - 1;
+            clampCursorCol();
+            ensureCursorVisible();
+            return;
+        }
+        if (sc == KEY_DOWN) {
+            if (notesCursorRow < notesLineCount - 1) notesCursorRow = notesCursorRow + 1;
+            clampCursorCol();
+            ensureCursorVisible();
+            return;
+        }
+        if (sc == KEY_LEFT) {
+            if (notesCursorCol > 0) {
+                notesCursorCol = notesCursorCol - 1;
+            } elif (notesCursorRow > 0) {
+                notesCursorRow = notesCursorRow - 1;
+                notesCursorCol = getLine(notesCursorRow).length;
+            }
+            return;
+        }
+        if (sc == KEY_RIGHT) {
+            string currentLine = getLine(notesCursorRow);
+            if (notesCursorCol < currentLine.length) {
+                notesCursorCol = notesCursorCol + 1;
+            } elif (notesCursorRow < notesLineCount - 1) {
+                notesCursorRow = notesCursorRow + 1;
+                notesCursorCol = 0;
+            }
+            return;
+        }
+
+        # Home/End
+        if (sc == 71) { notesCursorCol = 0; return; }
+        if (sc == 79) { notesCursorCol = getLine(notesCursorRow).length; return; }
+
+        # Enter — split line
+        if (sc == 28) {
+            if (notesLineCount >= NOTES_MAX_BUF) return;
+            string curLine = getLine(notesCursorRow);
+            string before = curLine.substring(0, notesCursorCol);
+            string after = curLine.substring(notesCursorCol, curLine.length);
+            setLine(notesCursorRow, before);
+            # Shift lines down
+            for (int i = notesLineCount; i > notesCursorRow + 1; i = i - 1) {
+                setLine(i, getLine(i - 1));
+            }
+            notesLineCount = notesLineCount + 1;
+            notesCursorRow = notesCursorRow + 1;
+            notesCursorCol = 0;
+            setLine(notesCursorRow, after);
+            notesModified = true;
+            ensureCursorVisible();
+            return;
+        }
+
+        # Backspace
+        if (sc == 14) {
+            if (notesCursorCol > 0) {
+                string curLine = getLine(notesCursorRow);
+                string newLine = curLine.substring(0, notesCursorCol - 1) + curLine.substring(notesCursorCol, curLine.length);
+                setLine(notesCursorRow, newLine);
+                notesCursorCol = notesCursorCol - 1;
+            } elif (notesCursorRow > 0) {
+                string prevLine = getLine(notesCursorRow - 1);
+                string curLine = getLine(notesCursorRow);
+                int newCol = prevLine.length;
+                setLine(notesCursorRow - 1, prevLine + curLine);
+                # Shift lines up
+                for (int i = notesCursorRow; i < notesLineCount - 1; i++) {
+                    setLine(i, getLine(i + 1));
+                }
+                notesLineCount = notesLineCount - 1;
+                notesCursorRow = notesCursorRow - 1;
+                notesCursorCol = newCol;
+            }
+            notesModified = true;
+            ensureCursorVisible();
+            return;
+        }
+
+        # Delete key
+        if (sc == 83) {
+            string curLine = getLine(notesCursorRow);
+            if (notesCursorCol < curLine.length) {
+                string newLine = curLine.substring(0, notesCursorCol) + curLine.substring(notesCursorCol + 1, curLine.length);
+                setLine(notesCursorRow, newLine);
+            } elif (notesCursorRow < notesLineCount - 1) {
+                string nextLine = getLine(notesCursorRow + 1);
+                setLine(notesCursorRow, curLine + nextLine);
+                for (int i = notesCursorRow + 1; i < notesLineCount - 1; i++) {
+                    setLine(i, getLine(i + 1));
+                }
+                notesLineCount = notesLineCount - 1;
+            }
+            notesModified = true;
+            return;
+        }
+
+        # Printable characters
+        if (event.ascii >= 32 && event.ascii < 127) {
+            string curLine = getLine(notesCursorRow);
+            if (curLine.length >= 200) return;  # Line length limit
+            string ch = "${event.ascii}";
+            string newLine = curLine.substring(0, notesCursorCol) + ch + curLine.substring(notesCursorCol, curLine.length);
+            setLine(notesCursorRow, newLine);
+            notesCursorCol = notesCursorCol + 1;
+            notesModified = true;
+            return;
+        }
+    }
+
+    # Process a mouse click
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        # Sidebar clicks
+        if (relX < NOTES_SIDEBAR_W) {
+            int headerH = 40;
+            int itemH = 36;
+
+            # "New Note" button at top
+            if (relY < headerH) {
+                newNote();
+                return;
+            }
+
+            # Note items
+            int clickedItem = (relY - headerH) / itemH;
+            if (clickedItem >= 0 && clickedItem < notesCount) {
+                switchToNote(clickedItem);
+            }
+            return;
+        }
+
+        # Text area — position cursor
+        int textX = relX - NOTES_SIDEBAR_W;
+        int textY = relY;
+        int lineH = 18;
+        int clickRow = notesScrollY + textY / lineH;
+        int clickCol = textX / 8;
+
+        if (clickRow < 0) clickRow = 0;
+        if (clickRow >= notesLineCount) clickRow = notesLineCount - 1;
+
+        notesCursorRow = clickRow;
+        string line = getLine(notesCursorRow);
+        if (clickCol > line.length) clickCol = line.length;
+        if (clickCol < 0) clickCol = 0;
+        notesCursorCol = clickCol;
+    }
+
+    # Draw the notes UI
+    public static func draw(int x, int y, int w, int h) -> void {
+        # Status message countdown
+        if (notesStatusTimer > 0) {
+            notesStatusTimer = notesStatusTimer - 1;
+            if (notesStatusTimer == 0) notesStatusMsg = "";
+        }
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0A0E1AFF);
+
+        # Sidebar
+        int sideW = NOTES_SIDEBAR_W;
+        if (sideW > w / 3) sideW = w / 3;
+        drawNoteSidebar(x, y, sideW, h);
+
+        # Text editing area
+        int editorX = x + sideW;
+        int editorW = w - sideW;
+        drawEditor(editorX, y, editorW, h);
+    }
+
+    # ========================================================================
+    # Internal — Rendering
+    # ========================================================================
+
+    private static func drawNoteSidebar(int x, int y, int w, int h) -> void {
+        Framebuffer.fillRect(x, y, w, h, 0x080C14FF);
+        Framebuffer.drawVLine(x + w - 1, y, h, 0x1A2332FF);
+
+        # Header "Notes" + New button
+        Framebuffer.fillRect(x, y, w - 1, 36, 0x101824FF);
+        TextRender.drawText("Notes", x + 12, y + 10, 0xE6EDF3FF);
+        TextRender.drawText("[+]", x + w - 36, y + 10, Theme.textAccent);
+
+        # Note list
+        int listY = y + 40;
+        int itemH = 36;
+        for (int i = 0; i < notesCount; i++) {
+            int itemY = listY + i * itemH;
+            if (itemY + itemH > y + h) break;
+
+            bool isActive = (i == notesSelected);
+            if (isActive) {
+                Framebuffer.fillRect(x, itemY, w - 1, itemH, 0x1A2332FF);
+                Framebuffer.fillRect(x, itemY, 3, itemH, Theme.textAccent);
+            }
+
+            # Rename input overlay
+            if (notesRenaming && notesRenameIdx == i) {
+                Framebuffer.fillRect(x + 12, itemY + 4, w - 20, 24, 0x0D1117FF);
+                Framebuffer.drawRect(x + 12, itemY + 4, w - 20, 24, Theme.textAccent);
+                TextRender.drawText(notesRenameBuffer + "_", x + 16, itemY + 10, 0xE6EDF3FF);
+            } else {
+                string name = getNoteListName(i);
+                color32 nameColor = isActive ? 0xE6EDF3FF : 0x8B949EFF;
+                TextRender.drawText(name, x + 16, itemY + 10, nameColor);
+            }
+        }
+    }
+
+    private static func drawEditor(int x, int y, int w, int h) -> void {
+        int lineH = 18;
+        int statusBarH = 24;
+        int editH = h - statusBarH;
+        int visibleLines = editH / lineH;
+
+        # Text content
+        for (int i = 0; i < visibleLines; i++) {
+            int lineIdx = notesScrollY + i;
+            if (lineIdx >= notesLineCount) break;
+
+            int lineY = y + i * lineH;
+            string lineText = getLine(lineIdx);
+
+            # Current line highlight
+            if (lineIdx == notesCursorRow) {
+                Framebuffer.fillRect(x, lineY, w, lineH, 0x11151FFF);
+            }
+
+            # Text
+            TextRender.drawText(lineText, x + 8, lineY + 1, 0xC9D1D9FF);
+
+            # Cursor (blinking)
+            if (lineIdx == notesCursorRow) {
+                int ticks = Timer.getTicks();
+                if ((ticks / 50) % 2 == 0) {
+                    int curX = x + 8 + notesCursorCol * 8;
+                    Framebuffer.fillRect(curX, lineY + 1, 2, 14, Theme.textAccent);
+                }
+            }
+        }
+
+        # Status bar
+        int sbY = y + editH;
+        Framebuffer.fillRect(x, sbY, w, statusBarH, 0x101824FF);
+        Framebuffer.drawHLine(x, sbY, w, 0x1A2332FF);
+
+        # Note name
+        string noteName = getNoteListName(notesSelected);
+        string modIndicator = notesModified ? " [modified]" : "";
+        TextRender.drawText(noteName + modIndicator, x + 8, sbY + 4, 0x8B949EFF);
+
+        # Cursor position
+        string posInfo = "Ln ${notesCursorRow + 1}, Col ${notesCursorCol + 1}";
+        int posW = posInfo.length * 8;
+        TextRender.drawText(posInfo, x + w - posW - 8, sbY + 4, 0x6B7280FF);
+
+        # Status message
+        if (notesStatusMsg != "") {
+            int msgW = notesStatusMsg.length * 8;
+            int msgX = x + w / 2 - msgW / 2;
+            TextRender.drawText(notesStatusMsg, msgX, sbY + 4, Theme.textAccent);
+        }
+    }
+
+    # ========================================================================
+    # Internal — Note management
+    # ========================================================================
+
+    private static func switchToNote(int idx) -> void {
+        if (idx < 0 || idx >= notesCount) return;
+        if (idx == notesSelected) return;
+
+        notesSelected = idx;
+        notesCursorRow = 0;
+        notesCursorCol = 0;
+        notesScrollY = 0;
+        notesModified = false;
+
+        # Load note content from VFS
+        string path = getNoteListPath(idx);
+        if (VFS.exists(path)) {
+            string content = VFS.read(path);
+            loadContent(content);
+        } else {
+            # Empty note
+            notesLineCount = 1;
+            setLine(0, "");
+        }
+    }
+
+    private static func newNote() -> void {
+        if (notesCount >= 6) return;
+
+        int idx = notesCount;
+        string name = "Note ${idx + 1}";
+        string path = "/home/user/notes/note${idx + 1}.txt";
+        setNoteListName(idx, name);
+        setNoteListPath(idx, path);
+        notesCount = notesCount + 1;
+
+        # Clear editor for new note
+        notesSelected = idx;
+        notesLineCount = 1;
+        setLine(0, "");
+        notesCursorRow = 0;
+        notesCursorCol = 0;
+        notesScrollY = 0;
+        notesModified = false;
+        notesStatusMsg = "New note created";
+        notesStatusTimer = 120;
+    }
+
+    private static func saveCurrentNote() -> void {
+        string path = getNoteListPath(notesSelected);
+
+        # Build content string from lines
+        string content = "";
+        for (int i = 0; i < notesLineCount; i++) {
+            if (i > 0) content = content + "\n";
+            content = content + getLine(i);
+        }
+
+        VFS.write(path, content);
+        notesModified = false;
+        notesStatusMsg = "Saved";
+        notesStatusTimer = 90;
+    }
+
+    private static func loadContent(string content) -> void {
+        notesLineCount = 0;
+        int start = 0;
+        for (int i = 0; i < content.length; i++) {
+            if (content[i] == '\n') {
+                if (notesLineCount >= NOTES_MAX_BUF) break;
+                setLine(notesLineCount, content.substring(start, i));
+                notesLineCount = notesLineCount + 1;
+                start = i + 1;
+            }
+        }
+        # Last line (no trailing newline)
+        if (start <= content.length && notesLineCount < NOTES_MAX_BUF) {
+            setLine(notesLineCount, content.substring(start, content.length));
+            notesLineCount = notesLineCount + 1;
+        }
+        if (notesLineCount == 0) {
+            notesLineCount = 1;
+            setLine(0, "");
+        }
+    }
+
+    private static func ensureCursorVisible() -> void {
+        if (notesCursorRow < notesScrollY) {
+            notesScrollY = notesCursorRow;
+        }
+        # Approximate visible lines (assume ~20)
+        int visible = 20;
+        if (notesCursorRow >= notesScrollY + visible) {
+            notesScrollY = notesCursorRow - visible + 1;
+        }
+    }
+
+    private static func clampCursorCol() -> void {
+        string line = getLine(notesCursorRow);
+        if (notesCursorCol > line.length) notesCursorCol = line.length;
+    }
+
+    # ========================================================================
+    # Internal — Rename note
+    # ========================================================================
+
+    private static func startRename() -> void {
+        notesRenaming = true;
+        notesRenameIdx = notesSelected;
+        notesRenameBuffer = getNoteListName(notesSelected);
+    }
+
+    private static func handleRenameInput(KeyEvent event) -> void {
+        # Escape — cancel
+        if (event.scancode == 1) {
+            notesRenaming = false;
+            notesRenameIdx = -1;
+            return;
+        }
+
+        # Enter — commit rename
+        if (event.scancode == 28) {
+            commitRename();
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            if (notesRenameBuffer.length > 0) {
+                notesRenameBuffer = notesRenameBuffer.substring(0, notesRenameBuffer.length - 1);
+            }
+            return;
+        }
+
+        # Printable characters
+        if (event.ascii >= 32 && event.ascii < 127) {
+            if (notesRenameBuffer.length < 30) {
+                notesRenameBuffer = notesRenameBuffer + "${event.ascii}";
+            }
+        }
+    }
+
+    private static func commitRename() -> void {
+        if (notesRenameBuffer.length == 0) {
+            notesRenaming = false;
+            notesRenameIdx = -1;
+            return;
+        }
+
+        string oldName = getNoteListName(notesRenameIdx);
+        if (oldName == notesRenameBuffer) {
+            notesRenaming = false;
+            notesRenameIdx = -1;
+            return;
+        }
+
+        # Update display name
+        setNoteListName(notesRenameIdx, notesRenameBuffer);
+
+        # Build new file path from new name
+        string safeName = "";
+        for (int i = 0; i < notesRenameBuffer.length; i++) {
+            char c = notesRenameBuffer.charAt(i);
+            if (c == ' ') {
+                safeName = safeName + "_";
+            } elif ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+                safeName = safeName + "${c}";
+            }
+        }
+        if (safeName.length == 0) safeName = "note";
+
+        string oldPath = getNoteListPath(notesRenameIdx);
+        string newPath = "/home/user/notes/" + safeName + ".txt";
+
+        # Rename file in VFS if it exists
+        if (oldPath != newPath) {
+            if (VFS.exists(oldPath)) {
+                VFS.rename(oldPath, newPath);
+            }
+            setNoteListPath(notesRenameIdx, newPath);
+        }
+
+        notesRenaming = false;
+        notesRenameIdx = -1;
+        notesStatusMsg = "Renamed to: " + notesRenameBuffer;
+        notesStatusTimer = 120;
+    }
+
+    # ========================================================================
+    # Internal — Data accessors (switch-based parallel array pattern)
+    # ========================================================================
+
+    private static func getLine(int i) -> string {
+        switch (i) {
+            case 0: return noteLine0;   case 1: return noteLine1;
+            case 2: return noteLine2;   case 3: return noteLine3;
+            case 4: return noteLine4;   case 5: return noteLine5;
+            case 6: return noteLine6;   case 7: return noteLine7;
+            case 8: return noteLine8;   case 9: return noteLine9;
+            case 10: return noteLine10; case 11: return noteLine11;
+            case 12: return noteLine12; case 13: return noteLine13;
+            case 14: return noteLine14; case 15: return noteLine15;
+            case 16: return noteLine16; case 17: return noteLine17;
+            case 18: return noteLine18; case 19: return noteLine19;
+            case 20: return noteLine20; case 21: return noteLine21;
+            case 22: return noteLine22; case 23: return noteLine23;
+            case 24: return noteLine24; case 25: return noteLine25;
+            case 26: return noteLine26; case 27: return noteLine27;
+            case 28: return noteLine28; case 29: return noteLine29;
+            case 30: return noteLine30; case 31: return noteLine31;
+            default: return "";
+        }
+    }
+
+    private static func setLine(int i, string val) -> void {
+        switch (i) {
+            case 0: noteLine0 = val;   case 1: noteLine1 = val;
+            case 2: noteLine2 = val;   case 3: noteLine3 = val;
+            case 4: noteLine4 = val;   case 5: noteLine5 = val;
+            case 6: noteLine6 = val;   case 7: noteLine7 = val;
+            case 8: noteLine8 = val;   case 9: noteLine9 = val;
+            case 10: noteLine10 = val; case 11: noteLine11 = val;
+            case 12: noteLine12 = val; case 13: noteLine13 = val;
+            case 14: noteLine14 = val; case 15: noteLine15 = val;
+            case 16: noteLine16 = val; case 17: noteLine17 = val;
+            case 18: noteLine18 = val; case 19: noteLine19 = val;
+            case 20: noteLine20 = val; case 21: noteLine21 = val;
+            case 22: noteLine22 = val; case 23: noteLine23 = val;
+            case 24: noteLine24 = val; case 25: noteLine25 = val;
+            case 26: noteLine26 = val; case 27: noteLine27 = val;
+            case 28: noteLine28 = val; case 29: noteLine29 = val;
+            case 30: noteLine30 = val; case 31: noteLine31 = val;
+        }
+    }
+
+    private static func getNoteListName(int i) -> string {
+        switch (i) {
+            case 0: return noteListName0; case 1: return noteListName1;
+            case 2: return noteListName2; case 3: return noteListName3;
+            case 4: return noteListName4; case 5: return noteListName5;
+            default: return "";
+        }
+    }
+
+    private static func setNoteListName(int i, string val) -> void {
+        switch (i) {
+            case 0: noteListName0 = val; case 1: noteListName1 = val;
+            case 2: noteListName2 = val; case 3: noteListName3 = val;
+            case 4: noteListName4 = val; case 5: noteListName5 = val;
+        }
+    }
+
+    private static func getNoteListPath(int i) -> string {
+        switch (i) {
+            case 0: return noteListPath0; case 1: return noteListPath1;
+            case 2: return noteListPath2; case 3: return noteListPath3;
+            case 4: return noteListPath4; case 5: return noteListPath5;
+            default: return "";
+        }
+    }
+
+    private static func setNoteListPath(int i, string val) -> void {
+        switch (i) {
+            case 0: noteListPath0 = val; case 1: noteListPath1 = val;
+            case 2: noteListPath2 = val; case 3: noteListPath3 = val;
+            case 4: noteListPath4 = val; case 5: noteListPath5 = val;
+        }
+    }
+}

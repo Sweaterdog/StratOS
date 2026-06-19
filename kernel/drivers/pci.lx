@@ -1,0 +1,251 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// PCI Bus Driver — Configuration Space Access for PCI devices
+// kernel/drivers/pci.lx
+//
+// Provides PCI configuration space read/write via I/O ports 0xCF8 / 0xCFC.
+// Also performs bus enumeration to discover devices at boot time.
+//
+// PCI configuration address format (32-bit write to 0xCF8):
+//   Bit 31:     Enable (always 1)
+//   Bits 23-16: Bus number
+//   Bits 15-11: Device number
+//   Bits 10-8:  Function number
+//   Bits 7-2:   Register offset (DWORD aligned)
+//   Bits 1-0:   Always 0
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+import "kernel/core/console.lx";
+
+# PCI I/O ports
+int PCI_CONFIG_ADDRESS = 0x0CF8;
+int PCI_CONFIG_DATA    = 0x0CFC;
+
+# Maximum values
+int PCI_MAX_BUS    = 256;
+int PCI_MAX_DEVICE = 32;
+int PCI_MAX_FUNC   = 8;
+
+# Discovered PCI device record
+export struct PciDevice {
+    int bus;
+    int device;
+    int function;
+    int vendorId;
+    int deviceId;
+    int classCode;
+    int subclass;
+    int progIf;
+    int headerType;
+    int irqLine;
+    long bar0;
+    long bar1;
+    long bar2;
+    long bar3;
+    long bar4;
+    long bar5;
+}
+
+# Store discovered devices (up to 64)
+int pciDeviceCount = 0;
+list<PciDevice> pciDevices = [];
+
+export class PCI {
+
+    # ========================================================================
+    # Build a PCI config address DWORD from bus/device/function/register
+    # ========================================================================
+    public static func configAddress(int bus, int device, int function, int reg) -> int {
+        # Enable bit (31) | bus (23:16) | device (15:11) | function (10:8) | register (7:2)
+        int addr = 0;
+        addr = addr | (1 << 31);                     # Enable bit
+        addr = addr | ((bus & 0xFF) << 16);           # Bus
+        addr = addr | ((device & 0x1F) << 11);        # Device
+        addr = addr | ((function & 0x07) << 8);       # Function
+        addr = addr | (reg & 0xFC);                   # Register (aligned)
+        return addr;
+    }
+
+    # ========================================================================
+    # Read a 32-bit value from PCI configuration space
+    # ========================================================================
+    public static func readConfig(int bus, int device, int function, int reg) -> int {
+        int addr = configAddress(bus, device, function, reg);
+        outl(PCI_CONFIG_ADDRESS, addr);
+        return inl(PCI_CONFIG_DATA);
+    }
+
+    # ========================================================================
+    # Write a 32-bit value to PCI configuration space
+    # ========================================================================
+    public static func writeConfig(int bus, int device, int function, int reg, int value) -> void {
+        int addr = configAddress(bus, device, function, reg);
+        outl(PCI_CONFIG_ADDRESS, addr);
+        outl(PCI_CONFIG_DATA, value);
+    }
+
+    # ========================================================================
+    # Read vendor/device ID from a PCI slot
+    # Returns vendorId in low 16 bits, deviceId in high 16 bits
+    # ========================================================================
+    public static func readVendorDevice(int bus, int device, int function) -> int {
+        return readConfig(bus, device, function, 0x00);
+    }
+
+    # ========================================================================
+    # Read class/subclass from PCI config register 0x08
+    # ========================================================================
+    public static func readClass(int bus, int device, int function) -> int {
+        return readConfig(bus, device, function, 0x08);
+    }
+
+    # ========================================================================
+    # Read BAR (Base Address Register) value
+    # barIndex: 0-5 (BARs at config offsets 0x10-0x24)
+    # ========================================================================
+    public static func readBAR(int bus, int device, int function, int barIndex) -> long {
+        int reg = 0x10 + (barIndex * 4);
+        int val = readConfig(bus, device, function, reg);
+
+        # Zero-extend 32-bit int to 64-bit long (avoid sign extension)
+        long mask32 = (((long) 1) << 32) - 1;
+        long val64 = ((long) val) & mask32;
+
+        # Check if this is a 64-bit memory BAR
+        if ((val & 0x01) == 0 && ((val >> 1) & 0x03) == 2 && barIndex < 5) {
+            # 64-bit BAR: combine with the next register
+            int high = readConfig(bus, device, function, reg + 4);
+            long base = val64 & ~((long) 0x0F);
+            long highPart = ((long) high) & mask32;
+            base = base | (highPart << 32);
+            return base;
+        }
+
+        # 32-bit memory BAR or I/O BAR
+        if ((val & 0x01) == 0) {
+            return val64 & ~((long) 0x0F);
+        } else {
+            return val64 & ~((long) 0x03);
+        }
+    }
+
+    # ========================================================================
+    # Read IRQ line from PCI config register 0x3C (byte 0)
+    # ========================================================================
+    public static func readIRQ(int bus, int device, int function) -> int {
+        int val = readConfig(bus, device, function, 0x3C);
+        return val & 0xFF;
+    }
+
+    # ========================================================================
+    # Enable bus mastering for a PCI device
+    # Set bit 2 of the Command register (offset 0x04)
+    # ========================================================================
+    public static func enableBusMaster(int bus, int device, int function) -> void {
+        int cmd = readConfig(bus, device, function, 0x04);
+        cmd = cmd | 0x07;   # I/O Space + Memory Space + Bus Master
+        writeConfig(bus, device, function, 0x04, cmd);
+    }
+
+    # ========================================================================
+    # Enumerate the PCI bus and discover all devices
+    # ========================================================================
+    public static func enumerate() -> void {
+        pciDeviceCount = 0;
+
+        for (int bus = 0; bus < PCI_MAX_BUS; bus++) {
+            for (int dev = 0; dev < PCI_MAX_DEVICE; dev++) {
+                int vendorDevice = readVendorDevice(bus, dev, 0);
+                int vendorId = vendorDevice & 0xFFFF;
+
+                # No device present
+                if (vendorId == 0xFFFF || vendorId == 0x0000) continue;
+
+                # Check all functions
+                int headerType = (readConfig(bus, dev, 0, 0x0C) >> 16) & 0xFF;
+                int maxFunc = 1;
+                if ((headerType & 0x80) != 0) maxFunc = PCI_MAX_FUNC;
+
+                for (int fn = 0; fn < maxFunc; fn++) {
+                    if (fn > 0) {
+                        vendorDevice = readVendorDevice(bus, dev, fn);
+                        vendorId = vendorDevice & 0xFFFF;
+                        if (vendorId == 0xFFFF) continue;
+                    }
+
+                    int deviceId = (vendorDevice >> 16) & 0xFFFF;
+                    int classReg = readClass(bus, dev, fn);
+                    int classCode = (classReg >> 24) & 0xFF;
+                    int subclass = (classReg >> 16) & 0xFF;
+                    int progIf = (classReg >> 8) & 0xFF;
+                    int irq = readIRQ(bus, dev, fn);
+                    int htype = (readConfig(bus, dev, fn, 0x0C) >> 16) & 0x7F;
+
+                    PciDevice pdev;
+                    pdev.bus = bus;
+                    pdev.device = dev;
+                    pdev.function = fn;
+                    pdev.vendorId = vendorId;
+                    pdev.deviceId = deviceId;
+                    pdev.classCode = classCode;
+                    pdev.subclass = subclass;
+                    pdev.progIf = progIf;
+                    pdev.headerType = htype;
+                    pdev.irqLine = irq;
+                    pdev.bar0 = readBAR(bus, dev, fn, 0);
+                    pdev.bar1 = readBAR(bus, dev, fn, 1);
+                    pdev.bar2 = readBAR(bus, dev, fn, 2);
+                    pdev.bar3 = readBAR(bus, dev, fn, 3);
+                    pdev.bar4 = readBAR(bus, dev, fn, 4);
+                    pdev.bar5 = readBAR(bus, dev, fn, 5);
+
+                    pciDevices.add(pdev);
+                    pciDeviceCount++;
+                }
+            }
+        }
+
+        Console.log("[  OK  ] PCI: ${pciDeviceCount} devices found");
+    }
+
+    # ========================================================================
+    # Find a PCI device by vendor and device ID
+    # Returns the device index, or -1 if not found
+    # ========================================================================
+    public static func findDevice(int vendorId, int deviceId) -> int {
+        for (int i = 0; i < pciDevices.length; i++) {
+            if (pciDevices[i].vendorId == vendorId && pciDevices[i].deviceId == deviceId) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    # ========================================================================
+    # Find a PCI device by class code and subclass
+    # Returns the device index, or -1 if not found
+    # ========================================================================
+    public static func findByClass(int classCode, int subclass) -> int {
+        for (int i = 0; i < pciDevices.length; i++) {
+            if (pciDevices[i].classCode == classCode && pciDevices[i].subclass == subclass) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    # ========================================================================
+    # Get a discovered PCI device by index
+    # ========================================================================
+    public static func getDevice(int index) -> PciDevice {
+        return pciDevices[index];
+    }
+
+    # ========================================================================
+    # Get total number of discovered devices
+    # ========================================================================
+    public static func getDeviceCount() -> int {
+        return pciDeviceCount;
+    }
+}

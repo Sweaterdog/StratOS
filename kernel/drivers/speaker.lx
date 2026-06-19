@@ -1,0 +1,88 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// PC Speaker Driver — Hardware beep generator for StratOS
+// kernel/drivers/speaker.lx
+//
+// Uses PIT channel 2 and the PC speaker gate to produce tones.
+// Non-blocking: call Speaker.update() each frame to auto-stop.
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+import "kernel/drivers/timer.lx";
+
+# Speaker state
+bool speakerPlaying = false;
+long speakerStopTick = 0;
+
+export class Speaker {
+
+    public static func init() -> void {
+        speakerPlaying = false;
+        speakerStopTick = 0;
+    }
+
+    # Play a tone at the given frequency (Hz) for the given duration (ms)
+    # Non-blocking — call update() each frame to auto-stop
+    public static func beep(int freq, int durationMs) -> void {
+        if (freq < 20 || freq > 20000) return;
+
+        # Calculate PIT divisor: 1193180 / freq
+        int divisor = 1193180 / freq;
+
+        # Configure PIT channel 2 for square wave (mode 3, lobyte/hibyte)
+        outb(0x43, (byte)0xB6);
+        outb(0x42, (byte)(divisor & 0xFF));
+        outb(0x42, (byte)((divisor >> 8) & 0xFF));
+
+        # Enable speaker gate (set bits 0 and 1 of port 0x61)
+        byte val = inb(0x61);
+        val = (byte)((int)val | 3);
+        outb(0x61, val);
+
+        speakerPlaying = true;
+        int tickDuration = durationMs * Timer.getFrequency() / 1000;
+        if (tickDuration < 1) tickDuration = 1;
+        speakerStopTick = Timer.getTicks() + (long)tickDuration;
+    }
+
+    # Stop any playing tone immediately
+    public static func stop() -> void {
+        if (!speakerPlaying) return;
+        byte val = inb(0x61);
+        val = (byte)((int)val & 0xFC);
+        outb(0x61, val);
+        speakerPlaying = false;
+    }
+
+    # Call each frame to auto-stop expired tones
+    public static func update() -> void {
+        if (speakerPlaying && Timer.getTicks() >= speakerStopTick) {
+            stop();
+        }
+    }
+
+    # Convenience: short click sound
+    public static func click() -> void {
+        beep(800, 15);
+    }
+
+    # Convenience: window open chime (ascending)
+    public static func chimeOpen() -> void {
+        beep(600, 40);
+    }
+
+    # Convenience: window close sound
+    public static func chimeClose() -> void {
+        beep(400, 30);
+    }
+
+    # Convenience: notification ping
+    public static func notify() -> void {
+        beep(1000, 50);
+    }
+
+    # Convenience: error buzz
+    public static func error() -> void {
+        beep(200, 80);
+    }
+}

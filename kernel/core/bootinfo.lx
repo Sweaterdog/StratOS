@@ -1,0 +1,39 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// BootInfo — Shared structure between bootloader and kernel
+// kernel/core/bootinfo.lx
+//
+// Both UEFI and BIOS bootloaders populate this identical struct and pass
+// a pointer to it via RDI when jumping to kernel_main().
+// ============================================================================
+
+export struct BootInfo {
+    long framebufferBase;       # Physical address of linear framebuffer
+    int framebufferSize;        # Size in bytes
+    int screenWidth;            # Horizontal resolution in pixels
+    int screenHeight;           # Vertical resolution in pixels
+    int pixelsPerScanline;      # Pixels per scanline (may differ from width)
+    long memoryMap;             # Pointer to memory map entries
+    int memoryMapSize;          # Total size of memory map in bytes
+    int memoryMapDescSize;      # Size of each memory map descriptor
+    int memoryMapKey;           # Memory map key (for UEFI ExitBootServices)
+}
+
+# Memory map entry types (UEFI/E820 unified)
+export enum MemoryType {
+    RESERVED = 0,
+    USABLE = 1,
+    ACPI_RECLAIMABLE = 3,
+    ACPI_NVS = 4,
+    BAD_MEMORY = 5,
+    BOOTLOADER_RECLAIMABLE = 6,
+    KERNEL_AND_MODULES = 7,
+    FRAMEBUFFER = 8
+}
+
+export struct MemoryMapEntry {
+    long base;                  # Physical base address
+    long length;                # Length in bytes
+    int type;                   # MemoryType
+    int attributes;             # Extended attributes
+}

@@ -1,0 +1,565 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Pulsar Music Player — Music playback app for StratOS
+// apps/music/player.lx
+//
+// Features:
+//   - Demo playlist with track metadata
+//   - Play/pause, next/previous, shuffle, repeat controls
+//   - Now Playing view with album art visualization
+//   - Playlist view with track list
+//   - Volume control
+//   - Keyboard and mouse controls
+//   - Progress bar with position tracking
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Player state
+bool musicPlaying = false;
+bool musicShuffled = false;
+int musicRepeat = 0;           # 0=off, 1=all, 2=one
+int musicVolume = 80;
+
+# Track data (parallel arrays, max 8 tracks)
+int musicTrackCount = 7;
+int musicCurrent = -1;
+int musicPositionMs = 0;
+int musicDurationMs = 0;
+
+string trackTitle0 = "Stellar Drift";      string trackArtist0 = "StratOS";  int trackDur0 = 180000;
+string trackTitle1 = "Nebula Pulse";        string trackArtist1 = "StratOS";  int trackDur1 = 210000;
+string trackTitle2 = "Void Echo";           string trackArtist2 = "StratOS";  int trackDur2 = 165000;
+string trackTitle3 = "Cosmic Frequencies";  string trackArtist3 = "StratOS";  int trackDur3 = 240000;
+string trackTitle4 = "Dark Matter";         string trackArtist4 = "StratOS";  int trackDur4 = 195000;
+string trackTitle5 = "Orbital Decay";       string trackArtist5 = "StratOS";  int trackDur5 = 225000;
+string trackTitle6 = "Event Horizon";       string trackArtist6 = "StratOS";  int trackDur6 = 200000;
+
+# View state
+int MUSIC_VIEW_PLAYING  = 0;
+int MUSIC_VIEW_PLAYLIST = 1;
+int musicView = 0;
+int musicListSelected = 0;
+
+# Layout
+int MUSIC_SIDEBAR_W   = 140;
+int MUSIC_CONTROLS_H  = 72;
+
+export class MusicApp {
+    # Initialize the music player
+    public static func init() -> void {
+        musicPlaying = false;
+        musicShuffled = false;
+        musicRepeat = 0;
+        musicVolume = 80;
+        musicCurrent = 0;
+        musicPositionMs = 0;
+        musicDurationMs = trackDur0;
+        musicView = 0;
+        musicListSelected = 0;
+    }
+
+    # Process a keyboard event from the compositor
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Space — play/pause
+        if (event.scancode == 57) {
+            togglePlayPause();
+            return;
+        }
+
+        # Right arrow — next track
+        if (event.scancode == KEY_RIGHT) {
+            nextTrack();
+            return;
+        }
+
+        # Left arrow — previous track
+        if (event.scancode == KEY_LEFT) {
+            prevTrack();
+            return;
+        }
+
+        # Up arrow — volume up
+        if (event.scancode == KEY_UP) {
+            musicVolume = musicVolume + 5;
+            if (musicVolume > 100) musicVolume = 100;
+            return;
+        }
+
+        # Down arrow — volume down
+        if (event.scancode == KEY_DOWN) {
+            musicVolume = musicVolume - 5;
+            if (musicVolume < 0) musicVolume = 0;
+            return;
+        }
+
+        # R — toggle repeat
+        if (event.ascii == 'r') {
+            musicRepeat = (musicRepeat + 1) % 3;
+            return;
+        }
+
+        # S — toggle shuffle
+        if (event.ascii == 's') {
+            musicShuffled = !musicShuffled;
+            return;
+        }
+
+        # 1 — Now Playing view
+        if (event.ascii == '1') {
+            musicView = MUSIC_VIEW_PLAYING;
+            return;
+        }
+
+        # 2 — Playlist view
+        if (event.ascii == '2') {
+            musicView = MUSIC_VIEW_PLAYLIST;
+            return;
+        }
+
+        # Tab — toggle view
+        if (event.scancode == 15) {
+            musicView = (musicView + 1) % 2;
+            return;
+        }
+    }
+
+    # Process a mouse click in the content area
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int controlsY = contentH - MUSIC_CONTROLS_H;
+
+        # Sidebar clicks
+        if (relX < MUSIC_SIDEBAR_W) {
+            int itemStartY = 20;
+            int itemH = 32;
+            int clickedItem = (relY - itemStartY) / itemH;
+            if (clickedItem == 0) musicView = MUSIC_VIEW_PLAYING;
+            elif (clickedItem == 1) musicView = MUSIC_VIEW_PLAYLIST;
+            return;
+        }
+
+        # Control bar clicks
+        if (relY >= controlsY) {
+            int controlRelX = relX;
+            int centerX = contentW / 2;
+
+            # Play/pause button area (center, ±20px)
+            if (controlRelX >= centerX - 20 && controlRelX <= centerX + 20) {
+                togglePlayPause();
+                return;
+            }
+
+            # Previous button (center - 60 to center - 30)
+            if (controlRelX >= centerX - 60 && controlRelX < centerX - 30) {
+                prevTrack();
+                return;
+            }
+
+            # Next button (center + 30 to center + 60)
+            if (controlRelX >= centerX + 30 && controlRelX < centerX + 60) {
+                nextTrack();
+                return;
+            }
+
+            # Shuffle button (center - 110 to center - 80)
+            if (controlRelX >= centerX - 110 && controlRelX < centerX - 80) {
+                musicShuffled = !musicShuffled;
+                return;
+            }
+
+            # Repeat button (center + 80 to center + 110)
+            if (controlRelX >= centerX + 80 && controlRelX < centerX + 110) {
+                musicRepeat = (musicRepeat + 1) % 3;
+                return;
+            }
+
+            # Volume bar (right side, x > contentW - 160)
+            if (controlRelX >= contentW - 160 && controlRelX < contentW - 20) {
+                int volBarX = contentW - 140;
+                int volBarW = 100;
+                int volClick = controlRelX - volBarX;
+                if (volClick < 0) volClick = 0;
+                if (volClick > volBarW) volClick = volBarW;
+                musicVolume = volClick * 100 / volBarW;
+                return;
+            }
+
+            return;
+        }
+
+        # Playlist view — click on track
+        if (musicView == MUSIC_VIEW_PLAYLIST) {
+            int listRelY = relY;
+            int itemH = 44;
+            int clickedTrack = listRelY / itemH;
+            if (clickedTrack >= 0 && clickedTrack < musicTrackCount) {
+                musicCurrent = clickedTrack;
+                musicPositionMs = 0;
+                musicDurationMs = getTrackDuration(clickedTrack);
+                musicPlaying = true;
+            }
+        }
+    }
+
+    # Draw the music player UI
+    public static func draw(int x, int y, int w, int h) -> void {
+        # Update playback position (advance each frame ~16ms)
+        if (musicPlaying && musicCurrent >= 0) {
+            musicPositionMs = musicPositionMs + 16;
+            if (musicPositionMs >= musicDurationMs) {
+                if (musicRepeat == 2) {
+                    musicPositionMs = 0;
+                } else {
+                    nextTrack();
+                }
+            }
+        }
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0A0E1AFF);
+
+        # Sidebar
+        int sideW = MUSIC_SIDEBAR_W;
+        if (sideW > w / 3) sideW = w / 3;
+        drawSidebar(x, y, sideW, h - MUSIC_CONTROLS_H);
+
+        # Main content area
+        int contentX = x + sideW;
+        int contentW = w - sideW;
+        int contentH = h - MUSIC_CONTROLS_H;
+
+        if (musicView == MUSIC_VIEW_PLAYING) {
+            drawNowPlaying(contentX, y, contentW, contentH);
+        } else {
+            drawPlaylist(contentX, y, contentW, contentH);
+        }
+
+        # Bottom control bar
+        drawControls(x, y + h - MUSIC_CONTROLS_H, w, MUSIC_CONTROLS_H);
+    }
+
+    # ========================================================================
+    # Internal — Playback
+    # ========================================================================
+
+    private static func togglePlayPause() -> void {
+        if (musicCurrent < 0 && musicTrackCount > 0) {
+            musicCurrent = 0;
+            musicPlaying = true;
+            musicPositionMs = 0;
+            musicDurationMs = getTrackDuration(0);
+            return;
+        }
+        musicPlaying = !musicPlaying;
+    }
+
+    private static func nextTrack() -> void {
+        if (musicTrackCount == 0) return;
+
+        if (musicShuffled) {
+            musicCurrent = (musicCurrent * 7 + 3) % musicTrackCount;
+        } else {
+            musicCurrent = musicCurrent + 1;
+            if (musicCurrent >= musicTrackCount) {
+                if (musicRepeat == 1) {
+                    musicCurrent = 0;
+                } else {
+                    musicCurrent = musicTrackCount - 1;
+                    musicPlaying = false;
+                    return;
+                }
+            }
+        }
+        musicPositionMs = 0;
+        musicDurationMs = getTrackDuration(musicCurrent);
+        musicPlaying = true;
+    }
+
+    private static func prevTrack() -> void {
+        if (musicTrackCount == 0) return;
+
+        if (musicPositionMs > 3000) {
+            musicPositionMs = 0;
+        } else {
+            musicCurrent = musicCurrent - 1;
+            if (musicCurrent < 0) musicCurrent = 0;
+            musicPositionMs = 0;
+            musicDurationMs = getTrackDuration(musicCurrent);
+        }
+    }
+
+    # ========================================================================
+    # Internal — Rendering
+    # ========================================================================
+
+    private static func drawSidebar(int x, int y, int w, int h) -> void {
+        Framebuffer.fillRect(x, y, w, h, 0x080C14FF);
+        Framebuffer.drawVLine(x + w - 1, y, h, 0x1A2332FF);
+
+        int itemY = y + 20;
+        int items = 2;
+        for (int i = 0; i < items; i++) {
+            bool isActive = (i == musicView);
+            if (isActive) {
+                Framebuffer.fillRect(x, itemY, w - 1, 28, 0x1A2332FF);
+                Framebuffer.fillRect(x, itemY, 3, 28, Theme.textAccent);
+            }
+
+            string label = "Now Playing";
+            if (i == 1) label = "Playlist";
+
+            color32 labelColor = isActive ? 0xE6EDF3FF : 0x8B949EFF;
+            TextRender.drawText(label, x + 16, itemY + 6, labelColor);
+            itemY = itemY + 32;
+        }
+    }
+
+    private static func drawNowPlaying(int x, int y, int w, int h) -> void {
+        int centerX = x + w / 2;
+
+        # Album art placeholder (large circle with glow)
+        int artSize = 120;
+        if (artSize > w - 40) artSize = w - 40;
+        if (artSize > h - 120) artSize = h - 120;
+        int artCenterY = y + 20 + artSize / 2;
+
+        # Outer glow
+        Framebuffer.fillCircle(centerX, artCenterY, artSize / 2 + 15, 0x5B8CFF10);
+        Framebuffer.fillCircle(centerX, artCenterY, artSize / 2 + 8, 0x5B8CFF20);
+
+        # Album art background
+        Framebuffer.fillCircle(centerX, artCenterY, artSize / 2, 0x1A2332FF);
+
+        # Spinning disc rings
+        if (musicPlaying) {
+            Framebuffer.drawCircle(centerX, artCenterY, artSize / 2 - 8, 0x2A3442FF);
+            Framebuffer.drawCircle(centerX, artCenterY, artSize / 2 - 20, 0x2A3442FF);
+            Framebuffer.drawCircle(centerX, artCenterY, artSize / 2 - 32, 0x2A3442FF);
+        }
+
+        # Center dot
+        Framebuffer.fillCircle(centerX, artCenterY, 5, Theme.textAccent);
+
+        # Track info below art
+        int infoY = artCenterY + artSize / 2 + 20;
+        if (musicCurrent >= 0) {
+            string title = getTrackTitle(musicCurrent);
+            string artist = getTrackArtist(musicCurrent);
+            int titleW = title.length * 8;
+            int artistW = artist.length * 8;
+            TextRender.drawText(title, centerX - titleW / 2, infoY, 0xE6EDF3FF);
+            TextRender.drawText(artist, centerX - artistW / 2, infoY + 20, 0x8B949EFF);
+        } else {
+            TextRender.drawText("No track selected", centerX - 68, infoY, 0x484F58FF);
+        }
+
+        # Progress bar
+        int barW = w - 80;
+        int barX = x + 40;
+        int barY = infoY + 50;
+        if (barY < y + h - 20) {
+            Framebuffer.fillRoundedRect(barX, barY, barW, 4, 2, 0x1A2332FF);
+
+            if (musicDurationMs > 0) {
+                int progressW = barW * musicPositionMs / musicDurationMs;
+                if (progressW > barW) progressW = barW;
+                Framebuffer.fillRoundedRect(barX, barY, progressW, 4, 2, Theme.textAccent);
+                Framebuffer.fillCircle(barX + progressW, barY + 2, 5, 0xE6EDF3FF);
+            }
+
+            # Time labels
+            string posTime = formatTime(musicPositionMs);
+            string durTime = formatTime(musicDurationMs);
+            TextRender.drawText(posTime, barX, barY + 10, 0x6B7280FF);
+            int durW = durTime.length * 8;
+            TextRender.drawText(durTime, barX + barW - durW, barY + 10, 0x6B7280FF);
+        }
+    }
+
+    private static func drawPlaylist(int x, int y, int w, int h) -> void {
+        int itemH = 44;
+
+        # Header
+        TextRender.drawText("Playlist", x + 16, y + 10, 0xE6EDF3FF);
+        int listY = y + 36;
+
+        for (int i = 0; i < musicTrackCount; i++) {
+            int itemY = listY + i * itemH;
+            if (itemY + itemH > y + h) break;
+
+            # Highlight current track
+            if (i == musicCurrent) {
+                Framebuffer.fillRect(x, itemY, w, itemH, 0x1E3A5FFF);
+            } elif (i % 2 == 0) {
+                Framebuffer.fillRect(x, itemY, w, itemH, 0x0F1520FF);
+            }
+
+            # Playing indicator (animated bars)
+            if (i == musicCurrent && musicPlaying) {
+                int barBaseX = x + 16;
+                for (int b = 0; b < 3; b++) {
+                    int barH = 4 + ((Timer.getTicks() / 20 + b * 3) % 12);
+                    Framebuffer.fillRect(barBaseX + b * 4, itemY + itemH / 2 - barH / 2, 2, barH, Theme.textAccent);
+                }
+            } elif (i == musicCurrent) {
+                # Paused indicator
+                Framebuffer.fillRect(x + 16, itemY + itemH / 2 - 5, 3, 10, Theme.textAccent);
+                Framebuffer.fillRect(x + 22, itemY + itemH / 2 - 5, 3, 10, Theme.textAccent);
+            }
+
+            # Track number
+            string numStr = "${i + 1}";
+            color32 numColor = (i == musicCurrent) ? Theme.textAccent : 0x484F58FF;
+            TextRender.drawText(numStr, x + 36, itemY + 6, numColor);
+
+            # Title
+            string title = getTrackTitle(i);
+            color32 titleColor = (i == musicCurrent) ? 0xE6EDF3FF : 0xC9D1D9FF;
+            TextRender.drawText(title, x + 56, itemY + 6, titleColor);
+
+            # Artist
+            string artist = getTrackArtist(i);
+            TextRender.drawText(artist, x + 56, itemY + 24, 0x6B7280FF);
+
+            # Duration
+            string dur = formatTime(getTrackDuration(i));
+            int durW = dur.length * 8;
+            TextRender.drawText(dur, x + w - durW - 16, itemY + 14, 0x6B7280FF);
+        }
+    }
+
+    private static func drawControls(int x, int y, int w, int h) -> void {
+        Framebuffer.fillRect(x, y, w, h, 0x101824FF);
+        Framebuffer.drawHLine(x, y, w, 0x1A2332FF);
+
+        int centerX = x + w / 2;
+        int btnY = y + 20;
+
+        # Shuffle button
+        int shuffleX = centerX - 100;
+        color32 shuffleColor = musicShuffled ? Theme.textAccent : 0x4A5568FF;
+        Framebuffer.fillCircle(shuffleX, btnY + 8, 8, shuffleColor);
+        TextRender.drawText("S", shuffleX - 3, btnY + 1, 0x0A0E1AFF);
+
+        # Previous button
+        int prevBtnX = centerX - 50;
+        Framebuffer.fillCircle(prevBtnX, btnY + 8, 12, 0x1A2332FF);
+        TextRender.drawText("<", prevBtnX - 3, btnY + 1, 0xC9D1D9FF);
+
+        # Play/Pause button
+        Framebuffer.fillCircle(centerX, btnY + 8, 16, 0xE6EDF3FF);
+        if (musicPlaying) {
+            # Pause bars
+            Framebuffer.fillRect(centerX - 5, btnY, 4, 16, 0x0A0E1AFF);
+            Framebuffer.fillRect(centerX + 2, btnY, 4, 16, 0x0A0E1AFF);
+        } else {
+            # Play triangle (approx)
+            Framebuffer.fillRect(centerX - 3, btnY, 2, 16, 0x0A0E1AFF);
+            Framebuffer.fillRect(centerX - 1, btnY + 2, 2, 12, 0x0A0E1AFF);
+            Framebuffer.fillRect(centerX + 1, btnY + 4, 2, 8, 0x0A0E1AFF);
+            Framebuffer.fillRect(centerX + 3, btnY + 6, 2, 4, 0x0A0E1AFF);
+        }
+
+        # Next button
+        int nextBtnX = centerX + 50;
+        Framebuffer.fillCircle(nextBtnX, btnY + 8, 12, 0x1A2332FF);
+        TextRender.drawText(">", nextBtnX - 3, btnY + 1, 0xC9D1D9FF);
+
+        # Repeat button
+        int repeatBtnX = centerX + 100;
+        color32 repeatColor = (musicRepeat > 0) ? Theme.textAccent : 0x4A5568FF;
+        Framebuffer.fillCircle(repeatBtnX, btnY + 8, 8, repeatColor);
+        string repeatLabel = "R";
+        if (musicRepeat == 2) repeatLabel = "1";
+        TextRender.drawText(repeatLabel, repeatBtnX - 3, btnY + 1, 0x0A0E1AFF);
+
+        # Volume bar (right side)
+        int volLabelX = x + w - 160;
+        TextRender.drawText("Vol", volLabelX, btnY + 1, 0x6B7280FF);
+        int volX = x + w - 130;
+        int volW = 100;
+        int volBarY = btnY + 6;
+        Framebuffer.fillRoundedRect(volX, volBarY, volW, 4, 2, 0x1A2332FF);
+        int volFill = volW * musicVolume / 100;
+        Framebuffer.fillRoundedRect(volX, volBarY, volFill, 4, 2, Theme.textAccent);
+        Framebuffer.fillCircle(volX + volFill, volBarY + 2, 5, 0xE6EDF3FF);
+
+        # Now playing info (left side of controls)
+        if (musicCurrent >= 0) {
+            string title = getTrackTitle(musicCurrent);
+            string artist = getTrackArtist(musicCurrent);
+            TextRender.drawText(title, x + 16, y + 12, 0xE6EDF3FF);
+            TextRender.drawText(artist, x + 16, y + 30, 0x6B7280FF);
+
+            # Mini progress bar
+            int miniBarX = x + 16;
+            int miniBarW = 120;
+            int miniBarY = y + 50;
+            Framebuffer.fillRect(miniBarX, miniBarY, miniBarW, 2, 0x1A2332FF);
+            if (musicDurationMs > 0) {
+                int prog = miniBarW * musicPositionMs / musicDurationMs;
+                if (prog > miniBarW) prog = miniBarW;
+                Framebuffer.fillRect(miniBarX, miniBarY, prog, 2, Theme.textAccent);
+            }
+        }
+    }
+
+    # ========================================================================
+    # Internal — Data accessors
+    # ========================================================================
+
+    private static func getTrackTitle(int i) -> string {
+        switch (i) {
+            case 0: return trackTitle0;
+            case 1: return trackTitle1;
+            case 2: return trackTitle2;
+            case 3: return trackTitle3;
+            case 4: return trackTitle4;
+            case 5: return trackTitle5;
+            case 6: return trackTitle6;
+            default: return "";
+        }
+    }
+
+    private static func getTrackArtist(int i) -> string {
+        switch (i) {
+            case 0: return trackArtist0;
+            case 1: return trackArtist1;
+            case 2: return trackArtist2;
+            case 3: return trackArtist3;
+            case 4: return trackArtist4;
+            case 5: return trackArtist5;
+            case 6: return trackArtist6;
+            default: return "";
+        }
+    }
+
+    private static func getTrackDuration(int i) -> int {
+        switch (i) {
+            case 0: return trackDur0;
+            case 1: return trackDur1;
+            case 2: return trackDur2;
+            case 3: return trackDur3;
+            case 4: return trackDur4;
+            case 5: return trackDur5;
+            case 6: return trackDur6;
+            default: return 0;
+        }
+    }
+
+    private static func formatTime(int ms) -> string {
+        int totalSec = ms / 1000;
+        int min = totalSec / 60;
+        int sec = totalSec % 60;
+        if (sec < 10) {
+            return "${min}:0${sec}";
+        }
+        return "${min}:${sec}";
+    }
+}

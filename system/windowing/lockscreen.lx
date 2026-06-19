@@ -1,0 +1,234 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Lock Screen — Password-protected lock for StratOS
+// system/windowing/lockscreen.lx
+//
+// Features:
+//   - Full-screen lock overlay with animated clock
+//   - Password entry with masked input
+//   - Wrong password shake animation
+//   - Auto-lock timeout support
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Lock screen state
+bool lockActive = false;
+string lockPassword = "stratos";   # Default password
+string lockInput = "";
+string lockErrorMsg = "";
+int lockErrorTimer = 0;
+int lockShakeOffset = 0;
+int lockShakeTimer = 0;
+int lockIdleTicks = 0;
+int LOCK_IDLE_TIMEOUT = 30000;  # ~5 minutes at 100Hz (disabled if 0)
+bool lockIdleEnabled = false;
+
+export class LockScreen {
+
+    # Check if the lock screen is active
+    public static func isActive() -> bool {
+        return lockActive;
+    }
+
+    # Activate the lock screen
+    public static func lock() -> void {
+        lockActive = true;
+        lockInput = "";
+        lockErrorMsg = "";
+        lockErrorTimer = 0;
+        lockShakeOffset = 0;
+        lockShakeTimer = 0;
+    }
+
+    # Attempt to unlock
+    public static func tryUnlock() -> bool {
+        if (lockInput == lockPassword) {
+            lockActive = false;
+            lockInput = "";
+            lockErrorMsg = "";
+            lockIdleTicks = 0;
+            return true;
+        }
+        lockErrorMsg = "Incorrect password";
+        lockErrorTimer = 200;
+        lockShakeTimer = 20;
+        lockInput = "";
+        return false;
+    }
+
+    # Register idle activity (call each frame when unlocked)
+    public static func resetIdle() -> void {
+        lockIdleTicks = 0;
+    }
+
+    # Tick the idle counter — returns true if auto-lock triggered
+    public static func tickIdle() -> bool {
+        if (!lockIdleEnabled) return false;
+        if (lockActive) return false;
+        lockIdleTicks = lockIdleTicks + 1;
+        if (lockIdleTicks >= LOCK_IDLE_TIMEOUT) {
+            lock();
+            return true;
+        }
+        return false;
+    }
+
+    # Toggle auto-lock on/off
+    public static func toggleAutoLock() -> void {
+        lockIdleEnabled = !lockIdleEnabled;
+        lockIdleTicks = 0;
+    }
+
+    # Check if auto-lock is enabled
+    public static func isAutoLockEnabled() -> bool {
+        return lockIdleEnabled;
+    }
+
+    # Set the password
+    public static func setPassword(string pwd) -> void {
+        lockPassword = pwd;
+    }
+
+    # Process keyboard input on the lock screen
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Enter — try to unlock
+        if (event.scancode == 28) {
+            tryUnlock();
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            if (lockInput.length > 0) {
+                lockInput = lockInput.substring(0, lockInput.length - 1);
+            }
+            return;
+        }
+
+        # Escape — clear input
+        if (event.scancode == 1) {
+            lockInput = "";
+            return;
+        }
+
+        # Printable characters
+        if (event.ascii >= 32 && event.ascii < 127) {
+            if (lockInput.length < 32) {
+                lockInput = lockInput + "${event.ascii}";
+            }
+        }
+    }
+
+    # Draw the lock screen overlay
+    public static func draw(int screenW, int screenH) -> void {
+        if (!lockActive) return;
+
+        # Full-screen dark background with gradient
+        for (int y = 0; y < screenH; y++) {
+            int shade = 8 + y * 6 / screenH;
+            color32 lineColor = (color32)((shade << 24) | (shade << 16) | ((shade + 8) << 8) | 0xFF);
+            Framebuffer.drawHLine(0, y, screenW, lineColor);
+        }
+
+        # Animated clock — large centered
+        int hours = Timer.getRtcHours();
+        int minutes = Timer.getRtcMinutes();
+
+        # Format time strings with leading zeros
+        string hourStr = "${hours}";
+        if (hours < 10) hourStr = "0${hours}";
+        string minStr = "${minutes}";
+        if (minutes < 10) minStr = "0${minutes}";
+
+        string timeStr = hourStr + ":" + minStr;
+
+        # Draw each digit large (4x scale = 32px wide per char)
+        int digitW = 32;
+        int timePixW = timeStr.length * digitW;
+        int timeX = (screenW - timePixW) / 2;
+        int timeY = screenH / 2 - 120;
+
+        # Glow effect behind time
+        Framebuffer.fillRoundedRect(timeX - 20, timeY - 10, timePixW + 40, 60, 12, 0x5B8CFF10);
+
+        for (int ci = 0; ci < timeStr.length; ci++) {
+            int dx = timeX + ci * digitW;
+            drawLargeChar(timeStr.charAt(ci), dx, timeY, 4, 0xE6EDF3FF);
+        }
+
+        # Date
+        int day = Timer.getRtcDay();
+        int month = Timer.getRtcMonth();
+        int year = Timer.getRtcYear();
+        string dateStr = "${month}/${day}/20${year}";
+        int dateW = dateStr.length * 8;
+        TextRender.drawText(dateStr, (screenW - dateW) / 2, timeY + 60, 0x8B949EFF);
+
+        # "StratOS" branding
+        TextRender.drawText("StratOS", (screenW - 56) / 2, timeY + 84, 0x484F58FF);
+
+        # Password input box
+        int boxW = 280;
+        int boxH = 36;
+        int boxX = (screenW - boxW) / 2;
+        int boxY = screenH / 2 + 20;
+
+        # Shake animation
+        if (lockShakeTimer > 0) {
+            lockShakeTimer = lockShakeTimer - 1;
+            if (lockShakeTimer % 4 < 2) {
+                lockShakeOffset = 6;
+            } else {
+                lockShakeOffset = -6;
+            }
+            if (lockShakeTimer == 0) lockShakeOffset = 0;
+        }
+        boxX = boxX + lockShakeOffset;
+
+        Framebuffer.fillRoundedRect(boxX, boxY, boxW, boxH, 6, 0x0D1117FF);
+        Framebuffer.drawRoundedRect(boxX, boxY, boxW, boxH, 6, 0x30363DFF);
+
+        # Masked password dots
+        if (lockInput.length > 0) {
+            for (int pi = 0; pi < lockInput.length; pi++) {
+                int dotX = boxX + 16 + pi * 14;
+                if (dotX + 6 < boxX + boxW) {
+                    Framebuffer.fillCircle(dotX, boxY + boxH / 2, 4, 0xE6EDF3FF);
+                }
+            }
+        } else {
+            TextRender.drawText("Enter password...", boxX + 12, boxY + 10, 0x484F58FF);
+        }
+
+        # Error message
+        if (lockErrorTimer > 0) {
+            lockErrorTimer = lockErrorTimer - 1;
+            int errW = lockErrorMsg.length * 8;
+            TextRender.drawText(lockErrorMsg, (screenW - errW) / 2, boxY + boxH + 16, 0xFF5252FF);
+        }
+
+        # Hint
+        TextRender.drawText("Press Enter to unlock", (screenW - 168) / 2, screenH - 60, 0x484F58FF);
+    }
+
+    # Draw a character at large scale (scale x normal 8x16 font)
+    private static func drawLargeChar(char c, int px, int py, int scale, color32 color) -> void {
+        # Use TextRender to draw at 1x, but we scale by drawing repeated blocks
+        # Simple approach: draw the character multiple times offset by 1px
+        # For a clean large font, draw blocks instead
+        int w = 8;
+        int h = 16;
+        for (int sy = 0; sy < scale; sy++) {
+            for (int sx = 0; sx < scale; sx++) {
+                TextRender.drawChar(c, px + sx, py + sy, color, 0x00000000);
+            }
+        }
+    }
+}

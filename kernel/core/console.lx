@@ -1,0 +1,383 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Console — Early kernel text console
+// kernel/core/console.lx
+//
+// Renders text directly to the framebuffer using a built-in bitmap font.
+// Also outputs to serial COM1 (0x3F8) for debugging via QEMU -serial stdio.
+// Used for boot messages before the full windowing system is available.
+// ============================================================================
+
+import "kernel/core/bootinfo.lx";
+import "kernel/drivers/framebuffer.lx";
+import "assets/fonts/system_font.lx";
+
+# Base address for built-in font data (populated during kernel build)
+long BUILTIN_FONT_BASE = 0;
+
+# Console state
+int cursorX = 0;
+int cursorY = 0;
+int consoleWidth = 0;       # Characters per line
+int consoleHeight = 0;      # Lines on screen
+color32 fgColor = 0xC8D0E0FF;   # Clean cosmic: soft silver-blue
+color32 bgColor = 0x0A0E1AFF;   # Deep void background
+
+# Output capture mode (for terminal windows)
+bool captureMode = false;
+string captureBuffer = "";
+
+# Scroll buffer state
+list<string> scrollBuffer = [];
+int scrollOffset = 0;           # 0 = bottom (live), >0 = scrolled up
+int MAX_SCROLL_LINES = 500;
+bool scrollMode = false;        # True when user has scrolled up
+
+# Serial port COM1 base address
+int SERIAL_PORT = 0x3F8;
+bool serialReady = false;
+
+# Theme color presets
+struct ConsoleTheme {
+    color32 foreground;
+    color32 background;
+    color32 accent;
+    color32 warning;
+    color32 error;
+    color32 success;
+}
+
+ConsoleTheme cosmicTheme = {
+    foreground: 0xC8D0E0FF,      # Soft silver-blue
+    background: 0x0A0E1AFF,      # Deep void
+    accent:     0x5B8CFFFF,      # Cosmic blue
+    warning:    0xFFB74DFF,      # Warm amber
+    error:      0xFF5252FF,      # Alert red
+    success:    0x69F0AEFF       # Nebula green
+};
+
+export class Console {
+    # Initialize serial port COM1 for debug output
+    private static func initSerial() -> void {
+        unsafe {
+            # Disable interrupts
+            asm("outb %b0, %w1" : : "a"(0x00), "Nd"(SERIAL_PORT + 1));
+            # Set DLAB (divisor latch access bit)
+            asm("outb %b0, %w1" : : "a"(0x80), "Nd"(SERIAL_PORT + 3));
+            # Divisor low byte: 1 (115200 baud)
+            asm("outb %b0, %w1" : : "a"(0x01), "Nd"(SERIAL_PORT + 0));
+            # Divisor high byte: 0
+            asm("outb %b0, %w1" : : "a"(0x00), "Nd"(SERIAL_PORT + 1));
+            # 8 bits, no parity, one stop bit
+            asm("outb %b0, %w1" : : "a"(0x03), "Nd"(SERIAL_PORT + 3));
+            # Enable FIFO, clear them, 14-byte threshold
+            asm("outb %b0, %w1" : : "a"(0xC7), "Nd"(SERIAL_PORT + 2));
+            # IRQs enabled, RTS/DSR set
+            asm("outb %b0, %w1" : : "a"(0x0B), "Nd"(SERIAL_PORT + 4));
+        }
+        serialReady = true;
+    }
+
+    # Write a single byte to serial port
+    private static func serialPutChar(char c) -> void {
+        if (!serialReady) return;
+        unsafe {
+            # Wait for transmit buffer to be empty (bit 5 of LSR)
+            int ready = 0;
+            while (ready == 0) {
+                int status = 0;
+                asm("inb %w1, %b0" : "=a"(status) : "Nd"(SERIAL_PORT + 5));
+                ready = status & 0x20;
+            }
+            # Write the byte
+            asm("outb %b0, %w1" : : "a"((int) c), "Nd"(SERIAL_PORT));
+        }
+    }
+
+    # Write a string to serial port
+    private static func serialWrite(string text) -> void {
+        if (!serialReady) return;
+        for (int i = 0; i < text.length; i++) {
+            serialPutChar(text.charAt(i));
+        }
+    }
+
+    # Write a string + newline to serial port
+    private static func serialLog(string text) -> void {
+        serialWrite(text);
+        serialPutChar('\r');
+        serialPutChar('\n');
+    }
+
+    # Initialize console from boot info
+    public static func init(BootInfo boot) -> void {
+        # Initialize serial first (always works, even without framebuffer)
+        initSerial();
+        serialLog("[Serial] StratOS Console initialized");
+
+        consoleWidth = boot.screenWidth / FONT_WIDTH;
+        consoleHeight = boot.screenHeight / FONT_HEIGHT;
+        cursorX = 0;
+        cursorY = 0;
+
+        serialWrite("[Serial] Screen: ");
+        serialLog("framebuffer init");
+
+        # Clear screen with background color
+        Framebuffer.clear(bgColor);
+    }
+
+    # Set color theme
+    public static func setTheme(string name) -> void {
+        if (name == "cosmic") {
+            fgColor = cosmicTheme.foreground;
+            bgColor = cosmicTheme.background;
+        }
+    }
+
+    # Set text foreground color
+    public static func setColor(color32 color) -> void {
+        fgColor = color;
+    }
+
+    # Set cursor position (pixel coordinates)
+    public static func setCursor(int x, int y) -> void {
+        cursorX = x / FONT_WIDTH;
+        cursorY = y / FONT_HEIGHT;
+    }
+
+    # Print a string followed by newline
+    public static func log(string text) -> void {
+        # Capture mode: redirect output to buffer instead of screen
+        if (captureMode) {
+            captureBuffer += text;
+            captureBuffer += "\n";
+            return;
+        }
+
+        # Mirror to serial port
+        serialLog(text);
+
+        # Store in scroll buffer
+        scrollBuffer.add(text);
+        if (scrollBuffer.length > MAX_SCROLL_LINES) {
+            scrollBuffer.removeAt(0);
+        }
+
+        # Only render to framebuffer if not in scroll mode
+        if (!scrollMode) {
+            for (int i = 0; i < text.length; i++) {
+                char c = text.charAt(i);
+                putChar(c);
+            }
+            newline();
+        }
+    }
+
+    # Print without newline
+    public static func write(string text) -> void {
+        # Capture mode: redirect output to buffer
+        if (captureMode) {
+            captureBuffer += text;
+            return;
+        }
+
+        # Mirror to serial port
+        serialWrite(text);
+
+        for (int i = 0; i < text.length; i++) {
+            char c = text.charAt(i);
+            putChar(c);
+        }
+    }
+
+    # Begin capturing output — redirects log/write to internal buffer
+    public static func beginCapture() -> void {
+        captureMode = true;
+        captureBuffer = "";
+    }
+
+    # End capturing and return the captured text
+    public static func endCapture() -> string {
+        captureMode = false;
+        string result = captureBuffer;
+        captureBuffer = "";
+        return result;
+    }
+
+    # Print a single character at current cursor position
+    private static func putChar(char c) -> void {
+        if (c == '\n') {
+            newline();
+            return;
+        }
+        if (c == '\r') {
+            cursorX = 0;
+            return;
+        }
+        if (c == '\t') {
+            cursorX = ((cursorX + 4) / 4) * 4;  # Align to 4-column tab stop
+            return;
+        }
+
+        # Render character glyph from bitmap font
+        renderGlyph(c, cursorX * FONT_WIDTH, cursorY * FONT_HEIGHT, fgColor, bgColor);
+
+        # Advance cursor
+        cursorX++;
+        if (cursorX >= consoleWidth) {
+            newline();
+        }
+    }
+
+    # Move to next line, scroll if needed
+    private static func newline() -> void {
+        cursorX = 0;
+        cursorY++;
+
+        if (cursorY >= consoleHeight) {
+            scrollUp();
+            cursorY = consoleHeight - 1;
+        }
+    }
+
+    # Scroll screen contents up by one text line
+    private static func scrollUp() -> void {
+        int lineBytes = Framebuffer.getWidth() * 4;  # 4 bytes per pixel (RGBA)
+        int scrollPixels = FONT_HEIGHT;
+
+        unsafe {
+            byte* fb = (byte*) Framebuffer.getBase();
+            int totalBytes = lineBytes * (Framebuffer.getHeight() - scrollPixels);
+
+            # Copy screen up by FONT_HEIGHT pixels
+            for (int i = 0; i < totalBytes; i++) {
+                fb[i] = fb[i + lineBytes * scrollPixels];
+            }
+
+            # Clear the last line
+            int lastLineStart = lineBytes * (Framebuffer.getHeight() - scrollPixels);
+            for (int i = 0; i < lineBytes * scrollPixels; i++) {
+                fb[lastLineStart + i] = 0;
+            }
+        }
+    }
+
+    # Render a single character glyph
+    # Uses a built-in 8x16 bitmap font table (linked from font data)
+    private static func renderGlyph(char c, int x, int y, color32 fg, color32 bg) -> void {
+        int charIndex = (int) c;
+        if (charIndex < 32 || charIndex > 126) {
+            charIndex = '?';  # Replace unprintable characters
+        }
+
+        unsafe {
+            # Font data is stored as int32 values (one per scanline row)
+            # Each value holds one 8-bit bitmask for that row
+            int* fontInts = (int*) BUILTIN_FONT_BASE;
+            int glyphBase = (charIndex - 32) * FONT_HEIGHT;
+
+            for (int row = 0; row < FONT_HEIGHT; row++) {
+                byte bits = (byte) fontInts[glyphBase + row];
+                for (int col = 0; col < FONT_WIDTH; col++) {
+                    color32 pixelColor = bg;
+                    int divisor = 1;
+                    switch (col) {
+                        case 0: divisor = 128; break;
+                        case 1: divisor = 64;  break;
+                        case 2: divisor = 32;  break;
+                        case 3: divisor = 16;  break;
+                        case 4: divisor = 8;   break;
+                        case 5: divisor = 4;   break;
+                        case 6: divisor = 2;   break;
+                        case 7: divisor = 1;   break;
+                        default: divisor = 1;  break;
+                    }
+
+                    if ((((int) bits) / divisor) % 2 == 1) {
+                        pixelColor = fg;
+                    }
+                    Framebuffer.plotPixel(x + col, y + row, pixelColor);
+                }
+            }
+        }
+    }
+
+    # ========================================================================
+    # Scroll Buffer Controls
+    # ========================================================================
+
+    # Scroll up by one page (shows older output)
+    public static func scrollPageUp() -> void {
+        int maxOffset = scrollBuffer.length - consoleHeight;
+        if (maxOffset < 0) maxOffset = 0;
+
+        scrollOffset = scrollOffset + (consoleHeight - 2);
+        if (scrollOffset > maxOffset) scrollOffset = maxOffset;
+
+        scrollMode = true;
+        redrawFromBuffer();
+    }
+
+    # Scroll down by one page (shows newer output)
+    public static func scrollPageDown() -> void {
+        scrollOffset = scrollOffset - (consoleHeight - 2);
+        if (scrollOffset <= 0) {
+            scrollOffset = 0;
+            scrollMode = false;
+        }
+        redrawFromBuffer();
+    }
+
+    # Exit scroll mode and return to live view
+    public static func scrollToBottom() -> void {
+        scrollOffset = 0;
+        scrollMode = false;
+        redrawFromBuffer();
+    }
+
+    # Redraw screen from scroll buffer at current offset
+    public static func redrawFromBuffer() -> void {
+        # Clear screen
+        Framebuffer.clear(bgColor);
+        cursorX = 0;
+        cursorY = 0;
+
+        int totalLines = scrollBuffer.length;
+        int startLine = totalLines - consoleHeight - scrollOffset;
+        if (startLine < 0) startLine = 0;
+        int endLine = startLine + consoleHeight;
+        if (endLine > totalLines) endLine = totalLines;
+
+        color32 savedFg = fgColor;
+        fgColor = 0xC8D0E0FF;  # Reset to default for buffer redraw
+
+        for (int i = startLine; i < endLine; i++) {
+            string line = scrollBuffer[i];
+            for (int j = 0; j < line.length; j++) {
+                putChar(line.charAt(j));
+            }
+            newline();
+        }
+
+        fgColor = savedFg;
+
+        # Show scroll indicator if not at bottom
+        if (scrollMode) {
+            color32 prevFg = fgColor;
+            fgColor = 0xFFB74DFF;   # Amber indicator
+            cursorX = consoleWidth - 12;
+            cursorY = 0;
+            string indicator = "[SCROLL UP]";
+            for (int i = 0; i < indicator.length; i++) {
+                putChar(indicator.charAt(i));
+            }
+            fgColor = prevFg;
+        }
+    }
+
+    # Check if currently in scroll mode
+    public static func isScrollMode() -> bool {
+        return scrollMode;
+    }
+}

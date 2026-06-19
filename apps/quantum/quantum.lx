@@ -1,0 +1,291 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Quantum — Package manager for StratOS
+// apps/quantum/quantum.lx
+// ============================================================================
+
+import "system/fs/vfs.lx";
+
+# Package database
+list<Package> installedPackages = [];
+list<Package> availablePackages = [];
+string repoUrl = "stratos://packages";
+string packageDir = "/usr/quantum/packages";
+string cacheDir   = "/var/quantum/cache";
+
+struct Package {
+    string name;
+    string version;
+    string description;
+    string author;
+    list<string> dependencies;
+    int sizeKb;
+    bool isInstalled;
+}
+
+export class Quantum {
+    # Initialize package manager
+    public static func init() -> void {
+        loadInstalled();
+        loadAvailable();
+    }
+
+    # Load installed package list from disk
+    private static func loadInstalled() -> void {
+        installedPackages = [];
+
+        # Read package manifest
+        string manifest = VFS.readFile("/usr/quantum/installed.json");
+        if (manifest != "") {
+            # Parse JSON-like format
+            parsePackageList(manifest, installedPackages);
+        }
+    }
+
+    # Load available package catalog (bundled)
+    private static func loadAvailable() -> void {
+        availablePackages = [
+            { name: "flux-stdlib",   version: "0.1.0", description: "Flux standard library",           author: "StratOS",   dependencies: [],              sizeKb: 512,  isInstalled: true },
+            { name: "stellar-edit",  version: "0.1.0", description: "Text editor",                     author: "StratOS",   dependencies: ["flux-stdlib"],  sizeKb: 128,  isInstalled: true },
+            { name: "nebula-files",  version: "0.1.0", description: "File explorer",                   author: "StratOS",   dependencies: ["flux-stdlib"],  sizeKb: 96,   isInstalled: true },
+            { name: "void-browser",  version: "0.1.0", description: "Web browser",                     author: "StratOS",   dependencies: ["flux-stdlib"],  sizeKb: 256,  isInstalled: true },
+            { name: "pulsar",        version: "0.1.0", description: "Music player",                    author: "StratOS",   dependencies: ["flux-stdlib"],  sizeKb: 160,  isInstalled: true },
+            { name: "flux-repl",     version: "0.1.0", description: "Flux interactive REPL",            author: "StratOS",   dependencies: ["flux-stdlib"],  sizeKb: 64,   isInstalled: true },
+            { name: "cosmic-theme",  version: "0.1.0", description: "Default cosmic theme pack",       author: "StratOS",   dependencies: [],              sizeKb: 48,   isInstalled: true },
+            { name: "sys-monitor",   version: "0.1.0", description: "System resource monitor",         author: "Community", dependencies: ["flux-stdlib"],  sizeKb: 80,   isInstalled: false },
+            { name: "calc",          version: "0.1.0", description: "Calculator app",                  author: "Community", dependencies: ["flux-stdlib"],  sizeKb: 32,   isInstalled: false },
+            { name: "paint",         version: "0.1.0", description: "Simple drawing app",              author: "Community", dependencies: ["flux-stdlib"],  sizeKb: 64,   isInstalled: false },
+            { name: "clock",         version: "0.1.0", description: "Desktop clock widget",            author: "Community", dependencies: ["flux-stdlib"],  sizeKb: 24,   isInstalled: false },
+            { name: "hex-viewer",    version: "0.1.0", description: "Hex file viewer",                 author: "Community", dependencies: ["flux-stdlib"],  sizeKb: 40,   isInstalled: false }
+        ];
+    }
+
+    # Simple package list parser
+    private static func parsePackageList(string data, list target) -> void {
+        # Simplified parser for package manifest
+        # In a real implementation, this would parse JSON
+    }
+
+    # ---- CLI Commands (called from shell) ----
+
+    # quantum install <package>
+    public static func install(string pkgName) -> string {
+        # Check if already installed
+        for (pkg in installedPackages) {
+            if (pkg.name == pkgName) {
+                return "quantum: '" + pkgName + "' is already installed (v" + pkg.version + ")";
+            }
+        }
+
+        # Find in available packages
+        Package target = findPackage(pkgName);
+        if (target.name == "") {
+            return "quantum: package '" + pkgName + "' not found";
+        }
+
+        # Resolve dependencies
+        list<Package> toInstall = resolveDependencies(target);
+
+        # Calculate total size
+        int totalSize = 0;
+        for (pkg in toInstall) {
+            totalSize = totalSize + pkg.sizeKb;
+        }
+
+        string output = "Resolving dependencies...\n";
+        output = output + "The following packages will be installed:\n";
+
+        for (pkg in toInstall) {
+            output = output + "  " + pkg.name + " (v" + pkg.version + ") [" + (string) pkg.sizeKb + " KB]\n";
+        }
+
+        output = output + "Total download size: " + (string) totalSize + " KB\n";
+        output = output + "Installing...\n";
+
+        # Simulate installation
+        for (pkg in toInstall) {
+            pkg.isInstalled = true;
+            installedPackages.add(pkg);
+            output = output + "  ✓ " + pkg.name + " installed\n";
+        }
+
+        saveInstalled();
+        output = output + "Done. " + (string) toInstall.length + " package(s) installed.";
+        return output;
+    }
+
+    # quantum remove <package>
+    public static func remove(string pkgName) -> string {
+        int idx = -1;
+        for (int i = 0; i < installedPackages.length; i++) {
+            if (installedPackages[i].name == pkgName) {
+                idx = i;
+                break;
+            }
+        }
+
+        if (idx == -1) {
+            return "quantum: package '" + pkgName + "' is not installed";
+        }
+
+        # Check for reverse dependencies
+        for (pkg in installedPackages) {
+            for (dep in pkg.dependencies) {
+                if (dep == pkgName) {
+                    return "quantum: cannot remove '" + pkgName + "' — required by '" + pkg.name + "'";
+                }
+            }
+        }
+
+        string name = installedPackages[idx].name;
+        installedPackages.removeAt(idx);
+        saveInstalled();
+
+        return "quantum: removed '" + name + "'";
+    }
+
+    # quantum update
+    public static func update() -> string {
+        string output = "Checking for updates...\n";
+        int updated = 0;
+
+        for (installed in installedPackages) {
+            Package latest = findPackage(installed.name);
+            if (latest.name != "" && latest.version != installed.version) {
+                output = output + "  ↑ " + installed.name + " " + installed.version + " → " + latest.version + "\n";
+                installed.version = latest.version;
+                updated = updated + 1;
+            }
+        }
+
+        if (updated == 0) {
+            output = output + "All packages are up to date.";
+        } else {
+            saveInstalled();
+            output = output + (string) updated + " package(s) updated.";
+        }
+
+        return output;
+    }
+
+    # quantum search <query>
+    public static func search(string query) -> string {
+        string output = "";
+        int found = 0;
+
+        for (pkg in availablePackages) {
+            if (pkg.name.contains(query) || pkg.description.contains(query)) {
+                string status = pkg.isInstalled ? "[installed]" : "[available]";
+                output = output + "  " + pkg.name + " v" + pkg.version + " " + status + "\n";
+                output = output + "    " + pkg.description + "\n";
+                found = found + 1;
+            }
+        }
+
+        if (found == 0) {
+            return "quantum: no packages matching '" + query + "'";
+        }
+
+        return "Found " + (string) found + " package(s):\n" + output;
+    }
+
+    # quantum list
+    public static func listInstalled() -> string {
+        if (installedPackages.length == 0) {
+            return "No packages installed.";
+        }
+
+        string output = "Installed packages:\n";
+        for (pkg in installedPackages) {
+            output = output + "  " + pkg.name + " v" + pkg.version + " [" + (string) pkg.sizeKb + " KB]\n";
+        }
+
+        return output;
+    }
+
+    # quantum info <package>
+    public static func info(string pkgName) -> string {
+        Package pkg = findPackage(pkgName);
+        if (pkg.name == "") {
+            return "quantum: package '" + pkgName + "' not found";
+        }
+
+        string output = "Package: " + pkg.name + "\n";
+        output = output + "Version: " + pkg.version + "\n";
+        output = output + "Author:  " + pkg.author + "\n";
+        output = output + "Size:    " + (string) pkg.sizeKb + " KB\n";
+        output = output + "Status:  " + (pkg.isInstalled ? "installed" : "available") + "\n";
+        output = output + "Desc:    " + pkg.description + "\n";
+
+        if (pkg.dependencies.length > 0) {
+            output = output + "Deps:    ";
+            for (int i = 0; i < pkg.dependencies.length; i++) {
+                output = output + pkg.dependencies[i];
+                if (i < pkg.dependencies.length - 1) {
+                    output = output + ", ";
+                }
+            }
+            output = output + "\n";
+        }
+
+        return output;
+    }
+
+    # ---- Helpers ----
+
+    # Find a package by name
+    private static func findPackage(string name) -> Package {
+        for (pkg in availablePackages) {
+            if (pkg.name == name) {
+                return pkg;
+            }
+        }
+        return { name: "", version: "", description: "", author: "", dependencies: [], sizeKb: 0, isInstalled: false };
+    }
+
+    # Resolve dependencies recursively
+    private static func resolveDependencies(Package target) -> list<Package> {
+        list<Package> result = [];
+
+        for (depName in target.dependencies) {
+            # Check if dependency is already installed
+            bool depInstalled = false;
+            for (installed in installedPackages) {
+                if (installed.name == depName) {
+                    depInstalled = true;
+                    break;
+                }
+            }
+
+            if (!depInstalled) {
+                Package dep = findPackage(depName);
+                if (dep.name != "") {
+                    # Recursively resolve
+                    list<Package> subDeps = resolveDependencies(dep);
+                    for (sd in subDeps) {
+                        result.add(sd);
+                    }
+                    result.add(dep);
+                }
+            }
+        }
+
+        result.add(target);
+        return result;
+    }
+
+    # Save installed packages to disk
+    private static func saveInstalled() -> void {
+        string manifest = "[\n";
+        for (int i = 0; i < installedPackages.length; i++) {
+            Package pkg = installedPackages[i];
+            manifest = manifest + "  { \"name\": \"" + pkg.name + "\", \"version\": \"" + pkg.version + "\" }";
+            if (i < installedPackages.length - 1) {
+                manifest = manifest + ",";
+            }
+            manifest = manifest + "\n";
+        }
+        manifest = manifest + "]";
+        VFS.writeFile("/usr/quantum/installed.json", manifest);
+    }
+}

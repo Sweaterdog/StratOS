@@ -1,0 +1,85 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Text Renderer — Shared text drawing utility for windowed applications
+// apps/lib/textrender.lx
+//
+// Renders text at arbitrary pixel positions using the built-in 8×16 font.
+// Used by TerminalApp, CalculatorApp, and other window-based applications.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "assets/fonts/system_font.lx";
+import "kernel/core/console.lx";
+
+export class TextRender {
+    # Draw a single character at pixel position (x, y)
+    public static func drawChar(char c, int x, int y, color32 fg, color32 bg) -> void {
+        int charIndex = (int) c;
+        if (charIndex < 32 || charIndex > 126) {
+            charIndex = '?';
+        }
+
+        unsafe {
+            int* fontInts = (int*) BUILTIN_FONT_BASE;
+            int glyphBase = (charIndex - 32) * FONT_HEIGHT;
+
+            for (int row = 0; row < FONT_HEIGHT; row++) {
+                byte bits = (byte) fontInts[glyphBase + row];
+                for (int col = 0; col < FONT_WIDTH; col++) {
+                    int divisor = 1;
+                    switch (col) {
+                        case 0: divisor = 128; break;
+                        case 1: divisor = 64;  break;
+                        case 2: divisor = 32;  break;
+                        case 3: divisor = 16;  break;
+                        case 4: divisor = 8;   break;
+                        case 5: divisor = 4;   break;
+                        case 6: divisor = 2;   break;
+                        case 7: divisor = 1;   break;
+                        default: divisor = 1;  break;
+                    }
+
+                    if ((((int) bits) / divisor) % 2 == 1) {
+                        Framebuffer.plotPixel(x + col, y + row, fg);
+                    } else if (((int) bg & 0xFF) > 0) {
+                        # Only draw background if it has alpha
+                        Framebuffer.plotPixel(x + col, y + row, bg);
+                    }
+                }
+            }
+        }
+    }
+
+    # Draw a string at pixel position
+    public static func drawString(string text, int x, int y, color32 fg, color32 bg) -> void {
+        int cx = x;
+        for (int i = 0; i < text.length; i++) {
+            char c = text.charAt(i);
+            if (c == '\n') {
+                cx = x;
+                y += FONT_HEIGHT;
+                continue;
+            }
+            if (c == '\t') {
+                cx += FONT_WIDTH * 4;
+                continue;
+            }
+            drawChar(c, cx, y, fg, bg);
+            cx += FONT_WIDTH;
+        }
+    }
+
+    # Draw a string with no background (transparent)
+    public static func drawText(string text, int x, int y, color32 fg) -> void {
+        drawString(text, x, y, fg, 0x00000000);
+    }
+
+    # Measure text width in pixels
+    public static func measureText(string text) -> int {
+        return text.length * FONT_WIDTH;
+    }
+
+    # Get font dimensions
+    public static func getCharWidth() -> int { return FONT_WIDTH; }
+    public static func getCharHeight() -> int { return FONT_HEIGHT; }
+}

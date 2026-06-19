@@ -1,0 +1,904 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Syscall Dispatch — Linux-compatible system call interface
+// kernel/core/syscall.lx
+//
+// Implements a subset of the Linux x86_64 syscall ABI, providing enough
+// coverage for statically-linked Clang/libc++ binaries to function.
+//
+// Syscall numbers follow the Linux x86_64 ABI:
+//   https://filippo.io/linux-syscall-table/
+//
+// Supported syscalls:
+//   File I/O:     read(0), write(1), open(2), close(3), lseek(8), pread64(17)
+//   File info:    stat(4), fstat(5), access(21)
+//   Memory:       mmap(9), munmap(11), brk(12)
+//   Process:      exit(60), exit_group(231), getpid(39), getppid(110)
+//   Directory:    getcwd(79), chdir(80), mkdir(83), unlink(87), rename(82)
+//   Misc:         ioctl(16), arch_prctl(158), set_tid_address(218)
+//   Modern:       openat(257), newfstatat(262)
+// ============================================================================
+
+import "kernel/core/console.lx";
+import "kernel/memory/manager.lx";
+import "system/fs/vfs.lx";
+
+# ============================================================================
+# Linux syscall numbers (x86_64)
+# ============================================================================
+int SYS_READ           = 0;
+int SYS_WRITE          = 1;
+int SYS_OPEN           = 2;
+int SYS_CLOSE          = 3;
+int SYS_STAT           = 4;
+int SYS_FSTAT          = 5;
+int SYS_LSEEK          = 8;
+int SYS_MMAP           = 9;
+int SYS_MUNMAP         = 11;
+int SYS_BRK            = 12;
+int SYS_IOCTL          = 16;
+int SYS_PREAD64        = 17;
+int SYS_ACCESS         = 21;
+int SYS_PIPE           = 22;
+int SYS_DUP            = 32;
+int SYS_DUP2           = 33;
+int SYS_GETPID         = 39;
+int SYS_FORK           = 57;
+int SYS_EXECVE         = 59;
+int SYS_EXIT           = 60;
+int SYS_WAIT4          = 61;
+int SYS_UNAME          = 63;
+int SYS_GETCWD         = 79;
+int SYS_CHDIR          = 80;
+int SYS_RENAME         = 82;
+int SYS_MKDIR          = 83;
+int SYS_RMDIR          = 84;
+int SYS_UNLINK         = 87;
+int SYS_READLINK       = 89;
+int SYS_GETUID         = 102;
+int SYS_GETGID         = 104;
+int SYS_GETEUID        = 107;
+int SYS_GETEGID        = 108;
+int SYS_GETPPID        = 110;
+int SYS_ARCH_PRCTL     = 158;
+int SYS_SET_TID_ADDRESS = 218;
+int SYS_CLOCK_GETTIME  = 228;
+int SYS_EXIT_GROUP     = 231;
+int SYS_OPENAT         = 257;
+int SYS_NEWFSTATAT     = 262;
+int SYS_GETRANDOM      = 318;
+
+# Linux error codes (returned as negative values)
+int ENOENT   = 2;     # No such file or directory
+int EIO      = 5;     # I/O error
+int EBADF    = 9;     # Bad file descriptor
+int ENOMEM   = 12;    # Out of memory
+int EACCES   = 13;    # Permission denied
+int EFAULT   = 14;    # Bad address
+int EEXIST   = 17;    # File exists
+int ENOTDIR  = 20;    # Not a directory
+int EISDIR   = 21;    # Is a directory
+int EINVAL   = 22;    # Invalid argument
+int EMFILE   = 24;    # Too many open files
+int ENOSYS   = 38;    # Function not implemented
+int ENOTEMPTY = 39;   # Directory not empty
+int ERANGE   = 34;    # Math result not representable
+
+# Open flags
+int O_RDONLY   = 0;
+int O_WRONLY   = 1;
+int O_RDWR     = 2;
+int O_CREAT    = 64;
+int O_TRUNC    = 512;
+int O_APPEND   = 1024;
+
+# Seek origins
+int SEEK_SET = 0;
+int SEEK_CUR = 1;
+int SEEK_END = 2;
+
+# AT_FDCWD — "use current working directory"
+int AT_FDCWD = -100;
+
+# arch_prctl codes
+int ARCH_SET_GS = 0x1001;
+int ARCH_SET_FS = 0x1002;
+int ARCH_GET_FS = 0x1003;
+int ARCH_GET_GS = 0x1004;
+
+# ============================================================================
+# File descriptor table — maps int fd → VFS path + position
+# ============================================================================
+int MAX_FDS = 256;
+
+# Parallel arrays for the file descriptor table
+list<string> fdPaths = [];       # VFS path for each fd
+list<int>    fdPositions = [];   # Current read/write offset
+list<bool>   fdOpen = [];        # Whether the fd is in use
+list<int>    fdFlags = [];       # Open flags
+int nextFd = 3;                  # 0=stdin, 1=stdout, 2=stderr
+
+# Process brk (heap end for user processes)
+long processBrk = 0;
+long processBrkBase = 0;
+
+# Current working directory
+string processCwd = "/";
+
+# TLS base address (set by arch_prctl)
+long tlsFsBase = 0;
+
+# ============================================================================
+# Initialize the syscall subsystem
+# ============================================================================
+export class Syscall {
+    public static func init() -> void {
+        # Initialize fd table with stdin/stdout/stderr
+        for (int i = 0; i < MAX_FDS; i++) {
+            fdPaths.add("");
+            fdPositions.add(0);
+            fdOpen.add(false);
+            fdFlags.add(0);
+        }
+
+        # fd 0 = stdin (read from keyboard buffer)
+        fdPaths[0] = "/dev/stdin";
+        fdOpen[0] = true;
+        fdFlags[0] = O_RDONLY;
+
+        # fd 1 = stdout (write to console)
+        fdPaths[1] = "/dev/stdout";
+        fdOpen[1] = true;
+        fdFlags[1] = O_WRONLY;
+
+        # fd 2 = stderr (write to console)
+        fdPaths[2] = "/dev/stderr";
+        fdOpen[2] = true;
+        fdFlags[2] = O_WRONLY;
+
+        # Initialize process brk at a high address
+        # User processes start their heap past their loaded segments
+        processBrkBase = 0x800000;   # 8MB — will be adjusted when ELF loads
+        processBrk = processBrkBase;
+
+        processCwd = "/";
+    }
+
+    # Set the initial brk to just past the loaded ELF image
+    public static func setInitialBrk(long brkAddr) -> void {
+        # Align up to page boundary
+        processBrkBase = (brkAddr + 0xFFF) & ~0xFFF;
+        processBrk = processBrkBase;
+    }
+}
+
+# ============================================================================
+# Main syscall dispatcher — called from assembly (boot.S syscall_entry)
+#
+# extern "C" long syscall_dispatch(long number, long a1, long a2,
+#                                   long a3, long a4, long a5)
+#
+# Returns the syscall result (or negative errno on error).
+# ============================================================================
+export func syscall_dispatch(long number, long a1, long a2, long a3, long a4, long a5) -> long {
+    int num = (int) number;
+
+    if (num == SYS_READ) {
+        return sys_read((int) a1, a2, (int) a3);
+    } elif (num == SYS_WRITE) {
+        return sys_write((int) a1, a2, (int) a3);
+    } elif (num == SYS_OPEN) {
+        return sys_open(a1, (int) a2, (int) a3);
+    } elif (num == SYS_CLOSE) {
+        return sys_close((int) a1);
+    } elif (num == SYS_STAT) {
+        return sys_stat(a1, a2);
+    } elif (num == SYS_FSTAT) {
+        return sys_fstat((int) a1, a2);
+    } elif (num == SYS_LSEEK) {
+        return sys_lseek((int) a1, a2, (int) a3);
+    } elif (num == SYS_MMAP) {
+        return sys_mmap(a1, a2, (int) a3, (int) a4, (int) a5, 0);
+    } elif (num == SYS_MUNMAP) {
+        return sys_munmap(a1, a2);
+    } elif (num == SYS_BRK) {
+        return sys_brk(a1);
+    } elif (num == SYS_IOCTL) {
+        return sys_ioctl((int) a1, a2, a3);
+    } elif (num == SYS_PREAD64) {
+        return sys_pread64((int) a1, a2, (int) a3, a4);
+    } elif (num == SYS_ACCESS) {
+        return sys_access(a1, (int) a2);
+    } elif (num == SYS_GETPID) {
+        return 1;    # Always PID 1 (init process)
+    } elif (num == SYS_GETPPID) {
+        return 0;    # Parent is kernel
+    } elif (num == SYS_GETUID || num == SYS_GETEUID) {
+        return 0;    # Root
+    } elif (num == SYS_GETGID || num == SYS_GETEGID) {
+        return 0;    # Root group
+    } elif (num == SYS_EXIT || num == SYS_EXIT_GROUP) {
+        sys_exit((int) a1);
+        return 0;
+    } elif (num == SYS_GETCWD) {
+        return sys_getcwd(a1, (int) a2);
+    } elif (num == SYS_CHDIR) {
+        return sys_chdir(a1);
+    } elif (num == SYS_MKDIR) {
+        return sys_mkdir(a1, (int) a2);
+    } elif (num == SYS_UNLINK) {
+        return sys_unlink(a1);
+    } elif (num == SYS_RENAME) {
+        return sys_rename(a1, a2);
+    } elif (num == SYS_READLINK) {
+        return sys_readlink(a1, a2, (int) a3);
+    } elif (num == SYS_ARCH_PRCTL) {
+        return sys_arch_prctl((int) a1, a2);
+    } elif (num == SYS_SET_TID_ADDRESS) {
+        return 1;    # Return "tid" = 1
+    } elif (num == SYS_UNAME) {
+        return sys_uname(a1);
+    } elif (num == SYS_CLOCK_GETTIME) {
+        return sys_clock_gettime((int) a1, a2);
+    } elif (num == SYS_OPENAT) {
+        return sys_openat((int) a1, a2, (int) a3, (int) a4);
+    } elif (num == SYS_NEWFSTATAT) {
+        return sys_newfstatat((int) a1, a2, a3, (int) a4);
+    } elif (num == SYS_GETRANDOM) {
+        return sys_getrandom(a2, (int) a3);
+    } elif (num == SYS_FORK) {
+        return (long)(0 - ENOSYS);   # Fork not supported yet
+    } elif (num == SYS_EXECVE) {
+        return (long)(0 - ENOSYS);   # Execve not supported yet
+    } elif (num == SYS_WAIT4) {
+        return (long)(0 - ENOSYS);
+    } else {
+        # Unknown syscall — log and return ENOSYS
+        # Console.log("[syscall] Unknown syscall ${num}");
+        return (long)(0 - ENOSYS);
+    }
+}
+
+# ============================================================================
+# Syscall implementations
+# ============================================================================
+
+# Helper: read a C string from a memory address into a FluxString
+func readCString(long addr) -> string {
+    string result = "";
+    unsafe {
+        byte* ptr = (byte*) addr;
+        int i = 0;
+        while (i < 255 && ptr[i] != 0) {
+            # Append character. FluxString has a fixed buffer, so we build manually.
+            string ch = "";
+            byte c = ptr[i];
+            # Use string append via char
+            result = result + charToString(c);
+            i++;
+        }
+    }
+    return result;
+}
+
+# Helper: convert a byte to a single-character string
+func charToString(byte c) -> string {
+    unsafe {
+        string s = " ";
+        long sAddr = (long) s.c_str();
+        byte* p = (byte*) sAddr;
+        p[0] = c;
+    }
+    return s;
+}
+
+# Helper: write bytes from a FluxString to a memory buffer
+func writeBytesToAddr(long addr, string data, int maxLen) -> int {
+    int len = data.length;
+    if (len > maxLen) {
+        len = maxLen;
+    }
+    unsafe {
+        byte* dst = (byte*) addr;
+        long srcAddr = (long) data.c_str();
+        byte* src = (byte*) srcAddr;
+        for (int i = 0; i < len; i++) {
+            dst[i] = src[i];
+        }
+    }
+    return len;
+}
+
+# Helper: resolve a path relative to CWD
+func resolvePath(string path) -> string {
+    if (path.length == 0) return processCwd;
+    if (path.charAt(0) == '/') return path;   # Already absolute
+    if (processCwd == "/") return "/" + path;
+    return processCwd + "/" + path;
+}
+
+# ── sys_read(fd, buf, count) ──
+func sys_read(int fd, long buf, int count) -> long {
+    if (fd < 0 || fd >= MAX_FDS || !fdOpen[fd]) {
+        return (long)(0 - EBADF);
+    }
+
+    if (fd == 0) {
+        # stdin — not implemented for now (would need keyboard buffer)
+        return 0;
+    }
+
+    string path = fdPaths[fd];
+    string content = VFS.read(path);
+    int pos = fdPositions[fd];
+    int available = content.length - pos;
+    if (available <= 0) return 0;   # EOF
+
+    int toRead = count;
+    if (toRead > available) toRead = available;
+
+    # Copy data to user buffer
+    unsafe {
+        byte* dst = (byte*) buf;
+        long srcAddr = (long) content.c_str();
+        byte* src = (byte*) srcAddr;
+        for (int i = 0; i < toRead; i++) {
+            dst[i] = src[pos + i];
+        }
+    }
+
+    fdPositions[fd] = pos + toRead;
+    return (long) toRead;
+}
+
+# ── sys_write(fd, buf, count) ──
+func sys_write(int fd, long buf, int count) -> long {
+    if (fd < 0 || fd >= MAX_FDS || !fdOpen[fd]) {
+        return (long)(0 - EBADF);
+    }
+
+    if (fd == 1 || fd == 2) {
+        # stdout / stderr — write to console
+        string text = "";
+        unsafe {
+            byte* src = (byte*) buf;
+            for (int i = 0; i < count; i++) {
+                text = text + charToString(src[i]);
+            }
+        }
+        Console.write(text);
+        return (long) count;
+    }
+
+    # Regular file — append or write at position
+    string path = fdPaths[fd];
+    string text = "";
+    unsafe {
+        byte* src = (byte*) buf;
+        for (int i = 0; i < count; i++) {
+            text = text + charToString(src[i]);
+        }
+    }
+
+    if (fdFlags[fd] & O_APPEND) {
+        string existing = VFS.read(path);
+        VFS.write(path, existing + text);
+    } else {
+        # Write at current position (simplified: just overwrite)
+        VFS.write(path, text);
+    }
+
+    fdPositions[fd] = fdPositions[fd] + count;
+    return (long) count;
+}
+
+# ── sys_open(pathname_ptr, flags, mode) ──
+func sys_open(long pathnamePtr, int flags, int mode) -> long {
+    string path = readCString(pathnamePtr);
+    path = resolvePath(path);
+
+    # Find a free fd
+    int fd = -1;
+    for (int i = 3; i < MAX_FDS; i++) {
+        if (!fdOpen[i]) {
+            fd = i;
+            break;
+        }
+    }
+    if (fd == -1) return (long)(0 - EMFILE);
+
+    # Check if file exists
+    bool exists = VFS.exists(path);
+
+    if (!exists) {
+        if (flags & O_CREAT) {
+            # Create the file
+            VFS.write(path, "");
+        } else {
+            return (long)(0 - ENOENT);
+        }
+    }
+
+    if ((flags & O_TRUNC) && exists) {
+        VFS.write(path, "");
+    }
+
+    fdPaths[fd] = path;
+    fdPositions[fd] = 0;
+    fdOpen[fd] = true;
+    fdFlags[fd] = flags;
+
+    return (long) fd;
+}
+
+# ── sys_close(fd) ──
+func sys_close(int fd) -> long {
+    if (fd < 0 || fd >= MAX_FDS) return (long)(0 - EBADF);
+    if (fd < 3) return 0;   # Don't close stdin/stdout/stderr
+    if (!fdOpen[fd]) return (long)(0 - EBADF);
+
+    fdOpen[fd] = false;
+    fdPaths[fd] = "";
+    fdPositions[fd] = 0;
+    fdFlags[fd] = 0;
+
+    return 0;
+}
+
+# ── sys_stat(pathname_ptr, statbuf) ──
+func sys_stat(long pathnamePtr, long statbuf) -> long {
+    string path = readCString(pathnamePtr);
+    path = resolvePath(path);
+    return fillStatBuf(path, statbuf);
+}
+
+# ── sys_fstat(fd, statbuf) ──
+func sys_fstat(int fd, long statbuf) -> long {
+    if (fd < 0 || fd >= MAX_FDS || !fdOpen[fd]) {
+        return (long)(0 - EBADF);
+    }
+
+    if (fd <= 2) {
+        # stdin/stdout/stderr — fill with character device info
+        unsafe {
+            long* buf = (long*) statbuf;
+            for (int i = 0; i < 18; i++) buf[i] = 0;
+            # st_mode = S_IFCHR | 0666 = 0020666
+            int* modePtr = (int*)(statbuf + 24);
+            *modePtr = 0x21B6;   # S_IFCHR | 0666
+        }
+        return 0;
+    }
+
+    return fillStatBuf(fdPaths[fd], statbuf);
+}
+
+# Helper: fill a Linux stat buffer from VFS info
+func fillStatBuf(string path, long statbuf) -> long {
+    if (!VFS.exists(path)) {
+        return (long)(0 - ENOENT);
+    }
+
+    string content = VFS.read(path);
+    int size = content.length;
+    bool isDir = VFS.isDirectory(path);
+
+    unsafe {
+        # Zero the stat buffer (144 bytes on x86_64)
+        byte* buf = (byte*) statbuf;
+        for (int i = 0; i < 144; i++) buf[i] = 0;
+
+        # st_mode (offset 24, 4 bytes)
+        int* modePtr = (int*)(statbuf + 24);
+        if (isDir) {
+            *modePtr = 0x41ED;   # S_IFDIR | 0755
+        } else {
+            *modePtr = 0x81A4;   # S_IFREG | 0644
+        }
+
+        # st_size (offset 48, 8 bytes)
+        long* sizePtr = (long*)(statbuf + 48);
+        *sizePtr = (long) size;
+
+        # st_blksize (offset 56, 8 bytes) — 4096
+        long* blkPtr = (long*)(statbuf + 56);
+        *blkPtr = 4096;
+
+        # st_blocks (offset 64, 8 bytes) — ceil(size / 512)
+        long* blocksPtr = (long*)(statbuf + 64);
+        *blocksPtr = (long)((size + 511) / 512);
+
+        # st_nlink (offset 16, 8 bytes) — 1
+        long* nlinkPtr = (long*)(statbuf + 16);
+        *nlinkPtr = 1;
+    }
+    return 0;
+}
+
+# ── sys_lseek(fd, offset, whence) ──
+func sys_lseek(int fd, long offset, int whence) -> long {
+    if (fd < 0 || fd >= MAX_FDS || !fdOpen[fd]) {
+        return (long)(0 - EBADF);
+    }
+
+    string content = VFS.read(fdPaths[fd]);
+    int fileSize = content.length;
+    int pos = fdPositions[fd];
+
+    if (whence == SEEK_SET) {
+        pos = (int) offset;
+    } elif (whence == SEEK_CUR) {
+        pos = pos + (int) offset;
+    } elif (whence == SEEK_END) {
+        pos = fileSize + (int) offset;
+    } else {
+        return (long)(0 - EINVAL);
+    }
+
+    if (pos < 0) pos = 0;
+    fdPositions[fd] = pos;
+    return (long) pos;
+}
+
+# ── sys_mmap(addr, length, prot, flags, fd, offset) ──
+func sys_mmap(long addr, long length, int prot, int flags, int fd, long offset) -> long {
+    # Simplified: anonymous mapping only (MAP_ANONYMOUS = 0x20)
+    # Allocate contiguous physical frames and map them
+
+    int pages = (int)((length + 4095) / 4096);
+
+    # Determine virtual address
+    # If addr is 0 (or MAP_ANONYMOUS), pick a free region
+    long baseAddr = addr;
+    if (baseAddr == 0) {
+        # Start above the process brk
+        baseAddr = (processBrk + 0x10000) & ~0xFFF;
+    }
+
+    int pageFlags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    for (int i = 0; i < pages; i++) {
+        long frame = MemoryManager.allocFrame();
+        long vaddr = baseAddr + (long)(i * 4096);
+
+        # Zero the page
+        unsafe {
+            byte* p = (byte*) frame;
+            for (int z = 0; z < 4096; z++) p[z] = 0;
+        }
+
+        MemoryManager.mapPage(vaddr, frame, pageFlags);
+    }
+
+    return baseAddr;
+}
+
+# ── sys_munmap(addr, length) ──
+func sys_munmap(long addr, long length) -> long {
+    # TODO: Actually unmap pages and free frames
+    # For now, just return success (leak the memory)
+    return 0;
+}
+
+# ── sys_brk(addr) ──
+func sys_brk(long addr) -> long {
+    if (addr == 0) {
+        return processBrk;
+    }
+
+    if (addr < processBrkBase) {
+        return processBrk;   # Can't shrink below base
+    }
+
+    # Expand: map pages between old brk and new brk
+    long oldBrk = processBrk;
+    long newBrk = (addr + 4095) & ~4095;   # Align up
+
+    if (newBrk > oldBrk) {
+        long page = oldBrk;
+        while (page < newBrk) {
+            long frame = MemoryManager.allocFrame();
+            unsafe {
+                byte* p = (byte*) frame;
+                for (int z = 0; z < 4096; z++) p[z] = 0;
+            }
+            MemoryManager.mapPage(page, frame, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+            page += 4096;
+        }
+    }
+
+    processBrk = newBrk;
+    return processBrk;
+}
+
+# ── sys_ioctl(fd, request, arg) ──
+func sys_ioctl(int fd, long request, long arg) -> long {
+    # TCGETS (0x5401) — check if fd is a terminal
+    if (request == 0x5401) {
+        if (fd <= 2) return 0;   # stdin/stdout/stderr are "terminals"
+        return (long)(0 - ENOTDIR);   # Not a terminal
+    }
+    # TIOCGWINSZ (0x5413) — get terminal size
+    if (request == 0x5413) {
+        unsafe {
+            int* ws = (int*) arg;
+            ws[0] = 24;      # ws_row (low 16 bits) — will be split by caller
+            ws[1] = 80;      # ws_col
+        }
+        return 0;
+    }
+    return (long)(0 - EINVAL);
+}
+
+# ── sys_pread64(fd, buf, count, offset) ──
+func sys_pread64(int fd, long buf, int count, long offset) -> long {
+    if (fd < 0 || fd >= MAX_FDS || !fdOpen[fd]) {
+        return (long)(0 - EBADF);
+    }
+
+    string content = VFS.read(fdPaths[fd]);
+    int pos = (int) offset;
+    int available = content.length - pos;
+    if (available <= 0) return 0;
+
+    int toRead = count;
+    if (toRead > available) toRead = available;
+
+    unsafe {
+        byte* dst = (byte*) buf;
+        long srcAddr = (long) content.c_str();
+        byte* src = (byte*) srcAddr;
+        for (int i = 0; i < toRead; i++) {
+            dst[i] = src[pos + i];
+        }
+    }
+
+    return (long) toRead;
+}
+
+# ── sys_access(pathname_ptr, mode) ──
+func sys_access(long pathnamePtr, int mode) -> long {
+    string path = readCString(pathnamePtr);
+    path = resolvePath(path);
+    if (VFS.exists(path)) return 0;
+    return (long)(0 - ENOENT);
+}
+
+# ── sys_exit(status) ──
+func sys_exit(int status) -> void {
+    Console.log("[process] Exited with status ${status}");
+    # For now, just halt. A real implementation would clean up the process
+    # and return to the kernel/compositor.
+    unsafe {
+        asm("cli");
+        asm("hlt");
+    }
+}
+
+# ── sys_getcwd(buf, size) ──
+func sys_getcwd(long buf, int size) -> long {
+    int len = processCwd.length;
+    if (len + 1 > size) return (long)(0 - ERANGE);
+
+    writeBytesToAddr(buf, processCwd, len);
+    unsafe {
+        byte* p = (byte*) buf;
+        p[len] = 0;   # Null terminator
+    }
+    return buf;
+}
+
+# ── sys_chdir(path_ptr) ──
+func sys_chdir(long pathPtr) -> long {
+    string path = readCString(pathPtr);
+    path = resolvePath(path);
+    if (!VFS.exists(path) || !VFS.isDirectory(path)) {
+        return (long)(0 - ENOENT);
+    }
+    processCwd = path;
+    return 0;
+}
+
+# ── sys_mkdir(path_ptr, mode) ──
+func sys_mkdir(long pathPtr, int mode) -> long {
+    string path = readCString(pathPtr);
+    path = resolvePath(path);
+    VFS.mkdir(path);
+    return 0;
+}
+
+# ── sys_unlink(path_ptr) ──
+func sys_unlink(long pathPtr) -> long {
+    string path = readCString(pathPtr);
+    path = resolvePath(path);
+    if (!VFS.exists(path)) return (long)(0 - ENOENT);
+    VFS.remove(path);
+    return 0;
+}
+
+# ── sys_rename(oldpath_ptr, newpath_ptr) ──
+func sys_rename(long oldPtr, long newPtr) -> long {
+    string oldPath = readCString(oldPtr);
+    string newPath = readCString(newPtr);
+    oldPath = resolvePath(oldPath);
+    newPath = resolvePath(newPath);
+    VFS.rename(oldPath, newPath);
+    return 0;
+}
+
+# ── sys_readlink(path_ptr, buf, bufsiz) ──
+func sys_readlink(long pathPtr, long buf, int bufsiz) -> long {
+    string path = readCString(pathPtr);
+    # /proc/self/exe — return the current executable path
+    if (path == "/proc/self/exe") {
+        string exe = "/usr/bin/clang++";
+        int len = exe.length;
+        if (len > bufsiz) len = bufsiz;
+        writeBytesToAddr(buf, exe, len);
+        return (long) len;
+    }
+    return (long)(0 - EINVAL);
+}
+
+# ── sys_arch_prctl(code, addr) ──
+func sys_arch_prctl(int code, long addr) -> long {
+    if (code == ARCH_SET_FS) {
+        # Set FS base register (used for TLS by musl/libc++)
+        tlsFsBase = addr;
+        unsafe {
+            # Write to FS_BASE MSR (0xC0000100)
+            int low = (int)(addr & 0xFFFFFFFF);
+            int high = (int)((addr >> 32) & 0xFFFFFFFF);
+            asm("wrmsr" : : "c"(0xC0000100), "a"(low), "d"(high));
+        }
+        return 0;
+    } elif (code == ARCH_GET_FS) {
+        unsafe {
+            long* p = (long*) addr;
+            *p = tlsFsBase;
+        }
+        return 0;
+    } elif (code == ARCH_SET_GS) {
+        unsafe {
+            int low = (int)(addr & 0xFFFFFFFF);
+            int high = (int)((addr >> 32) & 0xFFFFFFFF);
+            asm("wrmsr" : : "c"(0xC0000101), "a"(low), "d"(high));
+        }
+        return 0;
+    }
+    return (long)(0 - EINVAL);
+}
+
+# ── sys_uname(buf) ──
+func sys_uname(long buf) -> long {
+    # struct utsname: 5 fields of 65 bytes each (sysname, nodename, release, version, machine)
+    unsafe {
+        byte* p = (byte*) buf;
+        # Zero everything first (5 * 65 = 325 bytes)
+        for (int i = 0; i < 325; i++) p[i] = 0;
+
+        # sysname (offset 0)
+        byte* sysname = p;
+        sysname[0] = 'S'; sysname[1] = 't'; sysname[2] = 'r';
+        sysname[3] = 'a'; sysname[4] = 't'; sysname[5] = 'O';
+        sysname[6] = 'S';
+
+        # nodename (offset 65)
+        byte* nodename = p + 65;
+        nodename[0] = 's'; nodename[1] = 't'; nodename[2] = 'r';
+        nodename[3] = 'a'; nodename[4] = 't'; nodename[5] = 'o';
+        nodename[6] = 's';
+
+        # release (offset 130)
+        byte* release = p + 130;
+        release[0] = '0'; release[1] = '.'; release[2] = '1';
+        release[3] = '.'; release[4] = '0';
+
+        # version (offset 195)
+        byte* version = p + 195;
+        version[0] = '#'; version[1] = '1';
+
+        # machine (offset 260)
+        byte* machine = p + 260;
+        machine[0] = 'x'; machine[1] = '8'; machine[2] = '6';
+        machine[3] = '_'; machine[4] = '6'; machine[5] = '4';
+    }
+    return 0;
+}
+
+# ── sys_clock_gettime(clockid, tp) ──
+func sys_clock_gettime(int clockid, long tp) -> long {
+    # Return a rough timestamp based on PIT tick count
+    unsafe {
+        long* timespec = (long*) tp;
+        # tv_sec — approximate from timer ticks (100Hz)
+        timespec[0] = 0;    # We don't track wall clock time
+        # tv_nsec
+        timespec[1] = 0;
+    }
+    return 0;
+}
+
+# ── sys_openat(dirfd, pathname, flags, mode) ──
+func sys_openat(int dirfd, long pathnamePtr, int flags, int mode) -> long {
+    string path = readCString(pathnamePtr);
+
+    # If dirfd is AT_FDCWD or path is absolute, resolve normally
+    if (dirfd == AT_FDCWD || (path.length > 0 && path.charAt(0) == '/')) {
+        return sys_open(pathnamePtr, flags, mode);
+    }
+
+    # Otherwise, resolve relative to dirfd's path
+    if (dirfd < 0 || dirfd >= MAX_FDS || !fdOpen[dirfd]) {
+        return (long)(0 - EBADF);
+    }
+
+    string base = fdPaths[dirfd];
+    string fullPath = base + "/" + path;
+
+    # Write the full path to a temporary location and call sys_open
+    # Actually, just inline the open logic
+    int fd = -1;
+    for (int i = 3; i < MAX_FDS; i++) {
+        if (!fdOpen[i]) {
+            fd = i;
+            break;
+        }
+    }
+    if (fd == -1) return (long)(0 - EMFILE);
+
+    bool exists = VFS.exists(fullPath);
+    if (!exists) {
+        if (flags & O_CREAT) {
+            VFS.write(fullPath, "");
+        } else {
+            return (long)(0 - ENOENT);
+        }
+    }
+    if ((flags & O_TRUNC) && exists) {
+        VFS.write(fullPath, "");
+    }
+
+    fdPaths[fd] = fullPath;
+    fdPositions[fd] = 0;
+    fdOpen[fd] = true;
+    fdFlags[fd] = flags;
+
+    return (long) fd;
+}
+
+# ── sys_newfstatat(dirfd, pathname, statbuf, flags) ──
+func sys_newfstatat(int dirfd, long pathnamePtr, long statbuf, int flags) -> long {
+    string path = readCString(pathnamePtr);
+
+    if (dirfd == AT_FDCWD || (path.length > 0 && path.charAt(0) == '/')) {
+        path = resolvePath(path);
+    } else {
+        if (dirfd >= 0 && dirfd < MAX_FDS && fdOpen[dirfd]) {
+            path = fdPaths[dirfd] + "/" + path;
+        } else {
+            return (long)(0 - EBADF);
+        }
+    }
+
+    return fillStatBuf(path, statbuf);
+}
+
+# ── sys_getrandom(buf, buflen) ──
+# Provide pseudo-random bytes using a simple LCG
+int randSeed = 12345;
+func sys_getrandom(long buf, int buflen) -> long {
+    unsafe {
+        byte* p = (byte*) buf;
+        for (int i = 0; i < buflen; i++) {
+            randSeed = randSeed * 1103515245 + 12345;
+            p[i] = (byte)((randSeed >> 16) & 0xFF);
+        }
+    }
+    return (long) buflen;
+}
+
+# Page permission constants (re-exported for convenience)
+int SYSCALL_PAGE_PRESENT  = 0x01;
+int SYSCALL_PAGE_WRITABLE = 0x02;
+int SYSCALL_PAGE_USER     = 0x04;

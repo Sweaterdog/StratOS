@@ -1,0 +1,7 @@
+build/
+*.o
+*.elf
+*.iso
+*.img
+*.gen.cpp
+kernel/core/main

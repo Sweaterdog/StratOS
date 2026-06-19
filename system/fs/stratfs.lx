@@ -1,0 +1,834 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// StratFS — Simple On-Disk Filesystem for StratOS
+// system/fs/stratfs.lx
+//
+// A minimal filesystem designed for StratOS persistent storage.
+// Layout on disk:
+//
+//   Sector 0:     Superblock (magic, version, counts)
+//   Sectors 1-N:  Block bitmap (1 bit per data block)
+//   Sectors N+1:  Inode table (each inode is 128 bytes)
+//   Remaining:    Data blocks (each block = 4 sectors = 2048 bytes)
+//
+// Design decisions:
+//   - Block size: 2048 bytes (4 sectors) — good balance for small files
+//   - Max filename: 120 characters
+//   - Inode size: 128 bytes (fits 4 per sector)
+//   - Directory entries stored as data in directory inodes
+//   - Simple extent-based allocation (start block + block count)
+//
+// This module provides the low-level disk format operations.
+// The VFS module bridges this to the existing VFS API.
+// ============================================================================
+
+import "kernel/drivers/disk.lx";
+import "kernel/memory/manager.lx";
+import "kernel/core/console.lx";
+
+# ============================================================================
+# Filesystem Constants
+# ============================================================================
+
+int STRATFS_MAGIC       = 0x53465331;    # "SFS1"
+int STRATFS_VERSION     = 1;
+int STRATFS_BLOCK_SIZE  = 2048;          # 4 sectors per block
+int STRATFS_SECTORS_PER_BLOCK = 4;
+int STRATFS_INODE_SIZE  = 128;           # Bytes per inode
+int STRATFS_INODES_PER_SECTOR = 4;       # 512 / 128
+int STRATFS_MAX_FILENAME = 120;
+int STRATFS_DIR_ENTRY_SIZE = 128;        # 4 bytes inode + 4 bytes type + 120 bytes name
+
+# Inode types
+int INODE_FREE      = 0;
+int INODE_FILE      = 1;
+int INODE_DIRECTORY  = 2;
+
+# ============================================================================
+# On-Disk Structures (conceptual — accessed via raw byte manipulation)
+# ============================================================================
+#
+# Superblock (sector 0, 512 bytes):
+#   bytes 0-3:   magic (0x53465331)
+#   bytes 4-7:   version (1)
+#   bytes 8-11:  totalBlocks
+#   bytes 12-15: totalInodes
+#   bytes 16-19: freeBlocks
+#   bytes 20-23: freeInodes
+#   bytes 24-27: bitmapStartSector (always 1)
+#   bytes 28-31: bitmapSectorCount
+#   bytes 32-35: inodeTableStartSector
+#   bytes 36-39: inodeTableSectorCount
+#   bytes 40-43: dataStartSector
+#   bytes 44-47: rootInode (always inode 0)
+#   bytes 48-511: reserved/padding
+#
+# Inode (128 bytes):
+#   bytes 0-3:   type (INODE_FREE, INODE_FILE, INODE_DIRECTORY)
+#   bytes 4-7:   size (file size in bytes)
+#   bytes 8-11:  startBlock (first data block)
+#   bytes 12-15: blockCount (number of contiguous data blocks)
+#   bytes 16-19: parentInode (inode number of parent directory)
+#   bytes 20-23: createTime (unused for now)
+#   bytes 24-27: modifyTime (unused for now)
+#   bytes 28-31: permissions (rwxrwxrwx as 9-bit bitmask)
+#   bytes 32-127: reserved
+#
+# Directory entry (128 bytes within directory data):
+#   bytes 0-3:   inodeNumber
+#   bytes 4-7:   entryType (file=1, dir=2)
+#   bytes 8-127: filename (null-terminated, max 120 chars)
+
+# ============================================================================
+# StratFS State
+# ============================================================================
+
+bool fsInitialized = false;
+bool fsFormatted = false;
+
+# Cached superblock values
+int fsTotalBlocks = 0;
+int fsTotalInodes = 0;
+int fsFreeBlocks = 0;
+int fsFreeInodes = 0;
+int fsBitmapStart = 0;
+int fsBitmapSectors = 0;
+int fsInodeStart = 0;
+int fsInodeSectors = 0;
+int fsDataStart = 0;
+int fsRootInode = 0;
+
+# Sector buffer (512 bytes on heap)
+long fsSectorBuf = 0;
+
+# Inode read result globals (set by StratFS.readInode())
+int inodeType = 0;
+int inodeSize = 0;
+int inodeStartBlock = 0;
+int inodeBlockCount = 0;
+int inodeParent = 0;
+
+export class StratFS {
+
+    # ========================================================================
+    # Initialize the filesystem — read superblock from disk
+    # Returns true if a valid StratFS is found
+    # ========================================================================
+    public static func mount() -> bool {
+        if (!Disk.isPresent()) return false;
+
+        # Allocate a sector buffer (512 bytes)
+        fsSectorBuf = MemoryManager.kmalloc(512);
+        if (fsSectorBuf == 0) return false;
+
+        # Read superblock (sector 0)
+        if (Disk.readSector(0, fsSectorBuf) != 0) return false;
+
+        # Check magic number
+        unsafe {
+            int* sb = (int*) fsSectorBuf;
+            if (sb[0] != STRATFS_MAGIC) {
+                # No valid filesystem — needs formatting
+                fsInitialized = true;
+                fsFormatted = false;
+                Console.log("[WARN ] StratFS: No filesystem found — format needed");
+                return true;  # Driver works, just needs format
+            }
+
+            # Read superblock fields
+            fsTotalBlocks  = sb[2];
+            fsTotalInodes  = sb[3];
+            fsFreeBlocks   = sb[4];
+            fsFreeInodes   = sb[5];
+            fsBitmapStart  = sb[6];
+            fsBitmapSectors = sb[7];
+            fsInodeStart   = sb[8];
+            fsInodeSectors = sb[9];
+            fsDataStart    = sb[10];
+            fsRootInode    = sb[11];
+        }
+
+        fsInitialized = true;
+        fsFormatted = true;
+        Console.log("[  OK  ] StratFS: Filesystem mounted");
+        return true;
+    }
+
+    # ========================================================================
+    # Format the disk with a fresh StratFS
+    #
+    # Partition: use the entire disk, minus sector 0 (superblock)
+    # Layout:
+    #   Sector 0:       Superblock
+    #   Sectors 1..B:   Block bitmap
+    #   Sectors B+1..I: Inode table
+    #   Sectors I+1..:  Data blocks
+    # ========================================================================
+    public static func format() -> bool {
+        if (!Disk.isPresent()) return false;
+        if (fsSectorBuf == 0) {
+            fsSectorBuf = MemoryManager.kmalloc(512);
+            if (fsSectorBuf == 0) return false;
+        }
+
+        long totalSectors = Disk.getSectorCount();
+        if (totalSectors <= 64) return false;   # Too small
+
+        # Calculate layout:
+        # Reserve 2048 inodes (2048 * 128 bytes = 256KB = 512 sectors)
+        fsTotalInodes = 2048;
+        fsInodeSectors = (fsTotalInodes * STRATFS_INODE_SIZE) / 512;
+
+        # Bitmap: 1 bit per data block
+        # First calculate how many sectors are left for data after superblock + inode table
+        long availSectors = totalSectors - 1 - (long)fsInodeSectors;
+
+        # Each data block = 4 sectors, so total possible blocks = availSectors / 4
+        # Bitmap needs ceil(blocks / (512 * 8)) sectors = ceil(blocks / 4096) sectors
+        fsTotalBlocks = (int)(availSectors / (long)STRATFS_SECTORS_PER_BLOCK);
+
+        # Reduce for bitmap overhead
+        fsBitmapSectors = (fsTotalBlocks + 4095) / 4096;
+        fsTotalBlocks = (int)((availSectors - (long)fsBitmapSectors) / (long)STRATFS_SECTORS_PER_BLOCK);
+        fsBitmapSectors = (fsTotalBlocks + 4095) / 4096;
+
+        fsBitmapStart = 1;
+        fsInodeStart = fsBitmapStart + fsBitmapSectors;
+        fsDataStart = fsInodeStart + fsInodeSectors;
+        fsFreeBlocks = fsTotalBlocks;
+        fsFreeInodes = fsTotalInodes - 1;   # Root takes inode 0
+        fsRootInode = 0;
+
+        Console.log("[  FS  ] Formatting disk...");
+        Console.log("[  FS  ] Blocks: ${fsTotalBlocks}, Inodes: ${fsTotalInodes}");
+        Console.log("[  FS  ] Data starts at sector: ${fsDataStart}");
+
+        # ── Write superblock ──
+        unsafe {
+            int* sb = (int*) fsSectorBuf;
+            # Zero the buffer first
+            byte* zb = (byte*) fsSectorBuf;
+            for (int i = 0; i < 512; i++) zb[i] = 0;
+
+            sb[0] = STRATFS_MAGIC;
+            sb[1] = STRATFS_VERSION;
+            sb[2] = fsTotalBlocks;
+            sb[3] = fsTotalInodes;
+            sb[4] = fsFreeBlocks;
+            sb[5] = fsFreeInodes;
+            sb[6] = fsBitmapStart;
+            sb[7] = fsBitmapSectors;
+            sb[8] = fsInodeStart;
+            sb[9] = fsInodeSectors;
+            sb[10] = fsDataStart;
+            sb[11] = fsRootInode;
+        }
+        if (Disk.writeSector(0, fsSectorBuf) != 0) return false;
+
+        # ── Zero out block bitmap ──
+        zeroSectors(fsBitmapStart, fsBitmapSectors);
+
+        # ── Zero out inode table ──
+        zeroSectors(fsInodeStart, fsInodeSectors);
+
+        # ── Create root directory inode (inode 0) ──
+        # Allocate one data block for root dir entries
+        int rootBlock = allocBlock();
+        if (rootBlock < 0) return false;
+
+        writeInode(0, INODE_DIRECTORY, 0, rootBlock, 1, 0);
+
+        # Zero the root directory data block
+        zeroBlocks(rootBlock, 1);
+
+        fsFormatted = true;
+        Console.log("[  OK  ] StratFS: Format complete");
+        return true;
+    }
+
+    # ========================================================================
+    # Check if filesystem is formatted
+    # ========================================================================
+    public static func isFormatted() -> bool {
+        return fsFormatted;
+    }
+
+    # ========================================================================
+    # Read an inode from disk
+    # Returns: type, size, startBlock, blockCount, parentInode
+    # We pack these into globals for simplicity (Flux doesn't have tuples)
+    # (Globals are declared at file scope, above the class)
+    # ========================================================================
+
+    public static func readInode(int inodeNum) -> bool {
+        if (inodeNum < 0 || inodeNum >= fsTotalInodes) return false;
+
+        # Calculate which sector and offset
+        int inodesPerSector = 512 / STRATFS_INODE_SIZE;
+        int sector = fsInodeStart + (inodeNum / inodesPerSector);
+        int offset = (inodeNum % inodesPerSector) * STRATFS_INODE_SIZE;
+
+        if (Disk.readSector((long) sector, fsSectorBuf) != 0) return false;
+
+        unsafe {
+            int* fields = (int*)(fsSectorBuf + (long) offset);
+            inodeType       = fields[0];
+            inodeSize       = fields[1];
+            inodeStartBlock = fields[2];
+            inodeBlockCount = fields[3];
+            inodeParent     = fields[4];
+        }
+
+        return true;
+    }
+
+    # ========================================================================
+    # Write an inode to disk
+    # ========================================================================
+    public static func writeInode(int inodeNum, int type, int size, int startBlock, int blockCount, int parent) -> bool {
+        if (inodeNum < 0 || inodeNum >= fsTotalInodes) return false;
+
+        int inodesPerSector = 512 / STRATFS_INODE_SIZE;
+        int sector = fsInodeStart + (inodeNum / inodesPerSector);
+        int offset = (inodeNum % inodesPerSector) * STRATFS_INODE_SIZE;
+
+        # Read the sector first (to preserve other inodes in same sector)
+        if (Disk.readSector((long) sector, fsSectorBuf) != 0) return false;
+
+        unsafe {
+            int* fields = (int*)(fsSectorBuf + (long) offset);
+            fields[0] = type;
+            fields[1] = size;
+            fields[2] = startBlock;
+            fields[3] = blockCount;
+            fields[4] = parent;
+        }
+
+        return Disk.writeSector((long) sector, fsSectorBuf) == 0;
+    }
+
+    # ========================================================================
+    # Read a data block from disk into a provided buffer
+    # bufferAddr must point to at least STRATFS_BLOCK_SIZE bytes
+    # ========================================================================
+    public static func readBlock(int blockNum, long bufferAddr) -> bool {
+        if (blockNum < 0 || blockNum >= fsTotalBlocks) return false;
+
+        long startSector = (long)(fsDataStart + (blockNum * STRATFS_SECTORS_PER_BLOCK));
+        return Disk.readSectors(startSector, STRATFS_SECTORS_PER_BLOCK, bufferAddr) == 0;
+    }
+
+    # ========================================================================
+    # Write a data block to disk from a provided buffer
+    # ========================================================================
+    public static func writeBlock(int blockNum, long bufferAddr) -> bool {
+        if (blockNum < 0 || blockNum >= fsTotalBlocks) return false;
+
+        long startSector = (long)(fsDataStart + (blockNum * STRATFS_SECTORS_PER_BLOCK));
+        return Disk.writeSectors(startSector, STRATFS_SECTORS_PER_BLOCK, bufferAddr) == 0;
+    }
+
+    # ========================================================================
+    # Allocate a free data block from the bitmap
+    # Returns the block number, or -1 if no free blocks
+    # ========================================================================
+    public static func allocBlock() -> int {
+        # Scan bitmap sectors for a free bit
+        for (int sector = 0; sector < fsBitmapSectors; sector++) {
+            if (Disk.readSector((long)(fsBitmapStart + sector), fsSectorBuf) != 0) return -1;
+
+            unsafe {
+                byte* bitmap = (byte*) fsSectorBuf;
+                for (int byteIdx = 0; byteIdx < 512; byteIdx++) {
+                    if (bitmap[byteIdx] != 0xFF) {
+                        # Found a byte with at least one free bit
+                        for (int bit = 0; bit < 8; bit++) {
+                            if ((bitmap[byteIdx] & (1 << bit)) == 0) {
+                                int blockNum = (sector * 4096) + (byteIdx * 8) + bit;
+                                if (blockNum >= fsTotalBlocks) return -1;
+
+                                # Mark as allocated
+                                bitmap[byteIdx] = bitmap[byteIdx] | (byte)(1 << bit);
+                                Disk.writeSector((long)(fsBitmapStart + sector), fsSectorBuf);
+
+                                fsFreeBlocks--;
+                                updateSuperblockCounts();
+
+                                return blockNum;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return -1;   # Disk full
+    }
+
+    # ========================================================================
+    # Free a data block — mark it as available in the bitmap
+    # ========================================================================
+    public static func freeBlock(int blockNum) -> void {
+        if (blockNum < 0 || blockNum >= fsTotalBlocks) return;
+
+        int sector = blockNum / 4096;
+        int byteIdx = (blockNum % 4096) / 8;
+        int bit = blockNum % 8;
+
+        if (Disk.readSector((long)(fsBitmapStart + sector), fsSectorBuf) != 0) return;
+
+        unsafe {
+            byte* bitmap = (byte*) fsSectorBuf;
+            bitmap[byteIdx] = bitmap[byteIdx] & (byte)(~(1 << bit));
+        }
+
+        Disk.writeSector((long)(fsBitmapStart + sector), fsSectorBuf);
+        fsFreeBlocks++;
+        updateSuperblockCounts();
+    }
+
+    # ========================================================================
+    # Allocate a free inode
+    # Returns the inode number, or -1 if none available
+    # ========================================================================
+    public static func allocInode() -> int {
+        # Scan inode table for a free inode (type == INODE_FREE)
+        int inodesPerSector = 512 / STRATFS_INODE_SIZE;
+
+        for (int sector = 0; sector < fsInodeSectors; sector++) {
+            if (Disk.readSector((long)(fsInodeStart + sector), fsSectorBuf) != 0) return -1;
+
+            unsafe {
+                for (int i = 0; i < inodesPerSector; i++) {
+                    int* fields = (int*)(fsSectorBuf + (long)(i * STRATFS_INODE_SIZE));
+                    if (fields[0] == INODE_FREE) {
+                        int inodeNum = (sector * inodesPerSector) + i;
+                        if (inodeNum == 0) continue;   # Skip root inode
+                        fsFreeInodes--;
+                        return inodeNum;
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+
+    # ========================================================================
+    # Create a file or directory in a parent directory
+    #
+    # parentInodeNum — inode of the parent directory
+    # name           — filename (max 120 chars)
+    # type           — INODE_FILE or INODE_DIRECTORY
+    #
+    # Returns new inode number, or -1 on error
+    # ========================================================================
+    public static func createEntry(int parentInodeNum, string name, int type) -> int {
+        # Allocate a new inode
+        int newInode = allocInode();
+        if (newInode < 0) return -1;
+
+        # Allocate a data block for the new entry
+        int newBlock = allocBlock();
+        if (newBlock < 0) return -1;
+
+        # Initialize the inode
+        writeInode(newInode, type, 0, newBlock, 1, parentInodeNum);
+
+        # Zero the data block
+        long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+        if (blockBuf == 0) return -1;
+        unsafe {
+            byte* p = (byte*) blockBuf;
+            for (int i = 0; i < STRATFS_BLOCK_SIZE; i++) p[i] = 0;
+        }
+        writeBlock(newBlock, blockBuf);
+
+        # Add a directory entry in the parent
+        addDirEntry(parentInodeNum, newInode, type, name);
+
+        return newInode;
+    }
+
+    # ========================================================================
+    # Add a directory entry to a directory's data block
+    # ========================================================================
+    public static func addDirEntry(int dirInode, int childInode, int childType, string name) -> bool {
+        # Read the directory's inode to find its data block
+        if (!readInode(dirInode)) return false;
+        int dirBlock = inodeStartBlock;
+        int dirSize = inodeSize;
+
+        # Read the directory data block
+        long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+        if (blockBuf == 0) return false;
+        if (!readBlock(dirBlock, blockBuf)) return false;
+
+        # Find the next free slot (entries are STRATFS_DIR_ENTRY_SIZE each)
+        int maxEntries = STRATFS_BLOCK_SIZE / STRATFS_DIR_ENTRY_SIZE;
+        int entryIdx = dirSize / STRATFS_DIR_ENTRY_SIZE;
+
+        if (entryIdx >= maxEntries) {
+            # TODO: Allocate additional blocks for large directories
+            return false;
+        }
+
+        # Write the new entry
+        unsafe {
+            int offset = entryIdx * STRATFS_DIR_ENTRY_SIZE;
+            int* fields = (int*)(blockBuf + (long) offset);
+            fields[0] = childInode;
+            fields[1] = childType;
+
+            # Copy filename
+            byte* namePtr = (byte*)(blockBuf + (long)(offset + 8));
+            long nameAddr = (long) name.c_str();
+            byte* nameSrc = (byte*) nameAddr;
+            int nameLen = name.length;
+            if (nameLen > STRATFS_MAX_FILENAME - 1) nameLen = STRATFS_MAX_FILENAME - 1;
+            for (int i = 0; i < nameLen; i++) {
+                namePtr[i] = nameSrc[i];
+            }
+            namePtr[nameLen] = 0;   # Null terminate
+        }
+
+        # Write back the data block
+        writeBlock(dirBlock, blockBuf);
+
+        # Update the directory inode size
+        int newSize = dirSize + STRATFS_DIR_ENTRY_SIZE;
+        writeInode(dirInode, INODE_DIRECTORY, newSize, dirBlock, 1, inodeParent);
+
+        return true;
+    }
+
+    # ========================================================================
+    # Look up a name in a directory, return inode number or -1
+    # ========================================================================
+    public static func lookupInDir(int dirInode, string name) -> int {
+        if (!readInode(dirInode)) return -1;
+        if (inodeType != INODE_DIRECTORY) return -1;
+
+        int dirBlock = inodeStartBlock;
+        int dirSize = inodeSize;
+        if (dirSize == 0) return -1;
+
+        long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+        if (blockBuf == 0) return -1;
+        if (!readBlock(dirBlock, blockBuf)) return -1;
+
+        int numEntries = dirSize / STRATFS_DIR_ENTRY_SIZE;
+        unsafe {
+            for (int i = 0; i < numEntries; i++) {
+                int offset = i * STRATFS_DIR_ENTRY_SIZE;
+                int* fields = (int*)(blockBuf + (long) offset);
+                int entryInode = fields[0];
+
+                # Compare the name
+                byte* entryName = (byte*)(blockBuf + (long)(offset + 8));
+                long nameAddr = (long) name.c_str();
+                byte* target = (byte*) nameAddr;
+
+                bool match = true;
+                int j = 0;
+                while (j < STRATFS_MAX_FILENAME) {
+                    if (entryName[j] != target[j]) {
+                        match = false;
+                        break;
+                    }
+                    if (entryName[j] == 0) break;
+                    j++;
+                }
+
+                if (match && target[j] == 0) {
+                    return entryInode;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    # ========================================================================
+    # Resolve a full path to an inode number
+    # E.g. "/home/void/hello.txt" → inode number
+    # ========================================================================
+    public static func resolvePath(string path) -> int {
+        if (path == "/" || path.length == 0) return fsRootInode;
+
+        # Split path by '/'
+        int current = fsRootInode;
+        string component = "";
+        int i = 0;
+        if (path.charAt(0) == '/') i = 1;   # Skip leading slash
+
+        while (i <= path.length) {
+            if (i == path.length || path.charAt(i) == '/') {
+                if (component.length > 0) {
+                    int found = lookupInDir(current, component);
+                    if (found < 0) return -1;   # Not found
+                    current = found;
+                    component = "";
+                }
+            } else {
+                string ch = "${path.charAt(i)}";
+                component = component + ch;
+            }
+            i++;
+        }
+
+        return current;
+    }
+
+    # ========================================================================
+    # Read file data from disk into a FluxString
+    # ========================================================================
+    public static func readFile(int inodeNum) -> string {
+        if (!readInode(inodeNum)) return "";
+        if (inodeType != INODE_FILE) return "";
+
+        int fileSize = inodeSize;
+        if (fileSize == 0) return "";
+
+        int startBlock = inodeStartBlock;
+        int numBlocks = inodeBlockCount;
+
+        long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+        if (blockBuf == 0) return "";
+
+        string result = "";
+        int bytesRead = 0;
+
+        for (int b = 0; b < numBlocks && bytesRead < fileSize; b++) {
+            if (!readBlock(startBlock + b, blockBuf)) return result;
+
+            int toRead = fileSize - bytesRead;
+            if (toRead > STRATFS_BLOCK_SIZE) toRead = STRATFS_BLOCK_SIZE;
+
+            # Build string from raw bytes
+            unsafe {
+                byte* data = (byte*) blockBuf;
+                for (int i = 0; i < toRead; i++) {
+                    string ch = "${(char) data[i]}";
+                    result = result + ch;
+                }
+            }
+
+            bytesRead = bytesRead + toRead;
+        }
+
+        return result;
+    }
+
+    # ========================================================================
+    # Write file data to disk from a string
+    # ========================================================================
+    public static func writeFile(int inodeNum, string data) -> bool {
+        if (!readInode(inodeNum)) return false;
+        if (inodeType != INODE_FILE) return false;
+
+        int dataLen = data.length;
+        int blocksNeeded = (dataLen + STRATFS_BLOCK_SIZE - 1) / STRATFS_BLOCK_SIZE;
+        if (blocksNeeded == 0) blocksNeeded = 1;
+
+        # If the existing allocation is too small, allocate more blocks
+        int startBlock = inodeStartBlock;
+        int currentBlocks = inodeBlockCount;
+
+        if (blocksNeeded > currentBlocks) {
+            # Free old blocks
+            for (int b = 0; b < currentBlocks; b++) {
+                freeBlock(startBlock + b);
+            }
+
+            # Allocate new contiguous blocks (simple approach: find first fit)
+            startBlock = allocBlock();
+            if (startBlock < 0) return false;
+
+            for (int b = 1; b < blocksNeeded; b++) {
+                int nb = allocBlock();
+                if (nb < 0) return false;
+                # Note: this assumes contiguous allocation, may fragment
+            }
+            currentBlocks = blocksNeeded;
+        }
+
+        # Write data to blocks
+        long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+        if (blockBuf == 0) return false;
+
+        int bytesWritten = 0;
+        for (int b = 0; b < blocksNeeded; b++) {
+            # Zero the buffer
+            unsafe {
+                byte* p = (byte*) blockBuf;
+                for (int i = 0; i < STRATFS_BLOCK_SIZE; i++) p[i] = 0;
+            }
+
+            int toWrite = dataLen - bytesWritten;
+            if (toWrite > STRATFS_BLOCK_SIZE) toWrite = STRATFS_BLOCK_SIZE;
+
+            # Copy string data into buffer
+            unsafe {
+                byte* dst = (byte*) blockBuf;
+                long srcAddr = (long) data.c_str();
+                byte* src = (byte*) srcAddr;
+                for (int i = 0; i < toWrite; i++) {
+                    dst[i] = src[bytesWritten + i];
+                }
+            }
+
+            if (!writeBlock(startBlock + b, blockBuf)) return false;
+            bytesWritten = bytesWritten + toWrite;
+        }
+
+        # Update inode
+        writeInode(inodeNum, INODE_FILE, dataLen, startBlock, blocksNeeded, inodeParent);
+
+        return true;
+    }
+
+    # ========================================================================
+    # Delete a file or empty directory
+    # ========================================================================
+    public static func deleteEntry(int parentInode, string name) -> bool {
+        int target = lookupInDir(parentInode, name);
+        if (target < 0) return false;
+
+        # Read the target inode
+        if (!readInode(target)) return false;
+
+        # If directory, check it's empty
+        if (inodeType == INODE_DIRECTORY && inodeSize > 0) {
+            return false;   # Can't delete non-empty directory
+        }
+
+        # Free data blocks
+        for (int b = 0; b < inodeBlockCount; b++) {
+            freeBlock(inodeStartBlock + b);
+        }
+
+        # Clear the inode
+        writeInode(target, INODE_FREE, 0, 0, 0, 0);
+        fsFreeInodes++;
+
+        # Remove the directory entry from parent (compact the entries)
+        removeDirEntry(parentInode, name);
+
+        updateSuperblockCounts();
+        return true;
+    }
+
+    # ========================================================================
+    # Sync — flush superblock counts to disk
+    # ========================================================================
+    public static func sync() -> void {
+        updateSuperblockCounts();
+    }
+}
+
+# ============================================================================
+# Internal helper functions
+# ============================================================================
+
+# Zero a range of sectors
+func zeroSectors(int start, int count) -> void {
+    unsafe {
+        byte* buf = (byte*) fsSectorBuf;
+        for (int i = 0; i < 512; i++) buf[i] = 0;
+    }
+    for (int i = 0; i < count; i++) {
+        Disk.writeSector((long)(start + i), fsSectorBuf);
+    }
+}
+
+# Zero a range of data blocks
+func zeroBlocks(int startBlock, int count) -> void {
+    long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+    if (blockBuf == 0) return;
+    unsafe {
+        byte* p = (byte*) blockBuf;
+        for (int i = 0; i < STRATFS_BLOCK_SIZE; i++) p[i] = 0;
+    }
+    for (int b = 0; b < count; b++) {
+        StratFS.writeBlock(startBlock + b, blockBuf);
+    }
+}
+
+# Update free counts in superblock on disk
+func updateSuperblockCounts() -> void {
+    if (Disk.readSector(0, fsSectorBuf) != 0) return;
+    unsafe {
+        int* sb = (int*) fsSectorBuf;
+        sb[4] = fsFreeBlocks;
+        sb[5] = fsFreeInodes;
+    }
+    Disk.writeSector(0, fsSectorBuf);
+}
+
+# Remove a directory entry by compacting the directory
+func removeDirEntry(int dirInode, string name) -> void {
+    StratFS.readInode(dirInode);
+    int dirBlock = inodeStartBlock;
+    int dirSize = inodeSize;
+
+    long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+    if (blockBuf == 0) return;
+    if (!StratFS.readBlock(dirBlock, blockBuf)) return;
+
+    int numEntries = dirSize / STRATFS_DIR_ENTRY_SIZE;
+    int foundIdx = -1;
+
+    # Find the entry
+    unsafe {
+        for (int i = 0; i < numEntries; i++) {
+            int offset = i * STRATFS_DIR_ENTRY_SIZE;
+            byte* entryName = (byte*)(blockBuf + (long)(offset + 8));
+            long nameAddr = (long) name.c_str();
+            byte* target = (byte*) nameAddr;
+
+            bool match = true;
+            int j = 0;
+            while (j < STRATFS_MAX_FILENAME) {
+                if (entryName[j] != target[j]) {
+                    match = false;
+                    break;
+                }
+                if (entryName[j] == 0) break;
+                j++;
+            }
+            if (match && target[j] == 0) {
+                foundIdx = i;
+                break;
+            }
+        }
+
+        if (foundIdx >= 0 && foundIdx < numEntries - 1) {
+            # Compact: shift later entries up
+            for (int i = foundIdx; i < numEntries - 1; i++) {
+                int dstOff = i * STRATFS_DIR_ENTRY_SIZE;
+                int srcOff = (i + 1) * STRATFS_DIR_ENTRY_SIZE;
+                byte* dst = (byte*)(blockBuf + (long) dstOff);
+                byte* src = (byte*)(blockBuf + (long) srcOff);
+                for (int b = 0; b < STRATFS_DIR_ENTRY_SIZE; b++) {
+                    dst[b] = src[b];
+                }
+            }
+        }
+
+        if (foundIdx >= 0) {
+            # Zero the last slot
+            int lastOff = (numEntries - 1) * STRATFS_DIR_ENTRY_SIZE;
+            byte* last = (byte*)(blockBuf + (long) lastOff);
+            for (int b = 0; b < STRATFS_DIR_ENTRY_SIZE; b++) {
+                last[b] = 0;
+            }
+        }
+    }
+
+    if (foundIdx >= 0) {
+        StratFS.writeBlock(dirBlock, blockBuf);
+
+        # Update directory size
+        int newSize = dirSize - STRATFS_DIR_ENTRY_SIZE;
+        StratFS.writeInode(dirInode, INODE_DIRECTORY, newSize, dirBlock, 1, inodeParent);
+    }
+}

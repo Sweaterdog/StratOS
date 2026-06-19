@@ -1,0 +1,220 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Games Launcher — Browse and launch games from /games/ directory
+// apps/games/games.lx
+//
+// Displays available games with thumbnails and descriptions.
+// Games can be .flux files run via the Flux runtime, or AOT-compiled modules.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/fs/vfs.lx";
+
+# ============================================================================
+# Game registry — AOT-compiled games known at build time
+# Each game has a name, description, appType (for compositor), and color
+# ============================================================================
+int gameCount = 1;
+
+string gameName0   = "Snake";
+string gameDesc0   = "Classic snake game. Eat food, grow longer, avoid walls and yourself.";
+string gameType0   = "snake";
+color32 gameColor0 = 0x66BB6AFF;
+string gameCtrl0   = "Arrow Keys + Space";
+
+# Accessors for game registry
+func getGameName(int i) -> string {
+    if (i == 0) return gameName0;
+    return "";
+}
+func getGameDesc(int i) -> string {
+    if (i == 0) return gameDesc0;
+    return "";
+}
+func getGameType(int i) -> string {
+    if (i == 0) return gameType0;
+    return "";
+}
+func getGameColor(int i) -> color32 {
+    if (i == 0) return gameColor0;
+    return 0xC8D0E0FF;
+}
+func getGameControls(int i) -> string {
+    if (i == 0) return gameCtrl0;
+    return "";
+}
+
+# Launcher state
+int gamesSelectedIdx = 0;
+string gamesPendingLaunch = "";
+int gamesScrollY = 0;
+
+export class GamesApp {
+    public static func init() -> void {
+        gamesSelectedIdx = 0;
+        gamesPendingLaunch = "";
+        gamesScrollY = 0;
+
+        # Seed game .flux files into VFS so users can see the source
+        if (!VFS.exists("/games")) {
+            VFS.mkdirp("/games");
+        }
+        if (!VFS.exists("/games/snake")) {
+            VFS.mkdirp("/games/snake");
+        }
+        if (!VFS.exists("/games/snake/info.txt")) {
+            VFS.write("/games/snake/info.txt", "Snake Game\nArrow keys to move, Space to start\nEat the red food to grow!");
+        }
+    }
+
+    # Returns the game appType that should be launched, or "" if none
+    public static func getPendingLaunch() -> string {
+        string result = gamesPendingLaunch;
+        gamesPendingLaunch = "";
+        return result;
+    }
+
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        int scancode = event.scancode;
+        if (scancode == 72) {
+            # Up arrow
+            if (gamesSelectedIdx > 0) {
+                gamesSelectedIdx = gamesSelectedIdx - 1;
+            }
+        } elif (scancode == 80) {
+            # Down arrow
+            if (gamesSelectedIdx < gameCount - 1) {
+                gamesSelectedIdx = gamesSelectedIdx + 1;
+            }
+        } elif (scancode == 28) {
+            # Enter — launch selected game
+            if (gamesSelectedIdx >= 0 && gamesSelectedIdx < gameCount) {
+                gamesPendingLaunch = getGameType(gamesSelectedIdx);
+            }
+        }
+    }
+
+    public static func processClick(int relX, int relY, int w, int h) -> void {
+        # Header area is 70px, each card is 90px tall with 8px spacing
+        int cardAreaY = 70;
+        int cardH = 90;
+        int cardSpacing = 8;
+        int margin = 16;
+
+        if (relY < cardAreaY) return;
+
+        int localY = relY - cardAreaY + gamesScrollY;
+        int idx = localY / (cardH + cardSpacing);
+
+        if (idx >= 0 && idx < gameCount) {
+            gamesSelectedIdx = idx;
+
+            # Check if click is on the "Play" button area (right side of card)
+            int cardRight = w - margin;
+            int btnW = 70;
+            int btnX = cardRight - btnW - 12;
+            if (relX >= btnX && relX <= btnX + btnW) {
+                # Launch the game
+                gamesPendingLaunch = getGameType(idx);
+            }
+        }
+    }
+
+    public static func draw(int x, int y, int w, int h) -> void {
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        int margin = 16;
+        int contentX = x + margin;
+        int contentW = w - margin * 2;
+
+        # Header
+        TextRender.drawText("Games", contentX, y + 12, 0xE6EDF3FF);
+
+        # Subtitle
+        string countStr = "${gameCount} games available";
+        TextRender.drawText(countStr, contentX, y + 32, 0x8B949EFF);
+
+        # Divider
+        Framebuffer.fillRect(contentX, y + 52, contentW, 1, 0x30363DFF);
+
+        # Game cards
+        int cardY = y + 70;
+        int cardH = 90;
+        int cardSpacing = 8;
+
+        for (int i = 0; i < gameCount; i++) {
+            int cy = cardY + i * (cardH + cardSpacing) - gamesScrollY;
+
+            # Skip if out of view
+            if (cy + cardH < y + 70) continue;
+            if (cy > y + h) break;
+
+            bool selected = (i == gamesSelectedIdx);
+            drawGameCard(contentX, cy, contentW, cardH, i, selected);
+        }
+    }
+
+    private static func drawGameCard(int x, int y, int w, int h, int idx, bool selected) -> void {
+        # Card background
+        color32 bg = selected ? 0x1C2333FF : 0x161B22FF;
+        Framebuffer.fillRoundedRect(x, y, w, h, 6, bg);
+
+        # Selection border
+        if (selected) {
+            Framebuffer.drawRoundedRect(x, y, w, h, 6, 0x58A6FFFF);
+        } else {
+            Framebuffer.drawRoundedRect(x, y, w, h, 6, 0x30363DFF);
+        }
+
+        # Game icon (colored square with first letter)
+        int iconSize = 56;
+        int iconX = x + 12;
+        int iconY = y + (h - iconSize) / 2;
+        color32 iconColor = getGameColor(idx);
+        Framebuffer.fillRoundedRect(iconX, iconY, iconSize, iconSize, 8, iconColor);
+
+        # Draw game initial letter
+        string name = getGameName(idx);
+        if (name.length > 0) {
+            string initial = name.substr(0, 1);
+            TextRender.drawText(initial, iconX + 22, iconY + 20, 0xFFFFFFFF);
+        }
+
+        # Game name
+        int textX = iconX + iconSize + 16;
+        int nameY = y + 14;
+        TextRender.drawText(name, textX, nameY, 0xE6EDF3FF);
+
+        # Description
+        string desc = getGameDesc(idx);
+        int descY = nameY + 22;
+        # Truncate description if too long
+        int maxChars = (w - (textX - x) - 100) / 8;
+        if (maxChars > 0 && desc.length > maxChars) {
+            desc = desc.substr(0, maxChars) + "...";
+        }
+        TextRender.drawText(desc, textX, descY, 0x8B949EFF);
+
+        # Controls info
+        string controls = getGameControls(idx);
+        int ctrlY = descY + 18;
+        TextRender.drawText(controls, textX, ctrlY, 0x6B7280FF);
+
+        # Play button
+        int btnW = 70;
+        int btnH = 30;
+        int btnX = x + w - btnW - 12;
+        int btnY = y + (h - btnH) / 2;
+        color32 btnBg = selected ? 0x238636FF : 0x21262DFF;
+        color32 btnFg = selected ? 0xFFFFFFFF : 0x8B949EFF;
+        Framebuffer.fillRoundedRect(btnX, btnY, btnW, btnH, 4, btnBg);
+        TextRender.drawText("Play", btnX + 19, btnY + 8, btnFg);
+    }
+}

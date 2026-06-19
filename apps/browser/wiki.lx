@@ -1,0 +1,595 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// VoidSearch Encyclopedia — Built-in knowledge base for Void Browser
+// apps/browser/wiki.lx
+//
+// Contains 15 encyclopedia articles covering computing, science,
+// technology, and general knowledge. Provides search matching and
+// page rendering for the browser's built-in search engine.
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+int WIKI_ARTICLE_COUNT = 15;
+
+export class Wiki {
+
+    public static func getArticleCount() -> int {
+        return WIKI_ARTICLE_COUNT;
+    }
+
+    # ========================================================================
+    # Article Data Accessors
+    # ========================================================================
+
+    public static func getTitle(int id) -> string {
+        switch (id) {
+            case 0:  return "Operating Systems";
+            case 1:  return "Programming Languages";
+            case 2:  return "Computer Networks";
+            case 3:  return "Artificial Intelligence";
+            case 4:  return "Cryptography";
+            case 5:  return "Space Exploration";
+            case 6:  return "Mathematics";
+            case 7:  return "Physics";
+            case 8:  return "Climate Science";
+            case 9:  return "World Wide Web";
+            case 10: return "Open Source Software";
+            case 11: return "Quantum Computing";
+            case 12: return "Robotics";
+            case 13: return "Video Game History";
+            case 14: return "Renewable Energy";
+            default: return "Unknown Article";
+        }
+    }
+
+    public static func getKeywords(int id) -> string {
+        switch (id) {
+            case 0:  return "os kernel process memory thread scheduler boot driver";
+            case 1:  return "code compiler interpreter syntax paradigm runtime type";
+            case 2:  return "internet tcp ip packet routing protocol lan wan dns server";
+            case 3:  return "ai machine learning neural network deep model training data";
+            case 4:  return "encryption cipher hash key security digital certificate rsa aes";
+            case 5:  return "nasa rocket moon mars satellite orbit apollo mission astronaut";
+            case 6:  return "algebra calculus geometry number proof theorem equation pi";
+            case 7:  return "mechanics relativity quantum thermodynamics force energy atom";
+            case 8:  return "climate temperature co2 greenhouse warming earth weather ocean";
+            case 9:  return "html http browser url website tim berners lee hypertext server";
+            case 10: return "linux gpl free license community gnu github fork open code";
+            case 11: return "qubit superposition entanglement gate algorithm shor grover";
+            case 12: return "robot sensor actuator autonomous arm industrial drone control";
+            case 13: return "game console nintendo atari pong arcade pixel retro engine unity";
+            case 14: return "solar wind hydro geothermal sustainable power electricity clean";
+            default: return "";
+        }
+    }
+
+    public static func getPreview(int id) -> string {
+        switch (id) {
+            case 0:  return "System software that manages computer hardware and resources.";
+            case 1:  return "Formal languages for expressing computational instructions.";
+            case 2:  return "Interconnected devices sharing data via standardized protocols.";
+            case 3:  return "Systems designed to simulate human intelligence and learning.";
+            case 4:  return "Techniques for secure communication and data protection.";
+            case 5:  return "The investigation and exploration of outer space by humanity.";
+            case 6:  return "The abstract science of number, quantity, and space.";
+            case 7:  return "The study of matter, energy, and the fundamental forces of nature.";
+            case 8:  return "The study of long-term weather patterns and global changes.";
+            case 9:  return "A system of interlinked hypertext documents accessed via the Internet.";
+            case 10: return "Software released with source code freely available to modify.";
+            case 11: return "Computing that uses quantum-mechanical phenomena like superposition.";
+            case 12: return "Machines capable of carrying out complex actions automatically.";
+            case 13: return "The evolution of electronic interactive entertainment over decades.";
+            case 14: return "Energy collected from naturally replenishing sources like sun and wind.";
+            default: return "";
+        }
+    }
+
+    # Convert an article ID to its URL string
+    public static func wikiUrl(int id) -> string {
+        switch (id) {
+            case 0:  return "stratos://wiki/0";
+            case 1:  return "stratos://wiki/1";
+            case 2:  return "stratos://wiki/2";
+            case 3:  return "stratos://wiki/3";
+            case 4:  return "stratos://wiki/4";
+            case 5:  return "stratos://wiki/5";
+            case 6:  return "stratos://wiki/6";
+            case 7:  return "stratos://wiki/7";
+            case 8:  return "stratos://wiki/8";
+            case 9:  return "stratos://wiki/9";
+            case 10: return "stratos://wiki/10";
+            case 11: return "stratos://wiki/11";
+            case 12: return "stratos://wiki/12";
+            case 13: return "stratos://wiki/13";
+            case 14: return "stratos://wiki/14";
+            default: return "stratos://wiki/0";
+        }
+    }
+
+    # Convert a small number (0-15) to its string representation
+    public static func numToStr(int n) -> string {
+        switch (n) {
+            case 0: return "0";   case 1: return "1";
+            case 2: return "2";   case 3: return "3";
+            case 4: return "4";   case 5: return "5";
+            case 6: return "6";   case 7: return "7";
+            case 8: return "8";   case 9: return "9";
+            case 10: return "10"; case 11: return "11";
+            case 12: return "12"; case 13: return "13";
+            case 14: return "14"; case 15: return "15";
+            default: return "?";
+        }
+    }
+
+    # ========================================================================
+    # Search Matching
+    # ========================================================================
+
+    # Check if an article matches a search query (case-insensitive)
+    # Supports multi-word queries (all words must match title or keywords)
+    public static func matchesQuery(int id, string query) -> bool {
+        if (query.length == 0) return false;
+        string q = query.toLower().trim();
+        if (q.length == 0) return false;
+        string t = getTitle(id).toLower();
+        string k = getKeywords(id).toLower();
+        string p = getPreview(id).toLower();
+
+        # Try full query match first
+        if (t.contains(q)) return true;
+        if (k.contains(q)) return true;
+        if (p.contains(q)) return true;
+
+        # Split query into words and check each word matches at least one field
+        int wordStart = 0;
+        for (int i = 0; i <= q.length; i++) {
+            bool isSep = false;
+            if (i == q.length) {
+                isSep = true;
+            } elif (q.charAt(i) == ' ') {
+                isSep = true;
+            }
+            if (isSep && i > wordStart) {
+                string word = q.substring(wordStart, i);
+                if (word.length > 0) {
+                    bool wordFound = false;
+                    if (t.contains(word)) wordFound = true;
+                    if (k.contains(word)) wordFound = true;
+                    if (p.contains(word)) wordFound = true;
+                    if (!wordFound) return false;
+                }
+                wordStart = i + 1;
+            } elif (isSep) {
+                wordStart = i + 1;
+            }
+        }
+        return true;
+    }
+
+    # Parse article ID from a wiki URL like "stratos://wiki/12"
+    # Returns 0 on failure
+    public static func parseWikiId(string url) -> int {
+        # "stratos://wiki/" = 15 chars
+        if (url.length <= 15) return 0;
+        string num = url.substring(15, url.length);
+        if (num == "0") return 0;
+        if (num == "1") return 1;
+        if (num == "2") return 2;
+        if (num == "3") return 3;
+        if (num == "4") return 4;
+        if (num == "5") return 5;
+        if (num == "6") return 6;
+        if (num == "7") return 7;
+        if (num == "8") return 8;
+        if (num == "9") return 9;
+        if (num == "10") return 10;
+        if (num == "11") return 11;
+        if (num == "12") return 12;
+        if (num == "13") return 13;
+        if (num == "14") return 14;
+        return 0;
+    }
+
+    # Parse search query from URL like "stratos://search?q=hello"
+    public static func parseSearchQuery(string url) -> string {
+        # "stratos://search?q=" = 19 chars
+        if (url.length <= 19) return "";
+        return url.substring(19, url.length);
+    }
+
+    # ========================================================================
+    # Search Results Page Renderer
+    # ========================================================================
+
+    public static func drawSearchPage(string query, int x, int y, int w, int h, int scrollY) -> void {
+        int centerX = x + w / 2;
+        int charW = TextRender.getCharWidth();
+
+        # VoidSearch branding
+        int logoY = y + 40 - scrollY;
+        if (logoY > y - 40 && logoY < y + h) {
+            Framebuffer.fillCircle(centerX, logoY, 22, 0x5B8CFF40);
+            Framebuffer.fillCircle(centerX, logoY, 15, 0x5B8CFF80);
+            Framebuffer.fillCircle(centerX, logoY, 8, 0x5B8CFFFF);
+        }
+
+        int titleY = logoY + 30;
+        if (titleY > y && titleY < y + h) {
+            string brand = "VoidSearch";
+            int brandW = brand.length * charW;
+            TextRender.drawText(brand, centerX - brandW / 2, titleY, 0xE6EDF3FF);
+        }
+
+        # "Results for: query"
+        int queryY = titleY + 40;
+        if (queryY > y && queryY < y + h) {
+            string displayQ = query;
+            if (displayQ.length > 40) displayQ = displayQ.substring(0, 40);
+            string label = "Results for: " + displayQ;
+            TextRender.drawText(label, x + 40, queryY, 0x8B949EFF);
+        }
+
+        # Divider
+        int divY = queryY + 25;
+        if (divY > y && divY < y + h) {
+            Framebuffer.drawHLine(x + 40, divY, w - 80, 0x21262DFF);
+        }
+
+        # Count matches
+        int matchCount = 0;
+        for (int i = 0; i < WIKI_ARTICLE_COUNT; i++) {
+            if (matchesQuery(i, query)) matchCount = matchCount + 1;
+        }
+
+        int countY = divY + 10;
+        if (countY > y && countY < y + h) {
+            string countStr = numToStr(matchCount) + " results found";
+            TextRender.drawText(countStr, x + 40, countY, 0x6B7280FF);
+        }
+
+        # List matching articles
+        int resultY = countY + 30;
+        int resultIdx = 0;
+        for (int i = 0; i < WIKI_ARTICLE_COUNT; i++) {
+            if (!matchesQuery(i, query)) continue;
+            if (resultIdx >= 10) break;
+
+            int ry = resultY + resultIdx * 72;
+            if (ry > y + h) break;
+            if (ry + 60 > y) {
+                # Accent dot
+                Framebuffer.fillCircle(x + 48, ry + 6, 3, Theme.textAccent);
+
+                # Title (accent color — clickable)
+                string title = getTitle(i);
+                TextRender.drawText(title, x + 60, ry, Theme.textAccent);
+
+                # URL in green
+                string wUrl = wikiUrl(i);
+                TextRender.drawText(wUrl, x + 60, ry + 18, 0x56D364FF);
+
+                # Preview text
+                string prev = getPreview(i);
+                int maxChars = (w - 110) / charW;
+                if (prev.length > maxChars) {
+                    prev = prev.substring(0, maxChars);
+                }
+                TextRender.drawText(prev, x + 60, ry + 36, 0x6B7280FF);
+            }
+            resultIdx = resultIdx + 1;
+        }
+
+        # No results message
+        if (matchCount == 0) {
+            int noY = resultY;
+            if (noY > y && noY < y + h) {
+                TextRender.drawText("No results found.", x + 48, noY, 0x6B7280FF);
+                TextRender.drawText("Try different keywords or browse:", x + 48, noY + 28, 0x484F58FF);
+                TextRender.drawText("stratos://home", x + 48, noY + 50, Theme.textAccent);
+            }
+        }
+    }
+
+    # Handle click on search results page — returns URL to navigate to, or ""
+    public static func handleSearchClick(string query, int pageRelY) -> string {
+        # Page layout (absolute positions from page top):
+        #   logoY=40, titleY=70, queryY=110, divY=135, countY=145, resultY=175
+        int resultStartY = 175;
+        int resultH = 72;
+
+        if (pageRelY < resultStartY) return "";
+        int clickedIdx = (pageRelY - resultStartY) / resultH;
+        if (clickedIdx < 0) return "";
+        if (clickedIdx >= 10) return "";
+
+        # Find the Nth matching article
+        int matchIdx = 0;
+        for (int i = 0; i < WIKI_ARTICLE_COUNT; i++) {
+            if (!matchesQuery(i, query)) continue;
+            if (matchIdx == clickedIdx) {
+                return wikiUrl(i);
+            }
+            matchIdx = matchIdx + 1;
+        }
+        return "";
+    }
+
+    # ========================================================================
+    # Wiki Article Page Renderer
+    # ========================================================================
+
+    public static func drawArticlePage(int id, int x, int y, int w, int h, int scrollY) -> void {
+        int lx = x + 40;
+        int ly = y + 30 - scrollY;
+        int lineH = 22;
+
+        # Article title
+        TextRender.drawText(getTitle(id), lx, ly, 0xE6EDF3FF);
+        ly = ly + lineH;
+
+        # Subtitle
+        TextRender.drawText("From VoidSearch Encyclopedia", lx, ly, 0x6B7280FF);
+        ly = ly + lineH;
+
+        # Divider
+        Framebuffer.drawHLine(lx, ly + 4, w - 80, 0x21262DFF);
+        ly = ly + lineH;
+
+        # Article body — dispatched by ID
+        switch (id) {
+            case 0:  ly = drawOS(lx, ly, lineH); break;
+            case 1:  ly = drawLangs(lx, ly, lineH); break;
+            case 2:  ly = drawNetworks(lx, ly, lineH); break;
+            case 3:  ly = drawAI(lx, ly, lineH); break;
+            case 4:  ly = drawCrypto(lx, ly, lineH); break;
+            case 5:  ly = drawSpace(lx, ly, lineH); break;
+            case 6:  ly = drawMath(lx, ly, lineH); break;
+            case 7:  ly = drawPhysics(lx, ly, lineH); break;
+            case 8:  ly = drawClimate(lx, ly, lineH); break;
+            case 9:  ly = drawWWW(lx, ly, lineH); break;
+            case 10: ly = drawOpenSource(lx, ly, lineH); break;
+            case 11: ly = drawQuantum(lx, ly, lineH); break;
+            case 12: ly = drawRobotics(lx, ly, lineH); break;
+            case 13: ly = drawGames(lx, ly, lineH); break;
+            case 14: ly = drawEnergy(lx, ly, lineH); break;
+        }
+
+        # Back link
+        ly = ly + lineH * 2;
+        TextRender.drawText("<< Back to search results", lx, ly, Theme.textAccent);
+    }
+
+    # ========================================================================
+    # Article Content Renderers
+    # ========================================================================
+
+    private static func drawOS(int lx, int ly, int h) -> int {
+        TextRender.drawText("An operating system (OS) is system software that manages", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("computer hardware and software resources, providing common", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("services for computer programs.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Key Components:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Kernel — Core managing CPU, memory, and devices", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Scheduler — Allocates CPU time to running processes", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Memory Manager — Handles virtual memory and paging", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  File System — Organizes and stores data on disk", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Drivers — Interface between hardware and OS kernel", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Popular examples include Linux, Windows, macOS, FreeBSD,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("and StratOS. Modern operating systems support multitasking,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("memory protection, and graphical user interfaces.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawLangs(int lx, int ly, int h) -> int {
+        TextRender.drawText("A programming language is a formal set of instructions that", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("can be used to produce programs and control machines.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Classification:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Low-level — Assembly, machine code (close to hardware)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  High-level — Python, Java, C++ (human-readable syntax)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Compiled — Translated to machine code before running", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Interpreted — Executed line by line by an interpreter", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Paradigms:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Imperative, Object-Oriented, Functional, Declarative,", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Logic-based, and Multi-paradigm approaches.", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Flux is an example of a modern compiled language designed", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("for systems programming and application development.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawNetworks(int lx, int ly, int h) -> int {
+        TextRender.drawText("A computer network is a set of devices connected together", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("to share resources and exchange data using protocols.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Network Types:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  LAN — Local Area Network (home, office)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  WAN — Wide Area Network (city, country, global)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Internet — Global network connecting billions of devices", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Key Protocols:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  TCP/IP — Reliable data transmission across networks", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  HTTP — HyperText Transfer Protocol for web pages", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  DNS — Domain Name System to resolve hostnames to IPs", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  TLS — Transport Layer Security for encrypted links", lx, ly, 0x8B949EFF);
+        return ly;
+    }
+
+    private static func drawAI(int lx, int ly, int h) -> int {
+        TextRender.drawText("Artificial Intelligence (AI) is the simulation of human", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("intelligence by computer systems, encompassing learning,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("reasoning, problem-solving, and language understanding.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Branches:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Machine Learning — Systems that learn from data", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Deep Learning — Neural networks with many layers", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  NLP — Natural Language Processing for text and speech", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Computer Vision — Understanding images and video", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Reinforcement Learning — Learning by trial and error", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Applications include autonomous vehicles, medical diagnosis,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("language translation, and game-playing systems.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawCrypto(int lx, int ly, int h) -> int {
+        TextRender.drawText("Cryptography is the practice of securing information by", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("transforming it into an unreadable format for unauthorized", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("users, while allowing authorized parties to read it.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Methods:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Symmetric — Same key encrypts and decrypts (AES)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Asymmetric — Public/private key pairs (RSA, ECC)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Hashing — One-way function producing fixed digest (SHA)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Digital Signatures — Verify identity and integrity", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Cryptography underpins internet security, banking, and", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("blockchain technology. It dates back thousands of years", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("to the Caesar cipher used in ancient Rome.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawSpace(int lx, int ly, int h) -> int {
+        TextRender.drawText("Space exploration is the use of astronomy and space", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("technology to explore the cosmos beyond Earth.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Milestones:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  1957 — Sputnik, first artificial satellite launched", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1961 — Yuri Gagarin, first human in space", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1969 — Apollo 11, first Moon landing", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1998 — International Space Station begins assembly", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  2012 — Curiosity rover lands on Mars", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  2020 — SpaceX Crew Dragon first crewed flight", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Active agencies include NASA, ESA, ISRO, and CNSA.", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("Private companies like SpaceX are advancing rapidly.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawMath(int lx, int ly, int h) -> int {
+        TextRender.drawText("Mathematics is the abstract science of number, quantity,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("and space, studied as pure theory or applied discipline.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Major Branches:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Algebra — Symbols and rules for manipulating them", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Calculus — Study of rates of change and accumulation", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Geometry — Properties of space, shapes, and figures", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Number Theory — Properties of integers and primes", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Statistics — Collecting, analyzing, and interpreting data", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Topology — Properties preserved under deformation", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Mathematics provides the foundation for physics, computer", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("science, engineering, economics, and many other fields.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawPhysics(int lx, int ly, int h) -> int {
+        TextRender.drawText("Physics is the natural science that studies matter, energy,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("motion, and force — the fundamental rules governing the", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("behavior of the universe.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Key Areas:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Classical Mechanics — Newton's laws of motion", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Electromagnetism — Electric and magnetic forces", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Thermodynamics — Heat, work, and energy transfer", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Quantum Mechanics — Subatomic particle behavior", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  General Relativity — Gravity as curved spacetime", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Physics explains phenomena from falling apples to black", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("holes, and underpins all modern technology.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawClimate(int lx, int ly, int h) -> int {
+        TextRender.drawText("Climate science studies long-term patterns of temperature,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("precipitation, wind, and other atmospheric conditions.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Key Concepts:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Greenhouse Effect — Gases trap heat in the atmosphere", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Carbon Cycle — Movement of carbon through ecosystems", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Ice Cores — Historical climate data from glacial ice", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Ocean Currents — Distribute heat around the globe", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Human activities, especially burning fossil fuels, have", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("significantly increased atmospheric CO2, leading to global", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("warming and shifting weather patterns worldwide.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawWWW(int lx, int ly, int h) -> int {
+        TextRender.drawText("The World Wide Web (WWW) is an information system where", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("documents and resources are identified by URLs, linked by", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("hypertext, and accessed via the Internet.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("History:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  1989 — Tim Berners-Lee proposes the Web at CERN", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1991 — First website goes live", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1993 — Mosaic browser makes the Web popular", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1995 — JavaScript and dynamic content emerge", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  2004 — Web 2.0 era of social media begins", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Core technologies include HTML, CSS, JavaScript, HTTP,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("and URLs. The Web transformed global communication.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawOpenSource(int lx, int ly, int h) -> int {
+        TextRender.drawText("Open source software (OSS) is software with source code", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("that anyone can inspect, modify, and distribute freely.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Principles:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Transparency — Source code is publicly available", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Collaboration — Community-driven development model", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Freedom — Users can modify and redistribute code", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Major Licenses:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  GPL — Copyleft, derivative works must remain open", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  MIT — Permissive, minimal restrictions on reuse", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Apache 2.0 — Permissive with patent protection", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Notable projects: Linux, Firefox, Python, Git, and Flux.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawQuantum(int lx, int ly, int h) -> int {
+        TextRender.drawText("Quantum computing uses quantum-mechanical phenomena such", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("as superposition and entanglement to process information.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Core Concepts:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Qubit — Quantum bit, can represent 0, 1, or both", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Superposition — Existing in multiple states at once", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Entanglement — Linked qubits share quantum state", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Quantum Gates — Operations that manipulate qubits", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Applications:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Factoring large numbers (Shor's algorithm)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Database search acceleration (Grover's algorithm)", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Drug discovery and materials science simulation", lx, ly, 0x8B949EFF);
+        return ly;
+    }
+
+    private static func drawRobotics(int lx, int ly, int h) -> int {
+        TextRender.drawText("Robotics is the branch of engineering dealing with the", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("design, construction, and operation of robots.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Components:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Sensors — Cameras, lidar, IMUs for perception", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Actuators — Motors and servos for movement", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Controllers — Microprocessors running algorithms", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Power — Batteries or external power supplies", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Applications:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Industrial — Assembly lines, welding, painting", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Medical — Surgical robots and prosthetic limbs", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Exploration — Mars rovers, deep-sea vehicles", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Consumer — Vacuum robots, personal assistants", lx, ly, 0x8B949EFF);
+        return ly;
+    }
+
+    private static func drawGames(int lx, int ly, int h) -> int {
+        TextRender.drawText("Video games are electronic games played on screens,", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("evolving from simple experiments to a global industry.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Timeline:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  1972 — Pong, one of the first arcade titles", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1977 — Atari 2600 brings gaming into homes", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1985 — NES revives the console market", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  1994 — PlayStation launches the 3D gaming era", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  2004 — Online multiplayer becomes mainstream", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  2016 — VR headsets reach consumers", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Modern engines like Unreal and Unity enable both indie", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("developers and large studios to create immersive worlds.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+
+    private static func drawEnergy(int lx, int ly, int h) -> int {
+        TextRender.drawText("Renewable energy comes from sources that naturally replenish", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("on a human timescale, unlike fossil fuels.", lx, ly, 0xC9D1D9FF); ly = ly + h * 2;
+        TextRender.drawText("Sources:", lx, ly, 0xE6EDF3FF); ly = ly + h;
+        TextRender.drawText("  Solar — Photovoltaic cells convert sunlight to power", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Wind — Turbines harness kinetic energy of air flow", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Hydroelectric — Dams generate power from falling water", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Geothermal — Earth's interior heat drives turbines", lx, ly, 0x8B949EFF); ly = ly + h;
+        TextRender.drawText("  Biomass — Organic materials converted to fuel or power", lx, ly, 0x8B949EFF); ly = ly + h * 2;
+        TextRender.drawText("Renewable energy is critical for reducing greenhouse gas", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("emissions and achieving long-term sustainability goals.", lx, ly, 0xC9D1D9FF); ly = ly + h;
+        TextRender.drawText("Global capacity has grown rapidly in the 21st century.", lx, ly, 0xC9D1D9FF);
+        return ly;
+    }
+}

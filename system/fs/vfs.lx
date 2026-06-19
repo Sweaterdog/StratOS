@@ -1,0 +1,601 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// VFS - Virtual Filesystem (disk-backed persistent storage)
+// system/fs/vfs.lx
+//
+// A flat-list filesystem for StratOS. All files and directories are stored
+// in RAM for fast access, and automatically persisted to disk via StratFS
+// when modifications are made. On boot, the VFS loads its contents from the
+// StratFS partition if one exists. If no formatted disk is found, the VFS
+// falls back to pure RAM mode (volatile).
+//
+// Supported operations:
+//   - mkdir / mkdirp   Create directories (single or recursive)
+//   - touch            Create empty files
+//   - read / write     File content access
+//   - listDir          Directory listing
+//   - exists / stat    Path queries
+//   - remove           Delete files and directories
+//   - rename / copy    File management
+//   - sync             Force flush all data to disk
+// ============================================================================
+
+import "system/fs/stratfs.lx";
+
+// File type constants
+int FS_FILE = 0;
+int FS_DIRECTORY = 1;
+
+// Maximum file content size (64 KB per file)
+int MAX_FILE_SIZE = 65536;
+
+// A single filesystem entry (file or directory)
+export struct FSEntry {
+    string path;
+    int type;
+    string content;
+    long size;
+    int permissions;
+    string owner;
+}
+
+// Public file info returned by stat / listDir
+export struct FileInfo {
+    string name;
+    int type;
+    long size;
+    int permissions;
+    string owner;
+}
+
+// The actual filesystem storage
+list<FSEntry> fsEntries = [];
+
+// Whether the VFS is backed by a persistent disk
+bool vfsDiskBacked = false;
+
+// Dirty flag — set when VFS has unsaved changes
+bool vfsDirty = false;
+
+// Whether the initial sync after format is pending (avoids double-format)
+bool vfsFirstSync = false;
+
+export class VFS {
+    // ---- Initialization ----
+    public static func init() -> void {
+        addEntry("/", FS_DIRECTORY, "", 0755, "root");
+
+        // Try to initialize disk-backed storage
+        vfsDiskBacked = false;
+        if (Disk.isPresent()) {
+            if (StratFS.mount()) {
+                if (StratFS.isFormatted()) {
+                    // Disk has a valid StratFS — load contents
+                    loadFromDisk(0, "/");
+                    vfsDiskBacked = true;
+                    return;   // Skip default content creation
+                } else {
+                    // Disk exists but no filesystem — format it
+                    if (StratFS.format()) {
+                        vfsDiskBacked = true;
+                        vfsFirstSync = true;
+                    }
+                }
+            }
+        }
+
+        // No disk or format failed — create default RAM content
+        mkdirp("/bin");
+        mkdirp("/boot");
+        mkdirp("/dev");
+        mkdirp("/etc");
+        mkdirp("/home/void");
+        mkdirp("/proc");
+        mkdirp("/system/bin");
+        mkdirp("/system/lib");
+        mkdirp("/system/shell");
+        mkdirp("/tmp");
+        mkdirp("/usr/bin");
+        mkdirp("/usr/lib");
+        mkdirp("/var/log");
+
+        writeFile("/etc/hostname", "stratos", 0644, "root");
+        writeFile("/etc/os-release", "NAME=StratOS\nVERSION=0.1.0\nID=stratos\nPRETTY_NAME=StratOS 0.1.0 (Void)\n", 0644, "root");
+        writeFile("/etc/motd", "Welcome to StratOS - From the Void, Structure.\n", 0644, "root");
+        writeFile("/home/void/.bashrc", "# StratOS shell config\nexport PS1='\\u@\\h \\w $ '\n", 0644, "void");
+        writeFile("/var/log/boot.log", "[OK] Kernel booted\n[OK] VFS mounted\n", 0644, "root");
+
+        // If disk is available, persist the defaults
+        if (vfsDiskBacked) {
+            syncToDisk();
+        }
+    }
+
+    // ---- Directory Operations ----
+
+    public static func mkdir(string path) -> bool {
+        string clean = normalizePath(path);
+        if (exists(clean)) return false;
+
+        string parent = parentPath(clean);
+        if (!exists(parent)) return false;
+
+        addEntry(clean, FS_DIRECTORY, "", 0755, "void");
+        vfsDirty = true;
+        return true;
+    }
+
+    public static func mkdirp(string path) -> bool {
+        string clean = normalizePath(path);
+        if (exists(clean)) return true;
+
+        string current = "";
+        list<string> parts = clean.split("/");
+        for (int i = 0; i < parts.length; i++) {
+            if (parts[i].length == 0) continue;
+            current = current + "/" + parts[i];
+            if (!exists(current)) {
+                addEntry(current, FS_DIRECTORY, "", 0755, "void");
+            }
+        }
+        return true;
+    }
+
+    // ---- File Operations ----
+
+    public static func touch(string path) -> bool {
+        string clean = normalizePath(path);
+        if (exists(clean)) return true;
+
+        string parent = parentPath(clean);
+        if (!exists(parent)) return false;
+
+        addEntry(clean, FS_FILE, "", 0644, "void");
+        vfsDirty = true;
+        return true;
+    }
+
+    public static func read(string path) -> string {
+        string clean = normalizePath(path);
+        int idx = findEntry(clean);
+        if (idx < 0) return "";
+        if (fsEntries[idx].type != FS_FILE) return "";
+        return fsEntries[idx].content;
+    }
+
+    public static func write(string path, string data) -> bool {
+        string clean = normalizePath(path);
+        int idx = findEntry(clean);
+        if (idx >= 0) {
+            if (fsEntries[idx].type != FS_FILE) return false;
+
+            FSEntry updated = fsEntries[idx];
+            updated.content = data;
+            updated.size = data.length;
+            fsEntries[idx] = updated;
+            vfsDirty = true;
+            return true;
+        }
+
+        string parent = parentPath(clean);
+        if (!exists(parent)) return false;
+
+        addEntry(clean, FS_FILE, data, 0644, "void");
+        vfsDirty = true;
+        return true;
+    }
+
+    public static func append(string path, string data) -> bool {
+        string clean = normalizePath(path);
+        int idx = findEntry(clean);
+        if (idx >= 0 && fsEntries[idx].type == FS_FILE) {
+            FSEntry updated = fsEntries[idx];
+            updated.content = updated.content + data;
+            updated.size = updated.content.length;
+            fsEntries[idx] = updated;
+            vfsDirty = true;
+            return true;
+        }
+        return write(clean, data);
+    }
+
+    // ---- Query Operations ----
+
+    public static func exists(string path) -> bool {
+        return findEntry(normalizePath(path)) >= 0;
+    }
+
+    public static func isDirectory(string path) -> bool {
+        int idx = findEntry(normalizePath(path));
+        if (idx < 0) return false;
+        return fsEntries[idx].type == FS_DIRECTORY;
+    }
+
+    public static func isFile(string path) -> bool {
+        int idx = findEntry(normalizePath(path));
+        if (idx < 0) return false;
+        return fsEntries[idx].type == FS_FILE;
+    }
+
+    public static func stat(string path) -> FileInfo {
+        string clean = normalizePath(path);
+        int idx = findEntry(clean);
+        if (idx < 0) {
+            return { name: "", type: FS_FILE, size: 0, permissions: 0, owner: "" };
+        }
+        FSEntry entry = fsEntries[idx];
+        return {
+            name: basename(clean),
+            type: entry.type,
+            size: entry.size,
+            permissions: entry.permissions,
+            owner: entry.owner
+        };
+    }
+
+    public static func listDir(string path) -> list<FileInfo> {
+        string clean = normalizePath(path);
+        string dirPrefix = clean;
+        if (dirPrefix != "/") {
+            dirPrefix = dirPrefix + "/";
+        }
+
+        list<FileInfo> result = [];
+
+        for (int i = 0; i < fsEntries.length; i++) {
+            string entryPath = fsEntries[i].path;
+            if (entryPath == clean) continue;
+
+            if (isDirectChild(entryPath, dirPrefix)) {
+                FileInfo info = {
+                    name: basename(entryPath),
+                    type: fsEntries[i].type,
+                    size: fsEntries[i].size,
+                    permissions: fsEntries[i].permissions,
+                    owner: fsEntries[i].owner
+                };
+                result.add(info);
+            }
+        }
+        return result;
+    }
+
+    // ---- Remove Operations ----
+
+    public static func remove(string path) -> bool {
+        string clean = normalizePath(path);
+        if (clean == "/") return false;
+
+        int idx = findEntry(clean);
+        if (idx < 0) return false;
+
+        if (fsEntries[idx].type == FS_DIRECTORY) {
+            list<FileInfo> children = listDir(clean);
+            if (children.length > 0) return false;
+        }
+
+        fsEntries.removeAt(idx);
+        vfsDirty = true;
+        return true;
+    }
+
+    public static func removeRecursive(string path) -> bool {
+        string clean = normalizePath(path);
+        if (clean == "/") return false;
+
+        string prefix = clean + "/";
+        int i = 0;
+        while (i < fsEntries.length) {
+            if (fsEntries[i].path == clean || fsEntries[i].path.startsWith(prefix)) {
+                fsEntries.removeAt(i);
+            } else {
+                i++;
+            }
+        }
+        vfsDirty = true;
+        return true;
+    }
+
+    // ---- File Management ----
+
+    public static func copy(string src, string dst) -> bool {
+        string cleanSrc = normalizePath(src);
+        string cleanDst = normalizePath(dst);
+
+        int idx = findEntry(cleanSrc);
+        if (idx < 0) return false;
+        if (fsEntries[idx].type != FS_FILE) return false;
+
+        vfsDirty = true;
+        return write(cleanDst, fsEntries[idx].content);
+    }
+
+    public static func rename(string oldPath, string newPath) -> bool {
+        string cleanOld = normalizePath(oldPath);
+        string cleanNew = normalizePath(newPath);
+
+        int idx = findEntry(cleanOld);
+        if (idx < 0) return false;
+
+        FSEntry updated = fsEntries[idx];
+        updated.path = cleanNew;
+        fsEntries[idx] = updated;
+
+        if (updated.type == FS_DIRECTORY) {
+            string oldPrefix = cleanOld + "/";
+            string newPrefix = cleanNew + "/";
+            for (int i = 0; i < fsEntries.length; i++) {
+                if (fsEntries[i].path.startsWith(oldPrefix)) {
+                    FSEntry child = fsEntries[i];
+                    child.path = newPrefix + child.path.substring(oldPrefix.length, child.path.length - oldPrefix.length);
+                    fsEntries[i] = child;
+                }
+            }
+        }
+        vfsDirty = true;
+        return true;
+    }
+
+    public static func getTotalUsage() -> long {
+        long total = 0;
+        for (int i = 0; i < fsEntries.length; i++) {
+            total = total + fsEntries[i].size;
+        }
+        return total;
+    }
+
+    public static func getEntryCount() -> int {
+        return fsEntries.length;
+    }
+
+    // ---- Internal Helpers ----
+
+    private static func addEntry(string path, int type, string content, int perms, string owner) -> void {
+        FSEntry entry = {
+            path: path,
+            type: type,
+            content: content,
+            size: content.length,
+            permissions: perms,
+            owner: owner
+        };
+        fsEntries.add(entry);
+    }
+
+    private static func writeFile(string path, string content, int perms, string owner) -> void {
+        string parent = parentPath(path);
+        if (!exists(parent)) {
+            mkdirp(parent);
+        }
+        addEntry(path, FS_FILE, content, perms, owner);
+    }
+
+    private static func findEntry(string path) -> int {
+        for (int i = 0; i < fsEntries.length; i++) {
+            if (fsEntries[i].path == path) return i;
+        }
+        return -1;
+    }
+
+    public static func normalizePath(string path) -> string {
+        if (path.length == 0) return "/";
+        if (path == "/") return "/";
+
+        string result = path;
+        while (result.length > 1 && result.endsWith("/")) {
+            result = result.substring(0, result.length - 1);
+        }
+        return result;
+    }
+
+    public static func parentPath(string path) -> string {
+        if (path == "/" || path.length == 0) return "/";
+
+        int lastSlash = path.lastIndexOf("/");
+        if (lastSlash <= 0) return "/";
+        return path.substring(0, lastSlash);
+    }
+
+    public static func basename(string path) -> string {
+        if (path == "/") return "/";
+        int lastSlash = path.lastIndexOf("/");
+        if (lastSlash < 0) return path;
+        return path.substring(lastSlash + 1, path.length - lastSlash - 1);
+    }
+
+    private static func isDirectChild(string entryPath, string dirPath) -> bool {
+        if (dirPath == "/") {
+            if (entryPath.length <= 1) return false;
+            string rest = entryPath.substring(1, entryPath.length - 1);
+            return !rest.contains("/");
+        }
+
+        if (!entryPath.startsWith(dirPath)) return false;
+
+        string rest = entryPath.substring(dirPath.length, entryPath.length - dirPath.length);
+        if (rest.length == 0) return false;
+        return !rest.contains("/");
+    }
+
+    public static func resolvePath(string base, string relative) -> string {
+        if (relative.startsWith("/")) return normalizePath(relative);
+
+        string result = base;
+        list<string> parts = relative.split("/");
+        for (int i = 0; i < parts.length; i++) {
+            string part = parts[i];
+            if (part == "." || part.length == 0) continue;
+            if (part == "..") {
+                result = parentPath(result);
+            } else {
+                result = result + "/" + part;
+            }
+        }
+        return normalizePath(result);
+    }
+
+    // ---- Persistence ----
+
+    // Force all VFS data to disk (if disk-backed)
+    public static func sync() -> void {
+        if (vfsDiskBacked && vfsDirty) {
+            syncToDisk();
+            vfsDirty = false;
+        }
+    }
+
+    // Check if VFS has disk backing
+    public static func isPersistent() -> bool {
+        return vfsDiskBacked;
+    }
+
+    // Mark VFS as dirty (needs sync)
+    public static func markDirty() -> void {
+        vfsDirty = true;
+    }
+}
+
+// ============================================================================
+// Disk persistence helpers (outside export class, internal linkage)
+// ============================================================================
+
+// Recursively load all files/dirs from StratFS into RAM VFS
+func loadFromDisk(int inodeNum, string path) -> void {
+    // Read the inode
+    if (!StratFS.readInode(inodeNum)) return;
+
+    int type = inodeType;
+    int size = inodeSize;
+    int startBlock = inodeStartBlock;
+    int blockCount = inodeBlockCount;
+
+    if (type == INODE_DIRECTORY) {
+        // Ensure the directory exists in VFS
+        if (path != "/") {
+            int idx = -1;
+            for (int i = 0; i < fsEntries.length; i++) {
+                if (fsEntries[i].path == path) { idx = i; break; }
+            }
+            if (idx < 0) {
+                FSEntry entry = {
+                    path: path,
+                    type: FS_DIRECTORY,
+                    content: "",
+                    size: 0,
+                    permissions: 0755,
+                    owner: "void"
+                };
+                fsEntries.add(entry);
+            }
+        }
+
+        // Read directory entries and recurse
+        if (size > 0) {
+            long blockBuf = MemoryManager.kmalloc(STRATFS_BLOCK_SIZE);
+            if (blockBuf == 0) return;
+            if (!StratFS.readBlock(startBlock, blockBuf)) return;
+
+            int numEntries = size / STRATFS_DIR_ENTRY_SIZE;
+            unsafe {
+                for (int i = 0; i < numEntries; i++) {
+                    int offset = i * STRATFS_DIR_ENTRY_SIZE;
+                    int* fields = (int*)(blockBuf + (long) offset);
+                    int childInode = fields[0];
+                    int childType = fields[1];
+
+                    // Read the name
+                    byte* namePtr = (byte*)(blockBuf + (long)(offset + 8));
+                    string childName = "";
+                    int j = 0;
+                    while (j < STRATFS_MAX_FILENAME && namePtr[j] != 0) {
+                        string ch = "${(char) namePtr[j]}";
+                        childName = childName + ch;
+                        j++;
+                    }
+
+                    // Build full path
+                    string childPath = "";
+                    if (path == "/") {
+                        childPath = "/" + childName;
+                    } else {
+                        childPath = path + "/" + childName;
+                    }
+
+                    // Recurse into child
+                    loadFromDisk(childInode, childPath);
+                }
+            }
+        }
+    } else if (type == INODE_FILE) {
+        // Read file content
+        string content = StratFS.readFile(inodeNum);
+
+        // Add to VFS
+        FSEntry entry = {
+            path: path,
+            type: FS_FILE,
+            content: content,
+            size: content.length,
+            permissions: 0644,
+            owner: "void"
+        };
+        fsEntries.add(entry);
+    }
+}
+
+// Sync all VFS contents to StratFS on disk
+// This does a full re-write: erase and re-create all entries
+func syncToDisk() -> void {
+    // If we just formatted, skip the re-format — disk is already clean
+    if (vfsFirstSync) {
+        vfsFirstSync = false;
+    } else {
+        // Re-format to start fresh (simple approach — no incremental sync)
+        StratFS.format();
+    }
+
+    // Walk through all VFS entries and create them on disk
+    // First pass: create all directories (in order of depth)
+    for (int i = 0; i < fsEntries.length; i++) {
+        if (fsEntries[i].type == FS_DIRECTORY && fsEntries[i].path != "/") {
+            syncCreatePath(fsEntries[i].path, INODE_DIRECTORY);
+        }
+    }
+
+    // Second pass: create all files and write content
+    for (int i = 0; i < fsEntries.length; i++) {
+        if (fsEntries[i].type == FS_FILE) {
+            int fileInode = syncCreatePath(fsEntries[i].path, INODE_FILE);
+            if (fileInode >= 0 && fsEntries[i].content.length > 0) {
+                StratFS.writeFile(fileInode, fsEntries[i].content);
+            }
+        }
+    }
+
+    StratFS.sync();
+}
+
+// Create a path on disk by resolving parent directories
+// Returns the inode number of the created entry, or -1 on error
+func syncCreatePath(string path, int type) -> int {
+    // Find the parent directory's inode
+    string parent = VFS.parentPath(path);
+    string name = VFS.basename(path);
+
+    int parentInode = 0;   // Root
+    if (parent != "/") {
+        parentInode = StratFS.resolvePath(parent);
+        if (parentInode < 0) {
+            // Parent doesn't exist on disk yet — create it recursively
+            parentInode = syncCreatePath(parent, INODE_DIRECTORY);
+            if (parentInode < 0) return -1;
+        }
+    }
+
+    // Check if already exists on disk
+    int existing = StratFS.lookupInDir(parentInode, name);
+    if (existing >= 0) return existing;
+
+    // Create the entry
+    return StratFS.createEntry(parentInode, name, type);
+}

@@ -1,0 +1,943 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Desktop — Desktop environment with wallpaper and icon management
+// system/windowing/desktop.lx
+//
+// Manages:
+//   - Desktop wallpaper rendering (procedural + embedded)
+//   - Desktop icon grid with labels
+//   - Right-click context menu
+//   - Desktop shortcuts
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/core/console.lx";
+import "kernel/drivers/timer.lx";
+import "system/windowing/theme.lx";
+import "system/windowing/taskbar.lx";
+import "system/fs/vfs.lx";
+import "apps/lib/textrender.lx";
+
+# Desktop icon layout
+int ICON_SIZE = 48;
+int ICON_PADDING = 16;
+int ICON_COLS_START_X = 24;
+int ICON_ROWS_START_Y = 24;
+int ICON_GRID_SPACING = 80;   # Total cell size including padding
+int ICON_LABEL_HEIGHT = 16;
+
+# Desktop icon data
+struct DesktopIcon {
+    string name;          # Display label
+    string appType;       # App to launch when double-clicked
+    int gridCol;          # Column in icon grid
+    int gridRow;          # Row in icon grid
+    color32 iconColor;    # Icon tint color
+}
+
+list<DesktopIcon> desktopIcons = [];
+
+# Icon selection and drag state
+int selectedDesktopIcon = -1;
+int desktopDragIdx = -1;
+int desktopDragX = 0;
+int desktopDragY = 0;
+
+# Wallpaper state
+int currentWallpaper = 0;       # Index of current wallpaper
+int WALLPAPER_COUNT = 4;        # Number of built-in wallpapers
+
+# Desktop clock widget state
+bool clockWidgetVisible = false;
+int clockWidgetX = 800;         # Position (right side of screen)
+int clockWidgetY = 20;
+int CLOCK_WIDGET_W = 210;
+int CLOCK_WIDGET_H = 250;
+
+# Wallpaper names for user reference
+# Naming convention for user-provided wallpapers:
+#   /img/wallpapers/
+#     wallpaper_void.raw       - 1024x768 raw RGBA pixel data
+#     wallpaper_nebula.raw
+#     wallpaper_aurora.raw
+#     wallpaper_cosmic.raw
+#
+# Icon naming convention:
+#   /img/icons/
+#     icon_terminal_48.raw     - 48x48 raw RGBA pixel data
+#     icon_editor_48.raw
+#     icon_explorer_48.raw
+#     icon_browser_48.raw
+#     icon_music_48.raw
+#     icon_settings_48.raw
+#     icon_trash_48.raw
+
+export class Desktop {
+    # Initialize the desktop with default icons
+    public static func init() -> void {
+        VFS.mkdirp("/img/wallpapers");
+        VFS.mkdirp("/img/icons");
+
+        # Create user home directories
+        VFS.mkdirp("/home/music");
+        VFS.mkdirp("/home/pictures");
+        VFS.mkdirp("/home/documents");
+        VFS.mkdirp("/home/downloads");
+        VFS.mkdirp("/home/desktop");
+
+        # Seed sample media files into user directories
+        seedUserFiles();
+
+        # Create default desktop icons
+        addIcon("Terminal",    "terminal",  0, 0, 0x69F0AEFF);
+        addIcon("Files",       "explorer",  0, 1, 0xFFB74DFF);
+        addIcon("Calculator",  "calculator", 0, 2, 0x42A5F5FF);
+        addIcon("Editor",      "editor",    0, 3, 0x5B8CFFFF);
+        addIcon("Browser",     "browser",   0, 4, 0xBB86FCFF);
+        addIcon("Music",       "music",     0, 5, 0xFF5252FF);
+        addIcon("Notes",       "notes",     0, 6, 0xFFA657FF);
+        addIcon("Settings",    "settings",  0, 7, 0xC8D0E0FF);
+        addIcon("Monitor",     "sysmon",    0, 8, 0x4CAF50FF);
+        addIcon("Help",        "help",      0, 9, 0x42A5F5FF);
+        addIcon("Games",       "games",     0, 10, 0x66BB6AFF);
+    }
+
+    # Add a desktop icon
+    public static func addIcon(string name, string appType, int col, int row, color32 color) -> void {
+        DesktopIcon icon = {
+            name: name,
+            appType: appType,
+            gridCol: col,
+            gridRow: row,
+            iconColor: color
+        };
+        desktopIcons.add(icon);
+    }
+
+    # ========================================================================
+    # Seed sample user files into home directories
+    # ========================================================================
+
+    private static func seedUserFiles() -> void {
+        # Music — create track info files matching the demo playlist
+        VFS.write("/home/music/Stellar_Drift.txt", "Title: Stellar Drift\nArtist: StratOS\nDuration: 3:00\nGenre: Ambient Electronic");
+        VFS.write("/home/music/Nebula_Pulse.txt", "Title: Nebula Pulse\nArtist: StratOS\nDuration: 3:30\nGenre: Synthwave");
+        VFS.write("/home/music/Dark_Matter.txt", "Title: Dark Matter\nArtist: StratOS\nDuration: 4:15\nGenre: Deep Space Ambient");
+        VFS.write("/home/music/Cosmic_Dawn.txt", "Title: Cosmic Dawn\nArtist: StratOS\nDuration: 2:45\nGenre: Chillwave");
+        VFS.write("/home/music/Quantum_Leap.txt", "Title: Quantum Leap\nArtist: StratOS\nDuration: 3:20\nGenre: Electronic");
+        VFS.write("/home/music/Solar_Wind.txt", "Title: Solar Wind\nArtist: StratOS\nDuration: 3:50\nGenre: Ambient");
+        VFS.write("/home/music/Event_Horizon.txt", "Title: Event Horizon\nArtist: StratOS\nDuration: 4:30\nGenre: Dark Ambient");
+
+        # Pictures — sample descriptions
+        VFS.write("/home/pictures/README.txt", "StratOS Pictures\n\nWallpapers are rendered procedurally.\nUse Settings to change your wallpaper.\n\nBuilt-in wallpapers:\n  Void - Deep space starfield\n  Nebula - Purple/blue clouds\n  Aurora - Northern lights\n  Mountain - Sunset silhouettes");
+
+        # Documents — welcome document
+        VFS.write("/home/documents/Welcome.txt", "Welcome to StratOS!\n\nThis is your Documents folder.\nYou can create and edit files here\nusing the built-in text editor.\n\nTry these apps:\n  Terminal - Command line shell\n  Editor - Text editing with syntax highlighting\n  Files - Browse your file system\n  Browser - Search the VoidSearch encyclopedia\n  Calculator - Quick arithmetic\n  Music - Demo music player\n  Notes - Quick notepad\n  Settings - Customize your desktop");
+        VFS.write("/home/documents/Shortcuts.txt", "StratOS Keyboard Shortcuts\n\nAlt+F4    Close window\nAlt+Tab   Cycle windows\nAlt+Left  Snap window left\nAlt+Right Snap window right\nAlt+Up    Maximize window\nCtrl+T    New terminal\nSuper     App launcher\nCtrl+Q    Close focused window\nEscape    Cancel / close menu");
+    }
+
+    # ========================================================================
+    # Wallpaper Rendering — All procedural, no external files needed
+    # ========================================================================
+
+    # Draw the current wallpaper
+    public static func drawWallpaper(int screenW, int screenH, int taskbarH) -> void {
+        int usableH = screenH - taskbarH;
+        switch (currentWallpaper) {
+            case 0: drawWallpaperVoid(screenW, usableH);    break;
+            case 1: drawWallpaperNebula(screenW, usableH);  break;
+            case 2: drawWallpaperAurora(screenW, usableH);  break;
+            case 3: drawWallpaperMountain(screenW, usableH); break;
+            default: drawWallpaperVoid(screenW, usableH);   break;
+        }
+    }
+
+    # Cycle to next wallpaper
+    public static func nextWallpaper() -> void {
+        currentWallpaper = (currentWallpaper + 1) % WALLPAPER_COUNT;
+        Framebuffer.invalidateWallpaper();
+    }
+
+    # Set a specific wallpaper by index
+    public static func setWallpaper(int index) -> void {
+        if (index >= 0 && index < WALLPAPER_COUNT) {
+            currentWallpaper = index;
+            Framebuffer.invalidateWallpaper();
+        }
+    }
+
+    # ---- Wallpaper 0: Void ----
+    # Deep space with subtle stars and gradient
+    private static func drawWallpaperVoid(int w, int h) -> void {
+        for (int y = 0; y < h; y++) {
+            float t = (float) y / (float) h;
+            int r = (int)(8.0 + t * 6.0);
+            int g = (int)(12.0 + t * 4.0);
+            int b = (int)(22.0 + t * 14.0);
+            color32 c = (color32)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+            Framebuffer.drawHLine(0, y, w, c);
+        }
+
+        # Star field
+        int starCount = 200;
+        for (int i = 0; i < starCount; i++) {
+            int hash = (i * 2654435761) & 0xFFFFFF;
+            int sx = hash % w;
+            int sy = (hash / w) % h;
+            int brightness = 60 + (hash % 196);
+            color32 sc = (color32)((brightness << 24) | (brightness << 16) | ((brightness + 20) << 8) | 0xFF);
+            Framebuffer.plotPixel(sx, sy, sc);
+            if (brightness > 200) {
+                color32 glow = (color32)((brightness << 24) | (brightness << 16) | (brightness << 8) | 0x30);
+                Framebuffer.blendPixel(sx - 1, sy, glow);
+                Framebuffer.blendPixel(sx + 1, sy, glow);
+                Framebuffer.blendPixel(sx, sy - 1, glow);
+                Framebuffer.blendPixel(sx, sy + 1, glow);
+            }
+        }
+    }
+
+    # ---- Wallpaper 1: Nebula ----
+    # Purple/blue nebula clouds with bright stars
+    private static func drawWallpaperNebula(int w, int h) -> void {
+        for (int y = 0; y < h; y++) {
+            float t = (float) y / (float) h;
+            for (int x = 0; x < w; x++) {
+                float u = (float) x / (float) w;
+
+                # Base dark background
+                int r = (int)(12.0 + t * 8.0);
+                int g = (int)(8.0 + t * 4.0);
+                int b = (int)(28.0 + t * 12.0);
+
+                # Nebula bands — use simple sine approximation via polynomial
+                float wave1 = sinApprox(u * 6.28 + t * 3.14);
+                float wave2 = sinApprox(u * 3.14 + t * 6.28 + 1.5);
+
+                # Purple nebula cloud
+                float nebulaMask = wave1 * wave1 * (1.0 - t) * 0.4;
+                r = r + (int)(nebulaMask * 80.0);
+                g = g + (int)(nebulaMask * 20.0);
+                b = b + (int)(nebulaMask * 120.0);
+
+                # Blue accents
+                float blueMask = wave2 * wave2 * t * 0.3;
+                r = r + (int)(blueMask * 20.0);
+                g = g + (int)(blueMask * 40.0);
+                b = b + (int)(blueMask * 100.0);
+
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+
+                color32 c = (color32)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+                Framebuffer.plotPixel(x, y, c);
+            }
+        }
+
+        # Bright stars overlay
+        for (int i = 0; i < 150; i++) {
+            int hash = (i * 1664525 + 1013904223) & 0xFFFFFF;
+            int sx = hash % w;
+            int sy = (hash / w) % h;
+            int brightness = 180 + (hash % 76);
+            color32 sc = (color32)((brightness << 24) | (brightness << 16) | (brightness << 8) | 0xFF);
+            Framebuffer.plotPixel(sx, sy, sc);
+        }
+    }
+
+    # ---- Wallpaper 2: Aurora ----
+    # Northern lights effect with green/cyan curtains
+    private static func drawWallpaperAurora(int w, int h) -> void {
+        for (int y = 0; y < h; y++) {
+            float t = (float) y / (float) h;
+            for (int x = 0; x < w; x++) {
+                float u = (float) x / (float) w;
+
+                # Dark sky base
+                int r = (int)(6.0 + t * 4.0);
+                int g = (int)(10.0 + t * 6.0);
+                int b = (int)(20.0 + t * 10.0);
+
+                # Aurora curtains in upper half
+                if (t < 0.6) {
+                    float curtain = sinApprox(u * 12.56 + t * 4.0);
+                    float intensity = curtain * curtain * (0.6 - t) * 1.5;
+
+                    # Green/cyan aurora
+                    r = r + (int)(intensity * 15.0);
+                    g = g + (int)(intensity * 180.0);
+                    b = b + (int)(intensity * 80.0);
+
+                    # Some purple highlights
+                    float purple = sinApprox(u * 9.42 + 2.0);
+                    float purpleI = purple * purple * (0.4 - t) * 0.8;
+                    if (purpleI > 0.0) {
+                        r = r + (int)(purpleI * 100.0);
+                        b = b + (int)(purpleI * 60.0);
+                    }
+                }
+
+                # Ground silhouette in bottom 15%
+                if (t > 0.85) {
+                    float ground = (t - 0.85) / 0.15;
+                    float hillShape = sinApprox(u * 9.42);
+                    float hillHeight = 0.85 + (1.0 - hillShape * hillShape) * 0.08;
+                    if (t > hillHeight) {
+                        r = 2; g = 3; b = 5;
+                    }
+                }
+
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+                if (r < 0) r = 0;
+                if (g < 0) g = 0;
+                if (b < 0) b = 0;
+
+                color32 c = (color32)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+                Framebuffer.plotPixel(x, y, c);
+            }
+        }
+
+        # Stars in the dark sky
+        for (int i = 0; i < 100; i++) {
+            int hash = (i * 48271 + 7) & 0xFFFFFF;
+            int sx = hash % w;
+            int sy = (hash / w) % (h * 7 / 10);
+            int brightness = 120 + (hash % 136);
+            Framebuffer.plotPixel(sx, sy, (color32)((brightness << 24) | (brightness << 16) | (brightness << 8) | 0xFF));
+        }
+    }
+
+    # ---- Wallpaper 3: Mountain ----
+    # Layered mountain silhouettes at sunset
+    private static func drawWallpaperMountain(int w, int h) -> void {
+        # Sunset gradient sky
+        for (int y = 0; y < h; y++) {
+            float t = (float) y / (float) h;
+
+            int r = 0;
+            int g = 0;
+            int b = 0;
+            if (t < 0.3) {
+                # Top: deep blue/purple
+                float s = t / 0.3;
+                r = (int)(15.0 + s * 30.0);
+                g = (int)(10.0 + s * 15.0);
+                b = (int)(40.0 + s * 20.0);
+            } elif (t < 0.5) {
+                # Middle: warm orange/pink
+                float s = (t - 0.3) / 0.2;
+                r = (int)(45.0 + s * 80.0);
+                g = (int)(25.0 + s * 20.0);
+                b = (int)(60.0 - s * 30.0);
+            } else {
+                # Bottom: dark to warm fade
+                float s = (t - 0.5) / 0.5;
+                r = (int)(125.0 - s * 100.0);
+                g = (int)(45.0 - s * 35.0);
+                b = (int)(30.0 - s * 20.0);
+            }
+
+            if (r > 255) r = 255;
+            if (r < 0) r = 0;
+            if (g > 255) g = 255;
+            if (g < 0) g = 0;
+            if (b > 255) b = 255;
+            if (b < 0) b = 0;
+
+            color32 c = (color32)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+            Framebuffer.drawHLine(0, y, w, c);
+        }
+
+        # Mountain layers (back to front, progressively darker)
+        drawMountainLayer(w, h, 0.45, 0x1A1030FF, 3.0, 0.12);   # Far mountains
+        drawMountainLayer(w, h, 0.55, 0x120A20FF, 5.0, 0.15);   # Mid mountains
+        drawMountainLayer(w, h, 0.65, 0x0A0615FF, 7.0, 0.18);   # Near mountains
+        drawMountainLayer(w, h, 0.80, 0x050308FF, 4.0, 0.10);   # Foreground hills
+
+        # A few stars in the upper sky
+        for (int i = 0; i < 60; i++) {
+            int hash = (i * 7919 + 31) & 0xFFFFFF;
+            int sx = hash % w;
+            int sy = (hash / w) % (h * 3 / 10);
+            int brightness = 100 + (hash % 156);
+            Framebuffer.plotPixel(sx, sy, (color32)((brightness << 24) | (brightness << 16) | ((brightness - 20) << 8) | 0xFF));
+        }
+    }
+
+    # Draw a mountain silhouette layer
+    private static func drawMountainLayer(int w, int h, float baseY, color32 color, float freq, float amplitude) -> void {
+        int basePixelY = (int)(baseY * h);
+
+        for (int x = 0; x < w; x++) {
+            float u = (float) x / (float) w;
+            float peakOffset = sinApprox(u * freq * 6.28) * amplitude;
+            float subPeak = sinApprox(u * freq * 12.56 + 1.0) * amplitude * 0.3;
+            int mountainTop = basePixelY - (int)((peakOffset + subPeak) * h);
+
+            if (mountainTop < 0) mountainTop = 0;
+
+            for (int y = mountainTop; y < h; y++) {
+                Framebuffer.plotPixel(x, y, color);
+            }
+        }
+    }
+
+    # ========================================================================
+    # Desktop Clock Widget
+    # ========================================================================
+
+    # Toggle the desktop clock widget
+    public static func toggleClockWidget() -> void {
+        clockWidgetVisible = !clockWidgetVisible;
+    }
+
+    public static func isClockWidgetVisible() -> bool {
+        return clockWidgetVisible;
+    }
+
+    # Draw text at 2x scale using the built-in font
+    private static func drawScaledText(string text, int x, int y, color32 fg, int scale) -> void {
+        int cx = x;
+        int fontW = 8;
+        int fontH = 16;
+        for (int i = 0; i < text.length; i++) {
+            char c = text.charAt(i);
+            int charIndex = (int) c;
+            if (charIndex < 32 || charIndex > 126) charIndex = 63;  # '?'
+
+            unsafe {
+                int* fontInts = (int*) BUILTIN_FONT_BASE;
+                int glyphBase = (charIndex - 32) * fontH;
+
+                for (int row = 0; row < fontH; row++) {
+                    byte bits = (byte) fontInts[glyphBase + row];
+                    for (int col = 0; col < fontW; col++) {
+                        int divisor = 1;
+                        switch (col) {
+                            case 0: divisor = 128; break;
+                            case 1: divisor = 64;  break;
+                            case 2: divisor = 32;  break;
+                            case 3: divisor = 16;  break;
+                            case 4: divisor = 8;   break;
+                            case 5: divisor = 4;   break;
+                            case 6: divisor = 2;   break;
+                            case 7: divisor = 1;   break;
+                            default: divisor = 1;  break;
+                        }
+                        if ((((int) bits) / divisor) % 2 == 1) {
+                            # Draw a scale x scale block
+                            for (int sy = 0; sy < scale; sy++) {
+                                for (int sx = 0; sx < scale; sx++) {
+                                    Framebuffer.plotPixel(cx + col * scale + sx, y + row * scale + sy, fg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cx = cx + fontW * scale;
+        }
+    }
+
+    # Draw the floating clock widget on the desktop
+    public static func drawClockWidget(int screenW, int screenH) -> void {
+        if (!clockWidgetVisible) return;
+
+        int wx = screenW - CLOCK_WIDGET_W - 20;
+        int wy = 20;
+
+        # Semi-transparent background panel
+        for (int py = wy; py < wy + CLOCK_WIDGET_H; py++) {
+            for (int px = wx; px < wx + CLOCK_WIDGET_W; px++) {
+                Framebuffer.blendPixel(px, py, 0x00000080);
+            }
+        }
+        # Subtle border
+        Framebuffer.drawRoundedRect(wx, wy, CLOCK_WIDGET_W, CLOCK_WIDGET_H, 6, 0xFFFFFF30);
+
+        # Read RTC time
+        int hrs = Timer.getRtcHours();
+        int mins = Timer.getRtcMinutes();
+        int secs = Timer.getRtcSeconds();
+
+        # Format time as HH:MM:SS
+        string hStr = "";
+        if (hrs < 10) { hStr = "0${hrs}"; } else { hStr = "${hrs}"; }
+        string mStr = "";
+        if (mins < 10) { mStr = "0${mins}"; } else { mStr = "${mins}"; }
+        string sStr = "";
+        if (secs < 10) { sStr = "0${secs}"; } else { sStr = "${secs}"; }
+        string timeStr = "${hStr}:${mStr}:${sStr}";
+
+        # Draw time in large text (draw each char twice wide by repeating)
+        # Use drawScaledChar helper for 2x size
+        int tx = wx + (CLOCK_WIDGET_W - timeStr.length * 16) / 2;
+        drawScaledText(timeStr, tx, wy + 10, 0xFFFFFFFF, 2);
+
+        # Draw date below
+        int day = Timer.getRtcDay();
+        int month = Timer.getRtcMonth();
+        int year = Timer.getRtcYear();
+        string monthName = Timer.getMonthName(month);
+        string dateStr = "${monthName} ${day}, 20${year}";
+        int dateW = dateStr.length * 8;
+        int dx = wx + (CLOCK_WIDGET_W - dateW) / 2;
+        TextRender.drawText(dateStr, dx, wy + 50, 0xBBBBBBFF);
+
+        # Separator line
+        Framebuffer.drawHLine(wx + 10, wy + 68, CLOCK_WIDGET_W - 20, 0xFFFFFF30);
+
+        # ====== Calendar Grid ======
+        int calY = wy + 76;
+        int cellW = (CLOCK_WIDGET_W - 20) / 7;  # 7 columns for days of week
+        int cellH = 20;
+
+        # Day-of-week headers
+        string dow0 = "Su";  string dow1 = "Mo";  string dow2 = "Tu";
+        string dow3 = "We";  string dow4 = "Th";  string dow5 = "Fr";  string dow6 = "Sa";
+
+        int hx = wx + 10;
+        TextRender.drawText(dow0, hx + 4, calY, 0x888888FF);
+        TextRender.drawText(dow1, hx + cellW + 4, calY, 0x888888FF);
+        TextRender.drawText(dow2, hx + cellW * 2 + 4, calY, 0x888888FF);
+        TextRender.drawText(dow3, hx + cellW * 3 + 4, calY, 0x888888FF);
+        TextRender.drawText(dow4, hx + cellW * 4 + 4, calY, 0x888888FF);
+        TextRender.drawText(dow5, hx + cellW * 5 + 4, calY, 0x888888FF);
+        TextRender.drawText(dow6, hx + cellW * 6 + 4, calY, 0x888888FF);
+        calY = calY + cellH;
+
+        # Calculate first day of month (Zeller's formula simplified for 2000s)
+        int fullYear = 2000 + year;
+        int m = month;
+        int y2 = fullYear;
+        if (m < 3) {
+            m = m + 12;
+            y2 = y2 - 1;
+        }
+        int k = y2 % 100;
+        int j = y2 / 100;
+        int zdow = (1 + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
+        # Zeller: 0=Sat, 1=Sun, 2=Mon... convert to 0=Sun, 1=Mon...
+        int firstDay = zdow - 1;
+        if (firstDay < 0) firstDay = firstDay + 7;
+
+        # Days in this month
+        int daysInMonth = 30;
+        switch (month) {
+            case 1: daysInMonth = 31; break;
+            case 2:
+                daysInMonth = 28;
+                if (fullYear % 4 == 0) daysInMonth = 29;
+                break;
+            case 3: daysInMonth = 31; break;
+            case 4: daysInMonth = 30; break;
+            case 5: daysInMonth = 31; break;
+            case 6: daysInMonth = 30; break;
+            case 7: daysInMonth = 31; break;
+            case 8: daysInMonth = 31; break;
+            case 9: daysInMonth = 30; break;
+            case 10: daysInMonth = 31; break;
+            case 11: daysInMonth = 30; break;
+            case 12: daysInMonth = 31; break;
+        }
+
+        # Draw calendar days
+        int col = firstDay;
+        int row = 0;
+        for (int d = 1; d <= daysInMonth; d++) {
+            int cx = hx + col * cellW;
+            int cy = calY + row * cellH;
+
+            # Highlight current day
+            if (d == day) {
+                Framebuffer.fillRoundedRect(cx + 1, cy, cellW - 2, cellH - 2, 4, 0x58A6FF80);
+            }
+
+            string dStr = "${d}";
+            color32 dayColor = 0xDDDDDDFF;
+            if (d == day) dayColor = 0xFFFFFFFF;
+            # Right-align single digits
+            int textX = cx + 4;
+            if (d < 10) textX = textX + 4;
+            TextRender.drawText(dStr, textX, cy + 3, dayColor);
+
+            col = col + 1;
+            if (col >= 7) {
+                col = 0;
+                row = row + 1;
+            }
+        }
+    }
+
+    # ========================================================================
+    # Desktop Icon Rendering
+    # ========================================================================
+
+    # Draw all desktop icons
+    public static func drawIcons(int screenW, int screenH, int taskbarH) -> void {
+        # Offset icon Y when taskbar is at top
+        int iconYOff = 0;
+        if (Taskbar.isAtTop()) {
+            iconYOff = taskbarH;
+        }
+
+        for (int i = 0; i < desktopIcons.length; i++) {
+            # Skip drawing if this icon is being dragged (it renders at mouse pos)
+            if (i == desktopDragIdx) continue;
+
+            DesktopIcon icon = desktopIcons[i];
+            int x = ICON_COLS_START_X + icon.gridCol * ICON_GRID_SPACING;
+            int y = ICON_ROWS_START_Y + icon.gridRow * ICON_GRID_SPACING + iconYOff;
+
+            drawIconAt(icon, x, y);
+
+            # Selection highlight
+            if (i == selectedDesktopIcon) {
+                Framebuffer.drawRoundedRect(x + 1, y + 1, ICON_SIZE - 2, ICON_SIZE + ICON_LABEL_HEIGHT + 2, 4, Theme.textAccent);
+            }
+        }
+
+        # Draw the dragged icon at drag position (ghosted)
+        if (desktopDragIdx >= 0 && desktopDragIdx < desktopIcons.length) {
+            DesktopIcon dragIcon = desktopIcons[desktopDragIdx];
+            drawIconAt(dragIcon, desktopDragX, desktopDragY);
+            # Ghost overlay — semi-transparent accent border
+            Framebuffer.drawRoundedRect(desktopDragX + 1, desktopDragY + 1, ICON_SIZE - 2, ICON_SIZE + ICON_LABEL_HEIGHT + 2, 4, Theme.textAccent);
+        }
+    }
+
+    # Draw a single desktop icon
+    private static func drawIconAt(DesktopIcon icon, int x, int y) -> void {
+        int centerX = x + ICON_SIZE / 2;
+        int centerY = y + ICON_SIZE / 2;
+
+        # Icon background (rounded square, subtle)
+        color32 iconBg = Theme.withAlpha(icon.iconColor, 30);
+        Framebuffer.fillRoundedRect(x + 4, y + 4, ICON_SIZE - 8, ICON_SIZE - 8, 8, iconBg);
+
+        # Icon shape based on app type
+        switch (icon.appType) {
+            case "terminal":
+                # Terminal: >_ prompt shape
+                drawTerminalIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "explorer":
+                # Folder icon
+                drawFolderIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "editor":
+                # Document/code icon
+                drawEditorIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "browser":
+                # Globe icon
+                drawGlobeIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "music":
+                # Music note icon
+                drawMusicIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "notes":
+                # Notes/notepad icon
+                drawNotesIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "settings":
+                # Gear icon
+                drawGearIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "calculator":
+                # Calculator icon
+                drawCalcIcon(centerX, centerY, icon.iconColor);
+                break;
+            case "trash":
+                # Trash can icon
+                drawTrashIcon(centerX, centerY, icon.iconColor);
+                break;
+            default:
+                # Generic app icon
+                Framebuffer.fillCircle(centerX, centerY, 12, icon.iconColor);
+                break;
+        }
+
+        # Label below icon — render with TextRender
+        int labelW = icon.name.length * FONT_WIDTH;
+        int labelX = centerX - labelW / 2;
+        int labelY = y + ICON_SIZE + 4;
+        Framebuffer.fillRoundedRect(labelX - 4, labelY - 2, labelW + 8, ICON_LABEL_HEIGHT, 3, 0x0A0E1A80);
+        TextRender.drawText(icon.name, labelX, labelY, 0xE0E4ECFF);
+    }
+
+    # Hit-test desktop icons — returns appType of clicked icon, or "" if none
+    public static func hitTestIcon(int mx, int my) -> string {
+        int iconYOff = 0;
+        if (Taskbar.isAtTop()) {
+            iconYOff = 48;
+        }
+        for (int i = 0; i < desktopIcons.length; i++) {
+            DesktopIcon icon = desktopIcons[i];
+            int ix = ICON_COLS_START_X + icon.gridCol * ICON_GRID_SPACING;
+            int iy = ICON_ROWS_START_Y + icon.gridRow * ICON_GRID_SPACING + iconYOff;
+            int totalH = ICON_SIZE + ICON_LABEL_HEIGHT + 4;
+
+            if (mx >= ix && mx < ix + ICON_SIZE && my >= iy && my < iy + totalH) {
+                return icon.appType;
+            }
+        }
+        return "";
+    }
+
+    # Get human-readable title for an appType
+    public static func getAppTitle(string appType) -> string {
+        if (appType == "terminal")  return "Terminal";
+        if (appType == "explorer")  return "Files";
+        if (appType == "editor")    return "Editor";
+        if (appType == "browser")   return "Browser";
+        if (appType == "music")     return "Music";
+        if (appType == "settings")  return "Settings";
+        if (appType == "calculator") return "Calculator";
+        if (appType == "notes")     return "Notes";
+        if (appType == "sysmon")    return "System Monitor";
+        if (appType == "help")      return "Help";
+        if (appType == "games")     return "Games";
+        if (appType == "snake")     return "Snake";
+        if (appType == "viewer3d")  return "3D Viewer";
+        return "App";
+    }
+
+    # ========================================================================
+    # Icon Management — Selection, Drag, Remove
+    # ========================================================================
+
+    # Accessors for module-scope drag state (used by compositor)
+    public static func getSelectedIcon() -> int { return selectedDesktopIcon; }
+    public static func setSelectedIcon(int idx) -> void { selectedDesktopIcon = idx; }
+    public static func getDragIdx() -> int { return desktopDragIdx; }
+    public static func setDragIdx(int idx) -> void { desktopDragIdx = idx; }
+    public static func getDragX() -> int { return desktopDragX; }
+    public static func setDragX(int val) -> void { desktopDragX = val; }
+    public static func getDragY() -> int { return desktopDragY; }
+    public static func setDragY(int val) -> void { desktopDragY = val; }
+
+    # Hit-test returning index (for drag/select), -1 if no hit
+    public static func hitTestIconIdx(int mx, int my) -> int {
+        int iconYOff = 0;
+        if (Taskbar.isAtTop()) {
+            iconYOff = 48;
+        }
+        for (int i = 0; i < desktopIcons.length; i++) {
+            int ix = ICON_COLS_START_X + desktopIcons[i].gridCol * ICON_GRID_SPACING;
+            int iy = ICON_ROWS_START_Y + desktopIcons[i].gridRow * ICON_GRID_SPACING + iconYOff;
+            int totalH = ICON_SIZE + ICON_LABEL_HEIGHT + 4;
+            if (mx >= ix && mx < ix + ICON_SIZE && my >= iy && my < iy + totalH) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    # Get the appType of an icon by index
+    public static func getIconAppType(int idx) -> string {
+        if (idx < 0 || idx >= desktopIcons.length) return "";
+        return desktopIcons[idx].appType;
+    }
+
+    # Get icon grid position
+    public static func getIconPixelX(int idx) -> int {
+        if (idx < 0 || idx >= desktopIcons.length) return 0;
+        return ICON_COLS_START_X + desktopIcons[idx].gridCol * ICON_GRID_SPACING;
+    }
+
+    public static func getIconPixelY(int idx) -> int {
+        if (idx < 0 || idx >= desktopIcons.length) return 0;
+        int iconYOff = 0;
+        if (Taskbar.isAtTop()) {
+            iconYOff = 48;
+        }
+        return ICON_ROWS_START_Y + desktopIcons[idx].gridRow * ICON_GRID_SPACING + iconYOff;
+    }
+
+    # Move an icon to a new grid cell, swapping if occupied
+    public static func moveIconToGrid(int idx, int newCol, int newRow) -> void {
+        if (idx < 0 || idx >= desktopIcons.length) return;
+        if (newCol < 0 || newRow < 0) return;
+
+        # Check if target cell is occupied
+        for (int i = 0; i < desktopIcons.length; i++) {
+            if (i == idx) continue;
+            if (desktopIcons[i].gridCol == newCol && desktopIcons[i].gridRow == newRow) {
+                # Swap: move the occupant to the dragged icon's old position
+                int oldCol = desktopIcons[idx].gridCol;
+                int oldRow = desktopIcons[idx].gridRow;
+                desktopIcons[i].gridCol = oldCol;
+                desktopIcons[i].gridRow = oldRow;
+                break;
+            }
+        }
+
+        desktopIcons[idx].gridCol = newCol;
+        desktopIcons[idx].gridRow = newRow;
+    }
+
+    # Remove icon by index
+    public static func removeDesktopIcon(int idx) -> void {
+        if (idx < 0 || idx >= desktopIcons.length) return;
+        desktopIcons.removeAt(idx);
+        if (selectedDesktopIcon >= desktopIcons.length) {
+            selectedDesktopIcon = -1;
+        }
+    }
+
+    # Get icon count
+    public static func getIconCount() -> int {
+        return desktopIcons.length;
+    }
+
+    # Snap a pixel position to the nearest grid cell
+    public static func snapToGridCol(int pixelX) -> int {
+        int col = (pixelX - ICON_COLS_START_X + ICON_GRID_SPACING / 2) / ICON_GRID_SPACING;
+        if (col < 0) col = 0;
+        return col;
+    }
+
+    public static func snapToGridRow(int pixelY) -> int {
+        int iconYOff = 0;
+        if (Taskbar.isAtTop()) {
+            iconYOff = 48;
+        }
+        int row = (pixelY - ICON_ROWS_START_Y - iconYOff + ICON_GRID_SPACING / 2) / ICON_GRID_SPACING;
+        if (row < 0) row = 0;
+        return row;
+    }
+
+    # ---- Icon Shape Renderers ----
+
+    private static func drawTerminalIcon(int cx, int cy, color32 color) -> void {
+        # >_ shape
+        Framebuffer.drawLine(cx - 8, cy - 4, cx - 2, cy, color);
+        Framebuffer.drawLine(cx - 8, cy + 4, cx - 2, cy, color);
+        Framebuffer.drawHLine(cx, cy + 5, 10, color);
+    }
+
+    private static func drawFolderIcon(int cx, int cy, color32 color) -> void {
+        # Folder tab + body
+        Framebuffer.fillRect(cx - 10, cy - 6, 8, 3, color);
+        Framebuffer.fillRoundedRect(cx - 12, cy - 3, 24, 14, 2, color);
+        # Darker line for depth
+        color32 dark = Theme.darken(color, 0.3);
+        Framebuffer.drawHLine(cx - 12, cy - 3, 24, dark);
+    }
+
+    private static func drawEditorIcon(int cx, int cy, color32 color) -> void {
+        # Document with lines
+        Framebuffer.fillRect(cx - 8, cy - 10, 16, 20, 0x1C2333FF);
+        Framebuffer.drawRect(cx - 8, cy - 10, 16, 20, color);
+        # Text lines
+        Framebuffer.drawHLine(cx - 5, cy - 6, 10, color);
+        Framebuffer.drawHLine(cx - 5, cy - 2, 8, color);
+        Framebuffer.drawHLine(cx - 5, cy + 2, 10, color);
+        Framebuffer.drawHLine(cx - 5, cy + 6, 6, color);
+    }
+
+    private static func drawGlobeIcon(int cx, int cy, color32 color) -> void {
+        # Circle with cross lines (globe)
+        Framebuffer.drawCircle(cx, cy, 10, color);
+        Framebuffer.drawHLine(cx - 10, cy, 20, color);
+        # Vertical ellipse line
+        Framebuffer.drawCircle(cx, cy, 5, Theme.withAlpha(color, 128));
+    }
+
+    private static func drawMusicIcon(int cx, int cy, color32 color) -> void {
+        # Music note shape
+        Framebuffer.fillCircle(cx - 4, cy + 4, 4, color);
+        Framebuffer.drawVLine(cx, cy - 8, 12, color);
+        Framebuffer.drawHLine(cx, cy - 8, 6, color);
+        Framebuffer.fillCircle(cx + 6, cy - 4, 3, color);
+    }
+
+    private static func drawGearIcon(int cx, int cy, color32 color) -> void {
+        # Simplified gear: circle with ticks
+        Framebuffer.drawCircle(cx, cy, 6, color);
+        Framebuffer.drawCircle(cx, cy, 10, color);
+        # Gear teeth — tick marks at cardinal and diagonal positions
+        # North
+        Framebuffer.drawVLine(cx, cy - 10, 4, color);
+        # Northeast
+        Framebuffer.plotPixel(cx + 7, cy - 7, color);
+        Framebuffer.plotPixel(cx + 8, cy - 8, color);
+        # East
+        Framebuffer.drawHLine(cx + 8, cy, 4, color);
+        # Southeast
+        Framebuffer.plotPixel(cx + 7, cy + 7, color);
+        Framebuffer.plotPixel(cx + 8, cy + 8, color);
+        # South
+        Framebuffer.drawVLine(cx, cy + 8, 4, color);
+        # Southwest
+        Framebuffer.plotPixel(cx - 7, cy + 7, color);
+        Framebuffer.plotPixel(cx - 8, cy + 8, color);
+        # West
+        Framebuffer.drawHLine(cx - 12, cy, 4, color);
+        # Northwest
+        Framebuffer.plotPixel(cx - 7, cy - 7, color);
+        Framebuffer.plotPixel(cx - 8, cy - 8, color);
+    }
+
+    private static func drawTrashIcon(int cx, int cy, color32 color) -> void {
+        # Trash can shape
+        Framebuffer.drawHLine(cx - 6, cy - 8, 12, color);   # Lid
+        Framebuffer.drawRect(cx - 5, cy - 6, 10, 14, color); # Body
+        # Lines on body
+        Framebuffer.drawVLine(cx - 2, cy - 4, 10, color);
+        Framebuffer.drawVLine(cx + 2, cy - 4, 10, color);
+    }
+
+    private static func drawNotesIcon(int cx, int cy, color32 color) -> void {
+        # Notepad: page with lines
+        Framebuffer.fillRoundedRect(cx - 8, cy - 10, 16, 20, 2, 0x1C2333FF);
+        Framebuffer.drawRect(cx - 8, cy - 10, 16, 20, color);
+        # Dog-ear corner fold
+        Framebuffer.drawHLine(cx + 3, cy - 10, 5, color);
+        Framebuffer.drawVLine(cx + 8, cy - 10, 5, color);
+        Framebuffer.plotPixel(cx + 4, cy - 9, color);
+        Framebuffer.plotPixel(cx + 5, cy - 8, color);
+        Framebuffer.plotPixel(cx + 6, cy - 7, color);
+        Framebuffer.plotPixel(cx + 7, cy - 6, color);
+        # Text lines
+        Framebuffer.drawHLine(cx - 5, cy - 3, 10, color);
+        Framebuffer.drawHLine(cx - 5, cy + 1, 10, color);
+        Framebuffer.drawHLine(cx - 5, cy + 5, 7, color);
+    }
+
+    private static func drawCalcIcon(int cx, int cy, color32 color) -> void {
+        # Calculator body
+        Framebuffer.fillRoundedRect(cx - 10, cy - 12, 20, 24, 3, 0x1C2333FF);
+        Framebuffer.drawRect(cx - 10, cy - 12, 20, 24, color);
+        # Display area
+        Framebuffer.fillRect(cx - 7, cy - 10, 14, 6, color);
+        # Button grid (3x3 dots)
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                Framebuffer.fillRect(cx - 6 + col * 5, cy + row * 5, 3, 3, color);
+            }
+        }
+    }
+
+    # ========================================================================
+    # Sine approximation for wallpaper effects
+    # ========================================================================
+
+    # Simple sine approximation using Taylor series (good enough for visuals)
+    # Input in radians, output -1.0 to 1.0
+    private static func sinApprox(float x) -> float {
+        # Normalize x to [-PI, PI]
+        while (x > 3.14159) x = x - 6.28318;
+        while (x < -3.14159) x = x + 6.28318;
+
+        # Taylor series: sin(x) ~ x - x^3/6 + x^5/120
+        float x3 = x * x * x;
+        float x5 = x3 * x * x;
+        return x - x3 / 6.0 + x5 / 120.0;
+    }
+}

@@ -1,0 +1,397 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Toast Notification System — Popup notifications for StratOS
+// system/windowing/toast.lx
+//
+// Features:
+//   - Display temporary notification messages
+//   - Auto-dismiss after timeout
+//   - Stack multiple notifications
+//   - Slide-in from top right
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "kernel/drivers/speaker.lx";
+
+# Toast state — max 3 visible toasts
+int toastCount = 0;
+
+string toastMsg0 = "";  int toastTimer0 = 0;  int toastType0 = 0;
+string toastMsg1 = "";  int toastTimer1 = 0;  int toastType1 = 0;
+string toastMsg2 = "";  int toastTimer2 = 0;  int toastType2 = 0;
+
+# Toast types
+int TOAST_INFO    = 0;
+int TOAST_SUCCESS = 1;
+int TOAST_WARNING = 2;
+int TOAST_ERROR   = 3;
+
+# Notification history — stores last 20 notifications
+int HISTORY_MAX = 20;
+int historyCount = 0;
+# Parallel arrays for history entries (message + type)
+string histMsg0 = "";  string histMsg1 = "";  string histMsg2 = "";  string histMsg3 = "";
+string histMsg4 = "";  string histMsg5 = "";  string histMsg6 = "";  string histMsg7 = "";
+string histMsg8 = "";  string histMsg9 = "";  string histMsg10 = ""; string histMsg11 = "";
+string histMsg12 = ""; string histMsg13 = ""; string histMsg14 = ""; string histMsg15 = "";
+string histMsg16 = ""; string histMsg17 = ""; string histMsg18 = ""; string histMsg19 = "";
+int histType0 = 0;  int histType1 = 0;  int histType2 = 0;  int histType3 = 0;
+int histType4 = 0;  int histType5 = 0;  int histType6 = 0;  int histType7 = 0;
+int histType8 = 0;  int histType9 = 0;  int histType10 = 0; int histType11 = 0;
+int histType12 = 0; int histType13 = 0; int histType14 = 0; int histType15 = 0;
+int histType16 = 0; int histType17 = 0; int histType18 = 0; int histType19 = 0;
+
+# Notification panel state
+bool notifPanelVisible = false;
+int notifPanelScroll = 0;
+int unreadCount = 0;  # Tracks notifications not yet seen in panel
+
+# Layout
+int TOAST_W       = 280;
+int TOAST_H       = 48;
+int TOAST_MARGIN  = 8;
+int TOAST_LIFETIME = 180;    # ~3 seconds at 60fps
+
+export class Toast {
+    # Show a notification with a message and type
+    public static func show(string message, int type) -> void {
+        # Play notification sound
+        Speaker.notify();
+        # Add to notification history
+        addToHistory(message, type);
+        # Shift existing toasts down
+        if (toastCount >= 3) {
+            # Drop oldest (index 0)
+            toastMsg0 = toastMsg1;   toastTimer0 = toastTimer1;   toastType0 = toastType1;
+            toastMsg1 = toastMsg2;   toastTimer1 = toastTimer2;   toastType1 = toastType2;
+            toastMsg2 = message;     toastTimer2 = TOAST_LIFETIME; toastType2 = type;
+        } elif (toastCount == 0) {
+            toastMsg0 = message;     toastTimer0 = TOAST_LIFETIME; toastType0 = type;
+            toastCount = 1;
+        } elif (toastCount == 1) {
+            toastMsg1 = message;     toastTimer1 = TOAST_LIFETIME; toastType1 = type;
+            toastCount = 2;
+        } elif (toastCount == 2) {
+            toastMsg2 = message;     toastTimer2 = TOAST_LIFETIME; toastType2 = type;
+            toastCount = 3;
+        }
+    }
+
+    # Convenience methods
+    public static func info(string msg) -> void { show(msg, TOAST_INFO); }
+    public static func success(string msg) -> void { show(msg, TOAST_SUCCESS); }
+    public static func warning(string msg) -> void { show(msg, TOAST_WARNING); }
+    public static func error(string msg) -> void { show(msg, TOAST_ERROR); }
+
+    # Update timers and remove expired toasts (call each frame)
+    public static func update() -> void {
+        # Decrement timers
+        if (toastCount >= 1) {
+            toastTimer0 = toastTimer0 - 1;
+            if (toastTimer0 <= 0) {
+                # Remove first toast, shift others up
+                toastMsg0 = toastMsg1;   toastTimer0 = toastTimer1;   toastType0 = toastType1;
+                toastMsg1 = toastMsg2;   toastTimer1 = toastTimer2;   toastType1 = toastType2;
+                toastMsg2 = "";          toastTimer2 = 0;             toastType2 = 0;
+                toastCount = toastCount - 1;
+            }
+        }
+
+        if (toastCount >= 2) {
+            toastTimer1 = toastTimer1 - 1;
+            if (toastTimer1 <= 0) {
+                toastMsg1 = toastMsg2;   toastTimer1 = toastTimer2;   toastType1 = toastType2;
+                toastMsg2 = "";          toastTimer2 = 0;             toastType2 = 0;
+                toastCount = toastCount - 1;
+            }
+        }
+
+        if (toastCount >= 3) {
+            toastTimer2 = toastTimer2 - 1;
+            if (toastTimer2 <= 0) {
+                toastMsg2 = "";          toastTimer2 = 0;             toastType2 = 0;
+                toastCount = toastCount - 1;
+            }
+        }
+    }
+
+    # Draw all active toasts (top-right corner)
+    public static func draw(int screenW, int screenH) -> void {
+        if (toastCount == 0) return;
+
+        int baseX = screenW - TOAST_W - 16;
+        int baseY = 12;
+
+        for (int i = 0; i < toastCount; i++) {
+            int ty = baseY + i * (TOAST_H + TOAST_MARGIN);
+            string msg = getMsg(i);
+            int type = getType(i);
+            int timer = getTimer(i);
+            drawSingleToast(baseX, ty, msg, type, timer);
+        }
+    }
+
+    # Draw a single toast notification
+    private static func drawSingleToast(int x, int y, string msg, int type, int timer) -> void {
+        # Fade out in last 30 frames
+        color32 bgColor = 0x1C2333E0;
+        if (timer < 30) {
+            bgColor = 0x1C233380;
+        }
+
+        # Shadow
+        Framebuffer.fillRect(x + 3, y + 3, TOAST_W, TOAST_H, 0x00000040);
+
+        # Background
+        Framebuffer.fillRoundedRect(x, y, TOAST_W, TOAST_H, 8, bgColor);
+
+        # Left accent bar based on type
+        color32 accentColor = 0x58A6FFFF;  # Info
+        if (type == TOAST_SUCCESS) accentColor = 0x56D364FF;
+        elif (type == TOAST_WARNING) accentColor = 0xE3B341FF;
+        elif (type == TOAST_ERROR) accentColor = 0xF85149FF;
+
+        Framebuffer.fillRect(x, y + 4, 4, TOAST_H - 8, accentColor);
+
+        # Type icon
+        string icon = "i";
+        if (type == TOAST_SUCCESS) icon = "+";
+        elif (type == TOAST_WARNING) icon = "!";
+        elif (type == TOAST_ERROR) icon = "x";
+
+        Framebuffer.fillCircle(x + 20, y + TOAST_H / 2, 8, accentColor);
+        TextRender.drawText(icon, x + 17, y + TOAST_H / 2 - 8, 0x0D1117FF);
+
+        # Message text (truncate if needed)
+        string displayMsg = msg;
+        int maxChars = (TOAST_W - 50) / 8;
+        if (displayMsg.length > maxChars) {
+            displayMsg = displayMsg.substring(0, maxChars - 2) + "..";
+        }
+
+        color32 textColor = 0xE6EDF3FF;
+        if (timer < 30) {
+            textColor = 0x8B949EFF;
+        }
+        TextRender.drawText(displayMsg, x + 36, y + (TOAST_H - 16) / 2, textColor);
+
+        # Border
+        Framebuffer.drawRoundedRect(x, y, TOAST_W, TOAST_H, 8, 0x30363D80);
+    }
+
+    # Accessors
+    private static func getMsg(int i) -> string {
+        switch (i) {
+            case 0: return toastMsg0;
+            case 1: return toastMsg1;
+            case 2: return toastMsg2;
+            default: return "";
+        }
+    }
+
+    private static func getType(int i) -> int {
+        switch (i) {
+            case 0: return toastType0;
+            case 1: return toastType1;
+            case 2: return toastType2;
+            default: return 0;
+        }
+    }
+
+    private static func getTimer(int i) -> int {
+        switch (i) {
+            case 0: return toastTimer0;
+            case 1: return toastTimer1;
+            case 2: return toastTimer2;
+            default: return 0;
+        }
+    }
+
+    # ========================================================================
+    # Notification History
+    # ========================================================================
+
+    # Add a message to the history ring buffer (newest at index 0)
+    private static func addToHistory(string msg, int type) -> void {
+        # Shift everything down by one
+        histMsg19 = histMsg18; histType19 = histType18;
+        histMsg18 = histMsg17; histType18 = histType17;
+        histMsg17 = histMsg16; histType17 = histType16;
+        histMsg16 = histMsg15; histType16 = histType15;
+        histMsg15 = histMsg14; histType15 = histType14;
+        histMsg14 = histMsg13; histType14 = histType13;
+        histMsg13 = histMsg12; histType13 = histType12;
+        histMsg12 = histMsg11; histType12 = histType11;
+        histMsg11 = histMsg10; histType11 = histType10;
+        histMsg10 = histMsg9;  histType10 = histType9;
+        histMsg9 = histMsg8;   histType9 = histType8;
+        histMsg8 = histMsg7;   histType8 = histType7;
+        histMsg7 = histMsg6;   histType7 = histType6;
+        histMsg6 = histMsg5;   histType6 = histType5;
+        histMsg5 = histMsg4;   histType5 = histType4;
+        histMsg4 = histMsg3;   histType4 = histType3;
+        histMsg3 = histMsg2;   histType3 = histType2;
+        histMsg2 = histMsg1;   histType2 = histType1;
+        histMsg1 = histMsg0;   histType1 = histType0;
+        # Insert new at index 0
+        histMsg0 = msg;
+        histType0 = type;
+        if (historyCount < HISTORY_MAX) historyCount = historyCount + 1;
+        unreadCount = unreadCount + 1;
+    }
+
+    # Get history message by index
+    private static func getHistMsg(int i) -> string {
+        if (i == 0) return histMsg0;   if (i == 1) return histMsg1;
+        if (i == 2) return histMsg2;   if (i == 3) return histMsg3;
+        if (i == 4) return histMsg4;   if (i == 5) return histMsg5;
+        if (i == 6) return histMsg6;   if (i == 7) return histMsg7;
+        if (i == 8) return histMsg8;   if (i == 9) return histMsg9;
+        if (i == 10) return histMsg10; if (i == 11) return histMsg11;
+        if (i == 12) return histMsg12; if (i == 13) return histMsg13;
+        if (i == 14) return histMsg14; if (i == 15) return histMsg15;
+        if (i == 16) return histMsg16; if (i == 17) return histMsg17;
+        if (i == 18) return histMsg18; if (i == 19) return histMsg19;
+        return "";
+    }
+
+    # Get history type by index
+    private static func getHistType(int i) -> int {
+        if (i == 0) return histType0;   if (i == 1) return histType1;
+        if (i == 2) return histType2;   if (i == 3) return histType3;
+        if (i == 4) return histType4;   if (i == 5) return histType5;
+        if (i == 6) return histType6;   if (i == 7) return histType7;
+        if (i == 8) return histType8;   if (i == 9) return histType9;
+        if (i == 10) return histType10; if (i == 11) return histType11;
+        if (i == 12) return histType12; if (i == 13) return histType13;
+        if (i == 14) return histType14; if (i == 15) return histType15;
+        if (i == 16) return histType16; if (i == 17) return histType17;
+        if (i == 18) return histType18; if (i == 19) return histType19;
+        return 0;
+    }
+
+    # Toggle notification panel
+    public static func togglePanel() -> void {
+        notifPanelVisible = !notifPanelVisible;
+        notifPanelScroll = 0;
+        # Mark all as read when opening the panel
+        if (notifPanelVisible) {
+            unreadCount = 0;
+        }
+    }
+
+    public static func isPanelVisible() -> bool {
+        return notifPanelVisible;
+    }
+
+    # Get the number of unread notifications (for badge display)
+    public static func getUnreadCount() -> int {
+        return unreadCount;
+    }
+
+    # Clear all notification history
+    public static func clearAll() -> void {
+        historyCount = 0;
+        unreadCount = 0;
+        notifPanelScroll = 0;
+        histMsg0 = ""; histMsg1 = ""; histMsg2 = ""; histMsg3 = "";
+        histMsg4 = ""; histMsg5 = ""; histMsg6 = ""; histMsg7 = "";
+        histMsg8 = ""; histMsg9 = ""; histMsg10 = ""; histMsg11 = "";
+        histMsg12 = ""; histMsg13 = ""; histMsg14 = ""; histMsg15 = "";
+        histMsg16 = ""; histMsg17 = ""; histMsg18 = ""; histMsg19 = "";
+    }
+
+    # Process key input for the notification panel
+    public static func processPanelKey(KeyEvent event) -> void {
+        if (!notifPanelVisible) return;
+        if (!event.pressed) return;
+
+        if (event.scancode == 1) {
+            # Escape — close panel
+            notifPanelVisible = false;
+        } elif (event.scancode == KEY_UP) {
+            if (notifPanelScroll > 0) notifPanelScroll = notifPanelScroll - 1;
+        } elif (event.scancode == KEY_DOWN) {
+            if (notifPanelScroll < historyCount - 1) notifPanelScroll = notifPanelScroll + 1;
+        } elif (event.ascii == 'c' || event.ascii == 'C') {
+            # C — clear all notifications
+            clearAll();
+        }
+    }
+
+    # Draw the notification history panel (right side overlay)
+    public static func drawPanel(int screenW, int screenH) -> void {
+        if (!notifPanelVisible) return;
+
+        int panelW = 320;
+        int panelH = screenH - 80;
+        int px = screenW - panelW - 10;
+        int py = 10;
+
+        # Semi-transparent panel background
+        for (int row = py; row < py + panelH; row++) {
+            for (int col = px; col < px + panelW; col++) {
+                Framebuffer.blendPixel(col, row, 0x0D1117D0);
+            }
+        }
+        Framebuffer.drawRoundedRect(px, py, panelW, panelH, 8, 0x30363DFF);
+
+        # Header
+        TextRender.drawText("Notifications", px + 16, py + 12, 0xE6EDF3FF);
+        # Close hint and Clear hint
+        TextRender.drawText("[C]lear [Esc]", px + panelW - 112, py + 12, 0x8B949EFF);
+
+        # Separator
+        int sepY = py + 32;
+        Framebuffer.drawHLine(px + 8, sepY, panelW - 16, 0x30363DFF);
+
+        if (historyCount == 0) {
+            TextRender.drawText("No notifications yet", px + 16, py + 50, 0x8B949EFF);
+            return;
+        }
+
+        # Draw notification entries
+        int entryH = 36;
+        int startY = sepY + 8;
+        int visibleEntries = (panelH - 48) / entryH;
+
+        for (int i = 0; i < visibleEntries && (i + notifPanelScroll) < historyCount; i++) {
+            int idx = i + notifPanelScroll;
+            int ey = startY + i * entryH;
+
+            string msg = getHistMsg(idx);
+            int hType = getHistType(idx);
+
+            # Accent dot based on type
+            color32 dotColor = 0x58A6FFFF;
+            if (hType == TOAST_SUCCESS) dotColor = 0x56D364FF;
+            elif (hType == TOAST_WARNING) dotColor = 0xE3B341FF;
+            elif (hType == TOAST_ERROR) dotColor = 0xF85149FF;
+
+            Framebuffer.fillCircle(px + 20, ey + 10, 4, dotColor);
+
+            # Message text (truncate)
+            int maxC = (panelW - 50) / 8;
+            string disp = msg;
+            if (disp.length > maxC) {
+                disp = disp.substring(0, maxC - 2) + "..";
+            }
+            TextRender.drawText(disp, px + 32, ey + 4, 0xC9D1D9FF);
+
+            # Separator line
+            Framebuffer.drawHLine(px + 8, ey + entryH - 2, panelW - 16, 0x21262D80);
+        }
+
+        # Scroll indicator
+        if (historyCount > visibleEntries) {
+            int scrollMaxY = panelH - 60;
+            int thumbH = (visibleEntries * scrollMaxY) / historyCount;
+            if (thumbH < 10) thumbH = 10;
+            int thumbY = py + 40 + (notifPanelScroll * (scrollMaxY - thumbH)) / (historyCount - visibleEntries);
+            Framebuffer.fillRect(px + panelW - 6, thumbY, 3, thumbH, 0x484F5880);
+        }
+    }
+}

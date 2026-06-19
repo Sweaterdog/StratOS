@@ -1,0 +1,264 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Screensaver — Animated starfield with digital clock
+// system/windowing/screensaver.lx
+//
+// Features:
+//   - Animated star field (stars move toward viewer)
+//   - Floating digital clock
+//   - Activates after idle timeout
+//   - Dismissed by any key or mouse click
+//   - Configurable idle timeout
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+
+# Screensaver state
+bool ssActive = false;
+bool ssEnabled = true;
+int ssIdleCounter = 0;
+int SS_IDLE_TIMEOUT = 18000;   # ~5 minutes at 60fps (300 * 60)
+
+# Star field (32 stars, parallel arrays)
+int SS_STAR_COUNT = 32;
+int ssx0 = 100;   int ssy0 = 100;   int ssz0 = 50;
+int ssx1 = 300;   int ssy1 = 200;   int ssz1 = 40;
+int ssx2 = 500;   int ssy2 = 100;   int ssz2 = 30;
+int ssx3 = 700;   int ssy3 = 300;   int ssz3 = 45;
+int ssx4 = 200;   int ssy4 = 400;   int ssz4 = 35;
+int ssx5 = 600;   int ssy5 = 500;   int ssz5 = 25;
+int ssx6 = 400;   int ssy6 = 600;   int ssz6 = 50;
+int ssx7 = 150;   int ssy7 = 700;   int ssz7 = 42;
+int ssx8 = 800;   int ssy8 = 150;   int ssz8 = 38;
+int ssx9 = 50;    int ssy9 = 350;   int ssz9 = 28;
+int ssx10 = 900;  int ssy10 = 450;  int ssz10 = 48;
+int ssx11 = 350;  int ssy11 = 50;   int ssz11 = 20;
+int ssx12 = 750;  int ssy12 = 650;  int ssz12 = 36;
+int ssx13 = 450;  int ssy13 = 250;  int ssz13 = 44;
+int ssx14 = 100;  int ssy14 = 550;  int ssz14 = 32;
+int ssx15 = 650;  int ssy15 = 100;  int ssz15 = 26;
+int ssx16 = 250;  int ssy16 = 700;  int ssz16 = 46;
+int ssx17 = 850;  int ssy17 = 350;  int ssz17 = 34;
+int ssx18 = 550;  int ssy18 = 500;  int ssz18 = 22;
+int ssx19 = 100;  int ssy19 = 200;  int ssz19 = 40;
+int ssx20 = 400;  int ssy20 = 300;  int ssz20 = 50;
+int ssx21 = 300;  int ssy21 = 600;  int ssz21 = 38;
+int ssx22 = 700;  int ssy22 = 400;  int ssz22 = 28;
+int ssx23 = 200;  int ssy23 = 500;  int ssz23 = 45;
+int ssx24 = 500;  int ssy24 = 700;  int ssz24 = 33;
+int ssx25 = 800;  int ssy25 = 200;  int ssz25 = 47;
+int ssx26 = 600;  int ssy26 = 350;  int ssz26 = 24;
+int ssx27 = 350;  int ssy27 = 150;  int ssz27 = 42;
+int ssx28 = 900;  int ssy28 = 600;  int ssz28 = 30;
+int ssx29 = 150;  int ssy29 = 450;  int ssz29 = 36;
+int ssx30 = 750;  int ssy30 = 500;  int ssz30 = 50;
+int ssx31 = 450;  int ssy31 = 100;  int ssz31 = 20;
+
+# Animation frame counter
+int ssFrame = 0;
+
+export class Screensaver {
+
+    # Check if screensaver is currently active
+    public static func isActive() -> bool {
+        return ssActive;
+    }
+
+    # Check if screensaver is enabled
+    public static func isEnabled() -> bool {
+        return ssEnabled;
+    }
+
+    # Toggle screensaver on/off
+    public static func toggle() -> void {
+        ssEnabled = !ssEnabled;
+        if (!ssEnabled) {
+            ssActive = false;
+        }
+    }
+
+    # Reset the idle counter (called on any user input)
+    public static func resetIdle() -> void {
+        ssIdleCounter = 0;
+        if (ssActive) {
+            ssActive = false;
+        }
+    }
+
+    # Tick the idle counter (called each frame)
+    public static func tickIdle() -> void {
+        if (!ssEnabled) return;
+        if (ssActive) return;
+
+        ssIdleCounter = ssIdleCounter + 1;
+        if (ssIdleCounter >= SS_IDLE_TIMEOUT) {
+            ssActive = true;
+            ssFrame = 0;
+        }
+    }
+
+    # Dismiss the screensaver (any input)
+    public static func dismiss() -> void {
+        ssActive = false;
+        ssIdleCounter = 0;
+    }
+
+    # Draw the screensaver
+    public static func draw(int screenW, int screenH) -> void {
+        if (!ssActive) return;
+
+        ssFrame = ssFrame + 1;
+
+        # Black background
+        Framebuffer.fillRect(0, 0, screenW, screenH, 0x000000FF);
+
+        # Animate and draw stars
+        int cx = screenW / 2;
+        int cy = screenH / 2;
+
+        for (int i = 0; i < SS_STAR_COUNT; i++) {
+            # Get star position
+            int sx = getStarX(i);
+            int sy = getStarY(i);
+            int sz = getStarZ(i);
+
+            # Move star toward viewer (decrease Z)
+            sz = sz - 1;
+            if (sz <= 0) {
+                # Respawn star at random-ish position far away
+                sx = ((i * 137 + ssFrame * 31) % screenW);
+                sy = ((i * 251 + ssFrame * 43) % screenH);
+                sz = 50;
+            }
+
+            # Perspective projection
+            int projX = cx + (sx - cx) * 50 / sz;
+            int projY = cy + (sy - cy) * 50 / sz;
+
+            # Star brightness (closer = brighter)
+            int brightness = 255 - (sz * 4);
+            if (brightness < 60) brightness = 60;
+            if (brightness > 255) brightness = 255;
+
+            # Construct RGBA color
+            int alpha = 0xFF;
+            color32 starColor = (brightness * 0x01000000) + (brightness * 0x00010000) + (brightness * 0x00000100) + alpha;
+
+            # Draw star (bigger if closer)
+            if (projX >= 0 && projX < screenW && projY >= 0 && projY < screenH) {
+                if (sz < 15) {
+                    # Close star — draw 2x2
+                    Framebuffer.plotPixel(projX, projY, starColor);
+                    Framebuffer.plotPixel(projX + 1, projY, starColor);
+                    Framebuffer.plotPixel(projX, projY + 1, starColor);
+                    Framebuffer.plotPixel(projX + 1, projY + 1, starColor);
+                } elif (sz < 30) {
+                    # Medium star
+                    Framebuffer.plotPixel(projX, projY, starColor);
+                    Framebuffer.plotPixel(projX + 1, projY, starColor);
+                } else {
+                    # Far star — single pixel
+                    Framebuffer.plotPixel(projX, projY, starColor);
+                }
+            }
+
+            # Write back updated Z
+            setStarZ(i, sz);
+        }
+
+        # Floating digital clock (bouncing around screen)
+        int clockW = 128;
+        int clockH = 32;
+        int clockX = ((ssFrame * 2) % (screenW - clockW));
+        int clockY = screenH / 2 + ((ssFrame / 3) % 100) - 50;
+
+        # Read RTC time
+        int hrs = Timer.getRtcHours();
+        int mins = Timer.getRtcMinutes();
+        int secs = Timer.getRtcSeconds();
+        string hStr = "";
+        if (hrs < 10) { hStr = "0${hrs}"; } else { hStr = "${hrs}"; }
+        string mStr = "";
+        if (mins < 10) { mStr = "0${mins}"; } else { mStr = "${mins}"; }
+        string sStr = "";
+        if (secs < 10) { sStr = "0${secs}"; } else { sStr = "${secs}"; }
+        string timeStr = "${hStr}:${mStr}:${sStr}";
+
+        # Glow effect — dim text behind main text
+        TextRender.drawText(timeStr, clockX - 1, clockY, 0x58A6FF40);
+        TextRender.drawText(timeStr, clockX + 1, clockY, 0x58A6FF40);
+        TextRender.drawText(timeStr, clockX, clockY - 1, 0x58A6FF40);
+        TextRender.drawText(timeStr, clockX, clockY + 1, 0x58A6FF40);
+        # Main text
+        TextRender.drawText(timeStr, clockX, clockY, 0x58A6FFFF);
+
+        # Hint at bottom
+        TextRender.drawText("Press any key to wake", screenW / 2 - 84, screenH - 24, 0x333344FF);
+    }
+
+    # Star accessor helpers (parallel arrays)
+    private static func getStarX(int i) -> int {
+        switch (i) {
+            case 0: return ssx0;   case 1: return ssx1;   case 2: return ssx2;   case 3: return ssx3;
+            case 4: return ssx4;   case 5: return ssx5;   case 6: return ssx6;   case 7: return ssx7;
+            case 8: return ssx8;   case 9: return ssx9;   case 10: return ssx10; case 11: return ssx11;
+            case 12: return ssx12; case 13: return ssx13; case 14: return ssx14; case 15: return ssx15;
+            case 16: return ssx16; case 17: return ssx17; case 18: return ssx18; case 19: return ssx19;
+            case 20: return ssx20; case 21: return ssx21; case 22: return ssx22; case 23: return ssx23;
+            case 24: return ssx24; case 25: return ssx25; case 26: return ssx26; case 27: return ssx27;
+            case 28: return ssx28; case 29: return ssx29; case 30: return ssx30; case 31: return ssx31;
+            default: return 0;
+        }
+    }
+
+    private static func getStarY(int i) -> int {
+        switch (i) {
+            case 0: return ssy0;   case 1: return ssy1;   case 2: return ssy2;   case 3: return ssy3;
+            case 4: return ssy4;   case 5: return ssy5;   case 6: return ssy6;   case 7: return ssy7;
+            case 8: return ssy8;   case 9: return ssy9;   case 10: return ssy10; case 11: return ssy11;
+            case 12: return ssy12; case 13: return ssy13; case 14: return ssy14; case 15: return ssy15;
+            case 16: return ssy16; case 17: return ssy17; case 18: return ssy18; case 19: return ssy19;
+            case 20: return ssy20; case 21: return ssy21; case 22: return ssy22; case 23: return ssy23;
+            case 24: return ssy24; case 25: return ssy25; case 26: return ssy26; case 27: return ssy27;
+            case 28: return ssy28; case 29: return ssy29; case 30: return ssy30; case 31: return ssy31;
+            default: return 0;
+        }
+    }
+
+    private static func getStarZ(int i) -> int {
+        switch (i) {
+            case 0: return ssz0;   case 1: return ssz1;   case 2: return ssz2;   case 3: return ssz3;
+            case 4: return ssz4;   case 5: return ssz5;   case 6: return ssz6;   case 7: return ssz7;
+            case 8: return ssz8;   case 9: return ssz9;   case 10: return ssz10; case 11: return ssz11;
+            case 12: return ssz12; case 13: return ssz13; case 14: return ssz14; case 15: return ssz15;
+            case 16: return ssz16; case 17: return ssz17; case 18: return ssz18; case 19: return ssz19;
+            case 20: return ssz20; case 21: return ssz21; case 22: return ssz22; case 23: return ssz23;
+            case 24: return ssz24; case 25: return ssz25; case 26: return ssz26; case 27: return ssz27;
+            case 28: return ssz28; case 29: return ssz29; case 30: return ssz30; case 31: return ssz31;
+            default: return 50;
+        }
+    }
+
+    private static func setStarZ(int i, int val) -> void {
+        switch (i) {
+            case 0: ssz0 = val; break;   case 1: ssz1 = val; break;
+            case 2: ssz2 = val; break;   case 3: ssz3 = val; break;
+            case 4: ssz4 = val; break;   case 5: ssz5 = val; break;
+            case 6: ssz6 = val; break;   case 7: ssz7 = val; break;
+            case 8: ssz8 = val; break;   case 9: ssz9 = val; break;
+            case 10: ssz10 = val; break; case 11: ssz11 = val; break;
+            case 12: ssz12 = val; break; case 13: ssz13 = val; break;
+            case 14: ssz14 = val; break; case 15: ssz15 = val; break;
+            case 16: ssz16 = val; break; case 17: ssz17 = val; break;
+            case 18: ssz18 = val; break; case 19: ssz19 = val; break;
+            case 20: ssz20 = val; break; case 21: ssz21 = val; break;
+            case 22: ssz22 = val; break; case 23: ssz23 = val; break;
+            case 24: ssz24 = val; break; case 25: ssz25 = val; break;
+            case 26: ssz26 = val; break; case 27: ssz27 = val; break;
+            case 28: ssz28 = val; break; case 29: ssz29 = val; break;
+            case 30: ssz30 = val; break; case 31: ssz31 = val; break;
+        }
+    }
+}

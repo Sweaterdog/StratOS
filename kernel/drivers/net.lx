@@ -1,0 +1,1168 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Network Stack — Ethernet, ARP, IP, UDP, TCP, DNS
+// kernel/drivers/net.lx
+//
+// A minimal network stack for StratOS built on top of the E1000 driver.
+// Supports:
+//   - Ethernet frame parsing/construction
+//   - ARP request/reply (IPv4 address resolution)
+//   - IPv4 packet send/receive
+//   - UDP datagram send/receive
+//   - TCP connection (simplified: connect, send, receive, close)
+//   - DNS resolution (basic A record queries over UDP)
+//   - DHCP client (basic, for auto-configuration)
+//
+// All network operations are synchronous (polling-based).
+// ============================================================================
+
+import "kernel/drivers/e1000.lx";
+import "kernel/memory/manager.lx";
+import "kernel/core/console.lx";
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Ethernet types
+int ETH_TYPE_ARP  = 0x0806;
+int ETH_TYPE_IPV4 = 0x0800;
+
+# IP protocols
+int IP_PROTO_ICMP = 1;
+int IP_PROTO_TCP  = 6;
+int IP_PROTO_UDP  = 17;
+
+# ARP opcodes
+int ARP_REQUEST = 1;
+int ARP_REPLY   = 2;
+
+# Packet size limits
+int ETH_HEADER_SIZE = 14;
+int IP_HEADER_SIZE  = 20;
+int UDP_HEADER_SIZE = 8;
+int TCP_HEADER_SIZE = 20;
+int ARP_PACKET_SIZE = 28;
+int DNS_HEADER_SIZE = 12;
+int DHCP_HEADER_SIZE = 240;
+int MAX_PACKET_SIZE = 1518;
+
+# TCP flags
+int TCP_FIN = 0x01;
+int TCP_SYN = 0x02;
+int TCP_RST = 0x04;
+int TCP_PSH = 0x08;
+int TCP_ACK = 0x10;
+
+# TCP states
+int TCP_CLOSED      = 0;
+int TCP_SYN_SENT    = 1;
+int TCP_ESTABLISHED = 2;
+int TCP_FIN_WAIT    = 3;
+int TCP_CLOSE_WAIT  = 4;
+
+# ============================================================================
+# Network Configuration (set by DHCP or manually)
+# ============================================================================
+int netIP       = 0;           # Our IPv4 address (network byte order)
+int netSubnet   = 0;           # Subnet mask
+int netGateway  = 0;           # Default gateway
+int netDNS      = 0;           # DNS server
+bool netConfigured = false;
+
+# ARP cache (simple, 32 entries)
+int ARP_CACHE_SIZE = 32;
+list<int>  arpCacheIP  = [];
+list<long> arpCacheMAC = [];
+int arpCacheCount = 0;
+
+# TCP connection state (single connection at a time)
+int tcpState    = 0;
+int tcpLocalPort = 49152;
+int tcpRemotePort = 0;
+int tcpRemoteIP = 0;
+long tcpSeqNum   = 0;
+long tcpAckNum   = 0;
+
+# Receive data buffer
+long tcpRecvBuf = 0;
+int tcpRecvLen  = 0;
+int tcpRecvMax  = 65536;
+
+# UDP receive buffer
+long udpRecvBuf = 0;
+int udpRecvLen  = 0;
+int udpRecvSrcPort = 0;
+int udpRecvSrcIP = 0;
+
+# Working buffer for packet construction
+long netBuf = 0;
+int NET_BUF_SIZE = 2048;
+
+export class Net {
+
+    # ========================================================================
+    # Initialize the network stack
+    # ========================================================================
+    public static func init() -> void {
+        # Allocate working buffers
+        netBuf = MemoryManager.kmalloc(NET_BUF_SIZE);
+        tcpRecvBuf = MemoryManager.kmalloc(tcpRecvMax);
+        udpRecvBuf = MemoryManager.kmalloc(2048);
+
+        # Initialize ARP cache
+        for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+            arpCacheIP.add(0);
+            arpCacheMAC.add(0);
+        }
+
+        tcpState = TCP_CLOSED;
+        tcpRecvLen = 0;
+
+        Console.log("[  OK  ] Network stack initialized");
+    }
+
+    # ========================================================================
+    # Configure network with static IP
+    # ip, subnet, gateway, dns are in network byte order
+    # ========================================================================
+    public static func configure(int ip, int subnet, int gateway, int dns) -> void {
+        netIP = ip;
+        netSubnet = subnet;
+        netGateway = gateway;
+        netDNS = dns;
+        netConfigured = true;
+    }
+
+    # ========================================================================
+    # Run DHCP to get an IP address automatically
+    # ========================================================================
+    public static func dhcp() -> bool {
+        if (!E1000.isPresent()) return false;
+
+        # DHCP Discover
+        long pkt = MemoryManager.kmalloc(600);
+        if (pkt == 0) return false;
+
+        int pktLen = buildDhcpDiscover(pkt);
+        E1000.sendPacket(pkt, pktLen);
+
+        # Wait for DHCP Offer (poll for up to 5 seconds)
+        for (int attempt = 0; attempt < 500; attempt++) {
+            processIncoming();
+            spinWait(10000);
+
+            if (netConfigured) {
+                Console.log("[  OK  ] DHCP: Got IP ${ipToString(netIP)}");
+                return true;
+            }
+        }
+
+        # Fallback: use a static IP for QEMU's default network
+        # QEMU user-mode networking: 10.0.2.0/24, gateway 10.0.2.2, DNS 10.0.2.3
+        netIP      = makeIP(10, 0, 2, 15);
+        netSubnet  = makeIP(255, 255, 255, 0);
+        netGateway = makeIP(10, 0, 2, 2);
+        netDNS     = makeIP(10, 0, 2, 3);
+        netConfigured = true;
+
+        Console.log("[WARN ] DHCP timeout — using static IP: ${ipToString(netIP)}");
+        return true;
+    }
+
+    # ========================================================================
+    # Process incoming packets (call periodically)
+    # ========================================================================
+    public static func processIncoming() -> void {
+        E1000.poll();
+
+        while (E1000.hasPacket()) {
+            long pktAddr = E1000.receivePacket();
+            int pktLen = E1000.getLastPacketLen();
+            if (pktAddr == 0 || pktLen < ETH_HEADER_SIZE) continue;
+
+            processEthernet(pktAddr, pktLen);
+        }
+    }
+
+    # ========================================================================
+    # Resolve a hostname to an IP address using DNS
+    # Returns 0 on failure
+    # ========================================================================
+    public static func dnsResolve(string hostname) -> int {
+        if (!netConfigured || !E1000.isPresent()) return 0;
+
+        # Build DNS query
+        long pkt = MemoryManager.kmalloc(512);
+        if (pkt == 0) return 0;
+
+        int queryLen = buildDnsQuery(pkt, hostname);
+
+        # Wrap in UDP + IP + Ethernet and send
+        sendUDP(netDNS, 53, 12345, pkt, queryLen);
+
+        # Wait for DNS reply (poll for up to 3 seconds)
+        for (int attempt = 0; attempt < 300; attempt++) {
+            processIncoming();
+            spinWait(10000);
+
+            # Check if we got a UDP reply on port 12345
+            if (udpRecvLen > 0 && udpRecvSrcPort == 53) {
+                int ip = parseDnsReply(udpRecvBuf, udpRecvLen);
+                udpRecvLen = 0;
+                return ip;
+            }
+        }
+
+        return 0;
+    }
+
+    # ========================================================================
+    # Send a UDP datagram
+    # ========================================================================
+    public static func sendUDP(int dstIP, int dstPort, int srcPort, long data, int dataLen) -> bool {
+        if (!netConfigured || !E1000.isPresent()) return false;
+
+        long pkt = MemoryManager.kmalloc(MAX_PACKET_SIZE);
+        if (pkt == 0) return false;
+
+        # Resolve destination MAC
+        long dstMac = resolveMAC(dstIP);
+
+        int totalLen = ETH_HEADER_SIZE + IP_HEADER_SIZE + UDP_HEADER_SIZE + dataLen;
+
+        # Build Ethernet header
+        buildEthernetHeader(pkt, dstMac, ETH_TYPE_IPV4);
+
+        # Build IP header
+        buildIPHeader(pkt + ETH_HEADER_SIZE, netIP, dstIP, IP_PROTO_UDP, UDP_HEADER_SIZE + dataLen);
+
+        # Build UDP header
+        int udpOff = ETH_HEADER_SIZE + IP_HEADER_SIZE;
+        unsafe {
+            byte* p = (byte*)(pkt + (long) udpOff);
+            p[0] = (byte)((srcPort >> 8) & 0xFF);
+            p[1] = (byte)(srcPort & 0xFF);
+            p[2] = (byte)((dstPort >> 8) & 0xFF);
+            p[3] = (byte)(dstPort & 0xFF);
+            int udpLen = UDP_HEADER_SIZE + dataLen;
+            p[4] = (byte)((udpLen >> 8) & 0xFF);
+            p[5] = (byte)(udpLen & 0xFF);
+            p[6] = 0;  # Checksum (optional for UDP)
+            p[7] = 0;
+
+            # Copy data
+            byte* dst = (byte*)(pkt + (long)(udpOff + UDP_HEADER_SIZE));
+            byte* src = (byte*) data;
+            for (int i = 0; i < dataLen; i++) {
+                dst[i] = src[i];
+            }
+        }
+
+        E1000.sendPacket(pkt, totalLen);
+        return true;
+    }
+
+    # ========================================================================
+    # TCP Connect to a remote host
+    # Returns true if connection established
+    # ========================================================================
+    public static func tcpConnect(int remoteIP, int remotePort) -> bool {
+        if (!netConfigured || !E1000.isPresent()) return false;
+
+        tcpRemoteIP = remoteIP;
+        tcpRemotePort = remotePort;
+        tcpLocalPort = tcpLocalPort + 1;
+        if (tcpLocalPort > 60000) tcpLocalPort = 49152;
+        tcpSeqNum = 1000;   # Simple initial sequence number
+        tcpAckNum = 0;
+        tcpRecvLen = 0;
+
+        # Send SYN
+        sendTCPPacket(TCP_SYN, 0, 0);
+        tcpState = TCP_SYN_SENT;
+
+        # Wait for SYN+ACK (up to 5 seconds)
+        for (int attempt = 0; attempt < 500; attempt++) {
+            processIncoming();
+            spinWait(10000);
+
+            if (tcpState == TCP_ESTABLISHED) {
+                return true;
+            }
+            if (tcpState == TCP_CLOSED) return false;
+        }
+
+        tcpState = TCP_CLOSED;
+        return false;
+    }
+
+    # ========================================================================
+    # Send data over TCP
+    # ========================================================================
+    public static func tcpSend(long data, int dataLen) -> bool {
+        if (tcpState != TCP_ESTABLISHED) return false;
+
+        sendTCPPacket(TCP_PSH | TCP_ACK, data, dataLen);
+        tcpSeqNum = tcpSeqNum + (long) dataLen;
+
+        return true;
+    }
+
+    # ========================================================================
+    # Receive data from TCP
+    # Returns number of bytes received (stored in tcpRecvBuf)
+    # ========================================================================
+    public static func tcpReceive(long buffer, int maxLen, int timeoutMs) -> int {
+        tcpRecvLen = 0;
+
+        int polls = timeoutMs / 10;
+        for (int i = 0; i < polls; i++) {
+            processIncoming();
+            spinWait(10000);
+
+            if (tcpRecvLen > 0) {
+                int copyLen = tcpRecvLen;
+                if (copyLen > maxLen) copyLen = maxLen;
+
+                unsafe {
+                    byte* dst = (byte*) buffer;
+                    byte* src = (byte*) tcpRecvBuf;
+                    for (int j = 0; j < copyLen; j++) {
+                        dst[j] = src[j];
+                    }
+                }
+
+                int result = copyLen;
+                tcpRecvLen = 0;
+                return result;
+            }
+        }
+        return 0;
+    }
+
+    # ========================================================================
+    # Close TCP connection
+    # ========================================================================
+    public static func tcpClose() -> void {
+        if (tcpState == TCP_ESTABLISHED) {
+            sendTCPPacket(TCP_FIN | TCP_ACK, 0, 0);
+            tcpState = TCP_FIN_WAIT;
+
+            # Wait briefly for FIN-ACK
+            for (int i = 0; i < 100; i++) {
+                processIncoming();
+                spinWait(10000);
+                if (tcpState == TCP_CLOSED) break;
+            }
+        }
+        tcpState = TCP_CLOSED;
+    }
+
+    # ========================================================================
+    # Check if the network is configured
+    # ========================================================================
+    public static func isConfigured() -> bool {
+        return netConfigured;
+    }
+
+    # ========================================================================
+    # Get our IP address as a string
+    # ========================================================================
+    public static func getIPString() -> string {
+        return ipToString(netIP);
+    }
+
+    # ========================================================================
+    # Get our DNS server IP as a string
+    # ========================================================================
+    public static func getDNSString() -> string {
+        return ipToString(netDNS);
+    }
+
+    # ========================================================================
+    # Get our gateway IP as a string
+    # ========================================================================
+    public static func getGatewayString() -> string {
+        return ipToString(netGateway);
+    }
+}
+
+# ============================================================================
+# Internal Packet Processing
+# ============================================================================
+
+func processEthernet(long pktAddr, int pktLen) -> void {
+    unsafe {
+        byte* pkt = (byte*) pktAddr;
+
+        # Read EtherType (bytes 12-13, big-endian)
+        int ethType = ((int) pkt[12] << 8) | (int) pkt[13];
+
+        if (ethType == ETH_TYPE_ARP) {
+            processARP(pktAddr + ETH_HEADER_SIZE, pktLen - ETH_HEADER_SIZE);
+        } else if (ethType == ETH_TYPE_IPV4) {
+            processIP(pktAddr + ETH_HEADER_SIZE, pktLen - ETH_HEADER_SIZE);
+        }
+    }
+}
+
+func processARP(long arpAddr, int arpLen) -> void {
+    if (arpLen < ARP_PACKET_SIZE) return;
+
+    unsafe {
+        byte* arp = (byte*) arpAddr;
+
+        int opcode = ((int) arp[6] << 8) | (int) arp[7];
+        int senderIP = ((int) arp[14] << 24) | ((int) arp[15] << 16) | ((int) arp[16] << 8) | (int) arp[17];
+        int targetIP = ((int) arp[24] << 24) | ((int) arp[25] << 16) | ((int) arp[26] << 8) | (int) arp[27];
+
+        if (opcode == ARP_REPLY) {
+            # Cache the sender's MAC
+            long mac = 0;
+            for (int i = 0; i < 6; i++) {
+                mac = mac | ((long) arp[8 + i] << (i * 8));
+            }
+            arpCacheAdd(senderIP, mac);
+        } else if (opcode == ARP_REQUEST && targetIP == netIP) {
+            # Reply to ARP request for our IP
+            sendARPReply(senderIP, arpAddr);
+        }
+    }
+}
+
+func processIP(long ipAddr, int ipLen) -> void {
+    if (ipLen < IP_HEADER_SIZE) return;
+
+    unsafe {
+        byte* ip = (byte*) ipAddr;
+
+        int protocol = (int) ip[9];
+        int headerLen = ((int) ip[0] & 0x0F) * 4;
+        int totalLen = ((int) ip[2] << 8) | (int) ip[3];
+
+        int srcIP = ((int) ip[12] << 24) | ((int) ip[13] << 16) | ((int) ip[14] << 8) | (int) ip[15];
+
+        long payloadAddr = ipAddr + (long) headerLen;
+        int payloadLen = totalLen - headerLen;
+
+        if (protocol == IP_PROTO_UDP) {
+            processUDP(payloadAddr, payloadLen, srcIP);
+        } else if (protocol == IP_PROTO_TCP) {
+            processTCP(payloadAddr, payloadLen, srcIP);
+        } else if (protocol == IP_PROTO_ICMP) {
+            processICMP(payloadAddr, payloadLen, srcIP);
+        }
+    }
+}
+
+func processUDP(long udpAddr, int udpLen, int srcIP) -> void {
+    if (udpLen < UDP_HEADER_SIZE) return;
+
+    unsafe {
+        byte* udp = (byte*) udpAddr;
+        int srcPort = ((int) udp[0] << 8) | (int) udp[1];
+        int dstPort = ((int) udp[2] << 8) | (int) udp[3];
+        int dataLen = (((int) udp[4] << 8) | (int) udp[5]) - UDP_HEADER_SIZE;
+
+        # Check for DHCP reply (port 68)
+        if (dstPort == 68) {
+            processDHCPReply(udpAddr + UDP_HEADER_SIZE, dataLen);
+            return;
+        }
+
+        # Store for general UDP receive
+        if (dataLen > 0 && dataLen < 2048) {
+            byte* dst = (byte*) udpRecvBuf;
+            byte* src = (byte*)(udpAddr + UDP_HEADER_SIZE);
+            for (int i = 0; i < dataLen; i++) {
+                dst[i] = src[i];
+            }
+            udpRecvLen = dataLen;
+            udpRecvSrcPort = srcPort;
+            udpRecvSrcIP = srcIP;
+        }
+    }
+}
+
+func processTCP(long tcpAddr, int tcpLen, int srcIP) -> void {
+    if (tcpLen < TCP_HEADER_SIZE) return;
+
+    unsafe {
+        byte* tcp = (byte*) tcpAddr;
+        int srcPort = ((int) tcp[0] << 8) | (int) tcp[1];
+        int dstPort = ((int) tcp[2] << 8) | (int) tcp[3];
+        long seqNum = (long)(((int) tcp[4] << 24) | ((int) tcp[5] << 16) | ((int) tcp[6] << 8) | (int) tcp[7]);
+        long ackNum = (long)(((int) tcp[8] << 24) | ((int) tcp[9] << 16) | ((int) tcp[10] << 8) | (int) tcp[11]);
+        int dataOffset = (((int) tcp[12] >> 4) & 0x0F) * 4;
+        int flags = (int) tcp[13];
+
+        # Only accept packets for our current connection
+        if (dstPort != tcpLocalPort) return;
+        if (srcIP != tcpRemoteIP || srcPort != tcpRemotePort) return;
+
+        int dataLen = tcpLen - dataOffset;
+
+        if (tcpState == TCP_SYN_SENT && (flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+            # Received SYN+ACK — send ACK
+            tcpAckNum = seqNum + 1;
+            tcpSeqNum = tcpSeqNum + 1;
+            sendTCPPacket(TCP_ACK, 0, 0);
+            tcpState = TCP_ESTABLISHED;
+        } else if (tcpState == TCP_ESTABLISHED) {
+            if (dataLen > 0) {
+                # Copy received data
+                byte* dst = (byte*)(tcpRecvBuf + (long) tcpRecvLen);
+                byte* src = (byte*)(tcpAddr + (long) dataOffset);
+                int copyLen = dataLen;
+                if (tcpRecvLen + copyLen > tcpRecvMax) {
+                    copyLen = tcpRecvMax - tcpRecvLen;
+                }
+                for (int i = 0; i < copyLen; i++) {
+                    dst[i] = src[i];
+                }
+                tcpRecvLen = tcpRecvLen + copyLen;
+                tcpAckNum = seqNum + (long) dataLen;
+                sendTCPPacket(TCP_ACK, 0, 0);
+            }
+
+            if ((flags & TCP_FIN) != 0) {
+                tcpAckNum = seqNum + 1;
+                sendTCPPacket(TCP_FIN | TCP_ACK, 0, 0);
+                tcpState = TCP_CLOSED;
+            }
+        } else if (tcpState == TCP_FIN_WAIT) {
+            if ((flags & TCP_ACK) != 0) {
+                tcpState = TCP_CLOSED;
+            }
+        }
+    }
+}
+
+func processICMP(long icmpAddr, int icmpLen, int srcIP) -> void {
+    if (icmpLen < 8) return;
+
+    unsafe {
+        byte* icmp = (byte*) icmpAddr;
+        int type = (int) icmp[0];
+
+        # Echo request (ping) — send echo reply
+        if (type == 8) {
+            # Swap source/dest and change type to 0 (reply)
+            icmp[0] = 0;   # Type = Echo Reply
+
+            # Recalculate checksum (simple: clear and recompute)
+            icmp[2] = 0;
+            icmp[3] = 0;
+            int cksum = computeChecksum(icmpAddr, icmpLen);
+            icmp[2] = (byte)((cksum >> 8) & 0xFF);
+            icmp[3] = (byte)(cksum & 0xFF);
+
+            # Send the reply
+            long pkt = MemoryManager.kmalloc(MAX_PACKET_SIZE);
+            if (pkt == 0) return;
+
+            long dstMac = resolveMAC(srcIP);
+            buildEthernetHeader(pkt, dstMac, ETH_TYPE_IPV4);
+            buildIPHeader(pkt + ETH_HEADER_SIZE, netIP, srcIP, IP_PROTO_ICMP, icmpLen);
+
+            byte* payload = (byte*)(pkt + ETH_HEADER_SIZE + IP_HEADER_SIZE);
+            byte* src = (byte*) icmpAddr;
+            for (int i = 0; i < icmpLen; i++) {
+                payload[i] = src[i];
+            }
+
+            E1000.sendPacket(pkt, ETH_HEADER_SIZE + IP_HEADER_SIZE + icmpLen);
+        }
+    }
+}
+
+# ============================================================================
+# Packet Construction Helpers
+# ============================================================================
+
+func buildEthernetHeader(long pkt, long dstMac, int ethType) -> void {
+    unsafe {
+        byte* p = (byte*) pkt;
+
+        # Destination MAC (6 bytes)
+        for (int i = 0; i < 6; i++) {
+            p[i] = (byte)((dstMac >> (i * 8)) & 0xFF);
+        }
+
+        # Source MAC (6 bytes)
+        for (int i = 0; i < 6; i++) {
+            p[6 + i] = (byte) E1000.getMac(i);
+        }
+
+        # EtherType (big-endian)
+        p[12] = (byte)((ethType >> 8) & 0xFF);
+        p[13] = (byte)(ethType & 0xFF);
+    }
+}
+
+func buildIPHeader(long ipAddr, int srcIP, int dstIP, int protocol, int payloadLen) -> void {
+    int totalLen = IP_HEADER_SIZE + payloadLen;
+
+    unsafe {
+        byte* ip = (byte*) ipAddr;
+
+        ip[0] = 0x45;   # Version 4, IHL 5
+        ip[1] = 0;      # DSCP/ECN
+        ip[2] = (byte)((totalLen >> 8) & 0xFF);
+        ip[3] = (byte)(totalLen & 0xFF);
+        ip[4] = 0;      # Identification
+        ip[5] = 0;
+        ip[6] = 0x40;   # Don't Fragment
+        ip[7] = 0;
+        ip[8] = 64;     # TTL
+        ip[9] = (byte)(protocol & 0xFF);
+        ip[10] = 0;     # Checksum (computed below)
+        ip[11] = 0;
+
+        # Source IP (big-endian)
+        ip[12] = (byte)((srcIP >> 24) & 0xFF);
+        ip[13] = (byte)((srcIP >> 16) & 0xFF);
+        ip[14] = (byte)((srcIP >> 8) & 0xFF);
+        ip[15] = (byte)(srcIP & 0xFF);
+
+        # Destination IP (big-endian)
+        ip[16] = (byte)((dstIP >> 24) & 0xFF);
+        ip[17] = (byte)((dstIP >> 16) & 0xFF);
+        ip[18] = (byte)((dstIP >> 8) & 0xFF);
+        ip[19] = (byte)(dstIP & 0xFF);
+
+        # Compute header checksum
+        int cksum = computeChecksum(ipAddr, IP_HEADER_SIZE);
+        ip[10] = (byte)((cksum >> 8) & 0xFF);
+        ip[11] = (byte)(cksum & 0xFF);
+    }
+}
+
+func sendTCPPacket(int flags, long data, int dataLen) -> void {
+    long pkt = MemoryManager.kmalloc(MAX_PACKET_SIZE);
+    if (pkt == 0) return;
+
+    long dstMac = resolveMAC(tcpRemoteIP);
+
+    int tcpTotal = TCP_HEADER_SIZE + dataLen;
+    int totalLen = ETH_HEADER_SIZE + IP_HEADER_SIZE + tcpTotal;
+
+    buildEthernetHeader(pkt, dstMac, ETH_TYPE_IPV4);
+    buildIPHeader(pkt + ETH_HEADER_SIZE, netIP, tcpRemoteIP, IP_PROTO_TCP, tcpTotal);
+
+    long tcpOff = pkt + ETH_HEADER_SIZE + IP_HEADER_SIZE;
+    unsafe {
+        byte* tcp = (byte*) tcpOff;
+
+        # Source port
+        tcp[0] = (byte)((tcpLocalPort >> 8) & 0xFF);
+        tcp[1] = (byte)(tcpLocalPort & 0xFF);
+
+        # Destination port
+        tcp[2] = (byte)((tcpRemotePort >> 8) & 0xFF);
+        tcp[3] = (byte)(tcpRemotePort & 0xFF);
+
+        # Sequence number
+        tcp[4] = (byte)((tcpSeqNum >> 24) & 0xFF);
+        tcp[5] = (byte)((tcpSeqNum >> 16) & 0xFF);
+        tcp[6] = (byte)((tcpSeqNum >> 8) & 0xFF);
+        tcp[7] = (byte)(tcpSeqNum & 0xFF);
+
+        # Ack number
+        tcp[8] = (byte)((tcpAckNum >> 24) & 0xFF);
+        tcp[9] = (byte)((tcpAckNum >> 16) & 0xFF);
+        tcp[10] = (byte)((tcpAckNum >> 8) & 0xFF);
+        tcp[11] = (byte)(tcpAckNum & 0xFF);
+
+        # Data offset (5 words = 20 bytes) and flags
+        tcp[12] = 0x50;   # 5 << 4
+        tcp[13] = (byte)(flags & 0xFF);
+
+        # Window size (8KB)
+        tcp[14] = 0x20;
+        tcp[15] = 0x00;
+
+        # Checksum (placeholder - TODO: proper TCP checksum with pseudo-header)
+        tcp[16] = 0;
+        tcp[17] = 0;
+
+        # Urgent pointer
+        tcp[18] = 0;
+        tcp[19] = 0;
+
+        # Copy payload data
+        if (dataLen > 0 && data != 0) {
+            byte* dst = (byte*)(tcpOff + TCP_HEADER_SIZE);
+            byte* src = (byte*) data;
+            for (int i = 0; i < dataLen; i++) {
+                dst[i] = src[i];
+            }
+        }
+
+        # Compute TCP checksum including pseudo-header
+        int cksum = computeTCPChecksum(pkt + ETH_HEADER_SIZE, tcpOff, tcpTotal);
+        tcp[16] = (byte)((cksum >> 8) & 0xFF);
+        tcp[17] = (byte)(cksum & 0xFF);
+    }
+
+    E1000.sendPacket(pkt, totalLen);
+}
+
+func sendARPRequest(int targetIP) -> void {
+    long pkt = MemoryManager.kmalloc(64);
+    if (pkt == 0) return;
+
+    # Broadcast Ethernet header
+    long broadcastMac = 0xFFFFFFFFFFFF;
+    buildEthernetHeader(pkt, broadcastMac, ETH_TYPE_ARP);
+
+    unsafe {
+        byte* arp = (byte*)(pkt + ETH_HEADER_SIZE);
+
+        # Hardware type (Ethernet = 1)
+        arp[0] = 0x00; arp[1] = 0x01;
+        # Protocol type (IPv4)
+        arp[2] = 0x08; arp[3] = 0x00;
+        # Hardware address length
+        arp[4] = 6;
+        # Protocol address length
+        arp[5] = 4;
+        # Opcode (Request)
+        arp[6] = 0x00; arp[7] = 0x01;
+
+        # Sender hardware address (our MAC)
+        for (int i = 0; i < 6; i++) {
+            arp[8 + i] = (byte) E1000.getMac(i);
+        }
+
+        # Sender protocol address (our IP)
+        arp[14] = (byte)((netIP >> 24) & 0xFF);
+        arp[15] = (byte)((netIP >> 16) & 0xFF);
+        arp[16] = (byte)((netIP >> 8) & 0xFF);
+        arp[17] = (byte)(netIP & 0xFF);
+
+        # Target hardware address (all zeros for request)
+        for (int i = 0; i < 6; i++) arp[18 + i] = 0;
+
+        # Target protocol address
+        arp[24] = (byte)((targetIP >> 24) & 0xFF);
+        arp[25] = (byte)((targetIP >> 16) & 0xFF);
+        arp[26] = (byte)((targetIP >> 8) & 0xFF);
+        arp[27] = (byte)(targetIP & 0xFF);
+    }
+
+    E1000.sendPacket(pkt, ETH_HEADER_SIZE + ARP_PACKET_SIZE);
+}
+
+func sendARPReply(int targetIP, long requestArpAddr) -> void {
+    long pkt = MemoryManager.kmalloc(64);
+    if (pkt == 0) return;
+
+    unsafe {
+        byte* req = (byte*) requestArpAddr;
+
+        # Get requester's MAC
+        long reqMac = 0;
+        for (int i = 0; i < 6; i++) {
+            reqMac = reqMac | ((long) req[8 + i] << (i * 8));
+        }
+
+        buildEthernetHeader(pkt, reqMac, ETH_TYPE_ARP);
+
+        byte* arp = (byte*)(pkt + ETH_HEADER_SIZE);
+
+        # ARP reply
+        arp[0] = 0x00; arp[1] = 0x01;   # HW type
+        arp[2] = 0x08; arp[3] = 0x00;   # Proto type
+        arp[4] = 6; arp[5] = 4;         # Lengths
+        arp[6] = 0x00; arp[7] = 0x02;   # Opcode = Reply
+
+        # Sender = us
+        for (int i = 0; i < 6; i++) arp[8 + i] = (byte) E1000.getMac(i);
+        arp[14] = (byte)((netIP >> 24) & 0xFF);
+        arp[15] = (byte)((netIP >> 16) & 0xFF);
+        arp[16] = (byte)((netIP >> 8) & 0xFF);
+        arp[17] = (byte)(netIP & 0xFF);
+
+        # Target = requester
+        for (int i = 0; i < 6; i++) arp[18 + i] = req[8 + i];
+        arp[24] = (byte)((targetIP >> 24) & 0xFF);
+        arp[25] = (byte)((targetIP >> 16) & 0xFF);
+        arp[26] = (byte)((targetIP >> 8) & 0xFF);
+        arp[27] = (byte)(targetIP & 0xFF);
+    }
+
+    E1000.sendPacket(pkt, ETH_HEADER_SIZE + ARP_PACKET_SIZE);
+}
+
+# ============================================================================
+# ARP Cache
+# ============================================================================
+
+func arpCacheAdd(int ip, long mac) -> void {
+    # Check if already cached
+    for (int i = 0; i < arpCacheCount; i++) {
+        if (arpCacheIP[i] == ip) {
+            arpCacheMAC[i] = mac;
+            return;
+        }
+    }
+
+    # Add new entry
+    if (arpCacheCount < ARP_CACHE_SIZE) {
+        arpCacheIP[arpCacheCount] = ip;
+        arpCacheMAC[arpCacheCount] = mac;
+        arpCacheCount++;
+    }
+}
+
+func arpCacheLookup(int ip) -> long {
+    for (int i = 0; i < arpCacheCount; i++) {
+        if (arpCacheIP[i] == ip) return arpCacheMAC[i];
+    }
+    return 0;
+}
+
+func resolveMAC(int ip) -> long {
+    # If destination is on our subnet, ARP directly; else ARP the gateway
+    int targetIP = ip;
+    if ((ip & netSubnet) != (netIP & netSubnet)) {
+        targetIP = netGateway;
+    }
+
+    # Check cache
+    long mac = arpCacheLookup(targetIP);
+    if (mac != 0) return mac;
+
+    # Send ARP request and wait
+    for (int retries = 0; retries < 3; retries++) {
+        sendARPRequest(targetIP);
+        for (int i = 0; i < 100; i++) {
+            processEthPoll();
+            spinWait(10000);
+            mac = arpCacheLookup(targetIP);
+            if (mac != 0) return mac;
+        }
+    }
+
+    # Fallback: broadcast
+    return 0xFFFFFFFFFFFF;
+}
+
+func processEthPoll() -> void {
+    E1000.poll();
+    while (E1000.hasPacket()) {
+        long pktAddr = E1000.receivePacket();
+        int pktLen = E1000.getLastPacketLen();
+        if (pktAddr == 0 || pktLen < ETH_HEADER_SIZE) continue;
+        processEthernet(pktAddr, pktLen);
+    }
+}
+
+# ============================================================================
+# DNS
+# ============================================================================
+
+func buildDnsQuery(long buf, string hostname) -> int {
+    unsafe {
+        byte* p = (byte*) buf;
+
+        # Transaction ID
+        p[0] = 0x12; p[1] = 0x34;
+        # Flags: standard query, recursion desired
+        p[2] = 0x01; p[3] = 0x00;
+        # Questions: 1
+        p[4] = 0x00; p[5] = 0x01;
+        # Answers, Authority, Additional: 0
+        p[6] = 0; p[7] = 0; p[8] = 0; p[9] = 0; p[10] = 0; p[11] = 0;
+
+        # Query name (encoded as labels)
+        int offset = DNS_HEADER_SIZE;
+        long nameAddr = (long) hostname.c_str();
+        byte* name = (byte*) nameAddr;
+        int nameLen = hostname.length;
+
+        int labelStart = offset;
+        offset++;   # Reserve space for label length
+
+        for (int i = 0; i <= nameLen; i++) {
+            if (i == nameLen || name[i] == 46) {   # 46 = '.'
+                int labelLen = offset - labelStart - 1;
+                p[labelStart] = (byte) labelLen;
+                if (i < nameLen) {
+                    labelStart = offset;
+                    offset++;
+                }
+            } else {
+                p[offset] = name[i];
+                offset++;
+            }
+        }
+
+        p[offset] = 0;   # Root label
+        offset++;
+
+        # Query type (A record = 1)
+        p[offset] = 0x00; p[offset + 1] = 0x01;
+        offset = offset + 2;
+
+        # Query class (IN = 1)
+        p[offset] = 0x00; p[offset + 1] = 0x01;
+        offset = offset + 2;
+
+        return offset;
+    }
+}
+
+func parseDnsReply(long buf, int bufLen) -> int {
+    if (bufLen < DNS_HEADER_SIZE + 4) return 0;
+
+    unsafe {
+        byte* p = (byte*) buf;
+
+        # Check answer count
+        int answers = ((int) p[6] << 8) | (int) p[7];
+        if (answers == 0) return 0;
+
+        # Skip the question section
+        int offset = DNS_HEADER_SIZE;
+
+        # Skip name (may use compression pointers)
+        while (offset < bufLen) {
+            if (p[offset] == 0) { offset++; break; }
+            if ((p[offset] & 0xC0) == 0xC0) { offset = offset + 2; break; }
+            offset = offset + (int) p[offset] + 1;
+        }
+
+        # Skip QTYPE and QCLASS
+        offset = offset + 4;
+
+        # Parse the first answer
+        if (offset >= bufLen) return 0;
+
+        # Skip name (compression pointer likely)
+        if ((p[offset] & 0xC0) == 0xC0) {
+            offset = offset + 2;
+        } else {
+            while (offset < bufLen && p[offset] != 0) {
+                offset = offset + (int) p[offset] + 1;
+            }
+            offset++;
+        }
+
+        # Type (should be 1 for A record)
+        if (offset + 10 > bufLen) return 0;
+        int rtype = ((int) p[offset] << 8) | (int) p[offset + 1];
+        offset = offset + 2;
+
+        # Class
+        offset = offset + 2;
+
+        # TTL
+        offset = offset + 4;
+
+        # Data length
+        int rdlen = ((int) p[offset] << 8) | (int) p[offset + 1];
+        offset = offset + 2;
+
+        if (rtype == 1 && rdlen == 4 && offset + 4 <= bufLen) {
+            # A record — 4 bytes of IPv4
+            int ip = ((int) p[offset] << 24) | ((int) p[offset + 1] << 16) |
+                     ((int) p[offset + 2] << 8) | (int) p[offset + 3];
+            return ip;
+        }
+    }
+
+    return 0;
+}
+
+# ============================================================================
+# DHCP
+# ============================================================================
+
+func buildDhcpDiscover(long buf) -> int {
+    unsafe {
+        byte* pkt = (byte*) buf;
+
+        # Zero the buffer
+        for (int i = 0; i < 600; i++) pkt[i] = 0;
+
+        # Ethernet: broadcast
+        for (int i = 0; i < 6; i++) pkt[i] = 0xFF;
+        for (int i = 0; i < 6; i++) pkt[6 + i] = (byte) E1000.getMac(i);
+        pkt[12] = 0x08; pkt[13] = 0x00;   # IPv4
+
+        # IP header
+        long ipOff = (long) ETH_HEADER_SIZE;
+        byte* ip = (byte*)(buf + ipOff);
+        ip[0] = 0x45;
+        ip[8] = 128;    # TTL
+        ip[9] = 17;     # UDP
+        # Source: 0.0.0.0
+        # Dest: 255.255.255.255
+        ip[16] = 0xFF; ip[17] = 0xFF; ip[18] = 0xFF; ip[19] = 0xFF;
+
+        int udpPayload = DHCP_HEADER_SIZE + 64;
+        int ipTotal = IP_HEADER_SIZE + UDP_HEADER_SIZE + udpPayload;
+        ip[2] = (byte)((ipTotal >> 8) & 0xFF);
+        ip[3] = (byte)(ipTotal & 0xFF);
+
+        int cksum = computeChecksum(buf + ipOff, IP_HEADER_SIZE);
+        ip[10] = (byte)((cksum >> 8) & 0xFF);
+        ip[11] = (byte)(cksum & 0xFF);
+
+        # UDP header
+        long udpOff = ipOff + IP_HEADER_SIZE;
+        byte* udp = (byte*)(buf + udpOff);
+        udp[0] = 0x00; udp[1] = 68;    # Source port 68
+        udp[2] = 0x00; udp[3] = 67;    # Dest port 67
+        int udpLen = UDP_HEADER_SIZE + udpPayload;
+        udp[4] = (byte)((udpLen >> 8) & 0xFF);
+        udp[5] = (byte)(udpLen & 0xFF);
+
+        # DHCP payload
+        long dhcpOff = udpOff + UDP_HEADER_SIZE;
+        byte* dhcp = (byte*)(buf + dhcpOff);
+        dhcp[0] = 1;      # Boot Request
+        dhcp[1] = 1;      # Ethernet
+        dhcp[2] = 6;      # HW addr length
+        dhcp[3] = 0;      # Hops
+
+        # Transaction ID
+        dhcp[4] = 0x39; dhcp[5] = 0x03; dhcp[6] = 0xF3; dhcp[7] = 0x26;
+
+        # Client hardware address
+        for (int i = 0; i < 6; i++) {
+            dhcp[28 + i] = (byte) E1000.getMac(i);
+        }
+
+        # Magic cookie
+        dhcp[236] = 99; dhcp[237] = 130; dhcp[238] = 83; dhcp[239] = 99;
+
+        # Options
+        dhcp[240] = 53; dhcp[241] = 1; dhcp[242] = 1;   # DHCP Discover
+        dhcp[243] = 255;   # End
+
+        return ETH_HEADER_SIZE + ipTotal;
+    }
+}
+
+func processDHCPReply(long dhcpAddr, int dhcpLen) -> void {
+    if (dhcpLen < DHCP_HEADER_SIZE) return;
+
+    unsafe {
+        byte* dhcp = (byte*) dhcpAddr;
+
+        # Check it's a reply
+        if (dhcp[0] != 2) return;
+
+        # Read assigned IP (yiaddr at offset 16)
+        netIP = ((int) dhcp[16] << 24) | ((int) dhcp[17] << 16) |
+                ((int) dhcp[18] << 8) | (int) dhcp[19];
+
+        # Parse DHCP options starting at offset 240
+        int optOff = 240;
+        while (optOff < dhcpLen) {
+            int optType = (int) dhcp[optOff];
+            if (optType == 255) break;   # End
+            if (optType == 0) { optOff++; continue; }   # Padding
+
+            int optLen = (int) dhcp[optOff + 1];
+            optOff = optOff + 2;
+
+            if (optType == 1 && optLen == 4) {
+                # Subnet mask
+                netSubnet = ((int) dhcp[optOff] << 24) | ((int) dhcp[optOff + 1] << 16) |
+                            ((int) dhcp[optOff + 2] << 8) | (int) dhcp[optOff + 3];
+            } else if (optType == 3 && optLen >= 4) {
+                # Router (gateway)
+                netGateway = ((int) dhcp[optOff] << 24) | ((int) dhcp[optOff + 1] << 16) |
+                             ((int) dhcp[optOff + 2] << 8) | (int) dhcp[optOff + 3];
+            } else if (optType == 6 && optLen >= 4) {
+                # DNS server
+                netDNS = ((int) dhcp[optOff] << 24) | ((int) dhcp[optOff + 1] << 16) |
+                         ((int) dhcp[optOff + 2] << 8) | (int) dhcp[optOff + 3];
+            }
+
+            optOff = optOff + optLen;
+        }
+
+        if (netIP != 0) netConfigured = true;
+    }
+}
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+func computeChecksum(long data, int length) -> int {
+    long sum = 0;
+    unsafe {
+        byte* p = (byte*) data;
+        for (int i = 0; i < length; i = i + 2) {
+            int word = (int) p[i] << 8;
+            if (i + 1 < length) word = word | (int) p[i + 1];
+            sum = sum + (long) word;
+        }
+    }
+
+    # Fold carry
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (int)(~sum & 0xFFFF);
+}
+
+func computeTCPChecksum(long ipAddr, long tcpAddr, int tcpLen) -> int {
+    long sum = 0;
+
+    # Pseudo-header
+    unsafe {
+        byte* ip = (byte*) ipAddr;
+
+        # Source IP
+        sum = sum + (long)(((int) ip[12] << 8) | (int) ip[13]);
+        sum = sum + (long)(((int) ip[14] << 8) | (int) ip[15]);
+        # Dest IP
+        sum = sum + (long)(((int) ip[16] << 8) | (int) ip[17]);
+        sum = sum + (long)(((int) ip[18] << 8) | (int) ip[19]);
+        # Protocol (TCP = 6)
+        sum = sum + 6;
+        # TCP length
+        sum = sum + (long) tcpLen;
+
+        # TCP segment
+        byte* tcp = (byte*) tcpAddr;
+        for (int i = 0; i < tcpLen; i = i + 2) {
+            int word = (int) tcp[i] << 8;
+            if (i + 1 < tcpLen) word = word | (int) tcp[i + 1];
+            sum = sum + (long) word;
+        }
+    }
+
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (int)(~sum & 0xFFFF);
+}
+
+func makeIP(int a, int b, int c, int d) -> int {
+    return (a << 24) | (b << 16) | (c << 8) | d;
+}
+
+func ipToString(int ip) -> string {
+    int a = (ip >> 24) & 0xFF;
+    int b = (ip >> 16) & 0xFF;
+    int c = (ip >> 8) & 0xFF;
+    int d = ip & 0xFF;
+    return "${a}.${b}.${c}.${d}";
+}
+
+func spinWait(int iterations) -> void {
+    for (int i = 0; i < iterations; i++) {
+        # Busy wait
+    }
+}

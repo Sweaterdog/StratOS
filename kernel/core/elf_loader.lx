@@ -1,0 +1,460 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// ELF64 Loader — Parse and load static ELF64 binaries
+// kernel/core/elf_loader.lx
+//
+// Supports loading static ELF64 executables into memory for execution.
+// Two modes:
+//   - Ring 0 (trusted): Maps into kernel address space, calls entry directly
+//   - Ring 3 (isolated): Maps with user-accessible pages, uses IRETQ
+//
+// Only supports static executables (ET_EXEC). No dynamic linking.
+// ============================================================================
+
+import "kernel/memory/manager.lx";
+import "kernel/core/console.lx";
+import "system/fs/vfs.lx";
+
+# ============================================================================
+# ELF64 Constants
+# ============================================================================
+
+# ELF magic bytes
+int ELF_MAG0 = 0x7F;
+int ELF_MAG1 = 0x45;   # 'E'
+int ELF_MAG2 = 0x4C;   # 'L'
+int ELF_MAG3 = 0x46;   # 'F'
+
+# ELF class
+int ELFCLASS64 = 2;
+
+# ELF data encoding
+int ELFDATA2LSB = 1;    # Little-endian
+
+# ELF type
+int ET_EXEC = 2;        # Executable file
+int ET_DYN  = 3;        # Shared object (position-independent executable)
+
+# ELF machine
+int EM_X86_64 = 62;     # AMD x86-64
+
+# Program header types
+int PT_NULL    = 0;
+int PT_LOAD    = 1;
+int PT_DYNAMIC = 2;
+int PT_INTERP  = 3;
+int PT_NOTE    = 4;
+int PT_PHDR    = 6;
+
+# Program header flags
+int PF_X = 1;           # Execute
+int PF_W = 2;           # Write
+int PF_R = 4;           # Read
+
+# Page table flags for mapping
+int PAGE_PRESENT  = 0x01;
+int PAGE_WRITABLE = 0x02;
+int PAGE_USER     = 0x04;    # Accessible from Ring 3
+int PAGE_NX       = 0;       # NX bit is in bit 63 — handle separately
+
+# ============================================================================
+# ELF64 Header (64 bytes)
+# ============================================================================
+struct Elf64Header {
+    # e_ident[0..3]: magic
+    int magic;          # 0x464C457F for valid ELF
+
+    # e_ident[4]: class (1=32-bit, 2=64-bit)
+    int elfClass;
+
+    # e_ident[5]: data encoding (1=LSB, 2=MSB)
+    int dataEncoding;
+
+    # e_type: object file type
+    int type;
+
+    # e_machine: architecture
+    int machine;
+
+    # e_entry: entry point virtual address
+    long entry;
+
+    # e_phoff: program header table offset
+    long phoff;
+
+    # e_shoff: section header table offset
+    long shoff;
+
+    # e_phentsize: size of each program header entry
+    int phentsize;
+
+    # e_phnum: number of program header entries
+    int phnum;
+
+    # e_shentsize: size of each section header entry
+    int shentsize;
+
+    # e_shnum: number of section header entries
+    int shnum;
+}
+
+# ============================================================================
+# ELF64 Program Header (56 bytes)
+# ============================================================================
+struct Elf64Phdr {
+    int type;           # Segment type (PT_LOAD, etc.)
+    int flags;          # Segment flags (PF_R, PF_W, PF_X)
+    long offset;        # Offset in file
+    long vaddr;         # Virtual address in memory
+    long paddr;         # Physical address (usually same as vaddr)
+    long filesz;        # Size of segment in file
+    long memsz;         # Size of segment in memory (may be > filesz for BSS)
+    long align;         # Alignment
+}
+
+# ============================================================================
+# Loaded ELF information — returned by the loader
+# ============================================================================
+struct ElfLoadResult {
+    bool success;
+    string error;
+    long entryPoint;        # Virtual address of entry point
+    long lowestAddr;        # Lowest mapped virtual address
+    long highestAddr;       # Highest mapped virtual address + size
+    int segmentsLoaded;     # Number of PT_LOAD segments loaded
+}
+
+# Default user-mode stack location and size
+long USER_STACK_TOP  = 0x7FFFFFFFE000;   # Just below 128TB (canonical address boundary)
+long USER_STACK_SIZE = 1048576;           # 1MB user stack
+
+export class ElfLoader {
+
+    # ========================================================================
+    # Load an ELF64 binary from the VFS into memory
+    #
+    # Parameters:
+    #   path     — VFS path to the ELF binary
+    #   userMode — true = map pages as user-accessible (Ring 3)
+    #              false = map into kernel space (Ring 0)
+    #
+    # Returns an ElfLoadResult with the entry point and mapping info.
+    # ========================================================================
+    public static func load(string path, bool userMode) -> ElfLoadResult {
+        ElfLoadResult result = {
+            success: false,
+            error: "",
+            entryPoint: 0,
+            lowestAddr: 0x7FFFFFFFFFFFFFFF,
+            highestAddr: 0,
+            segmentsLoaded: 0
+        };
+
+        # Read the entire ELF file from VFS
+        string fileData = VFS.read(path);
+        if (fileData.length == 0) {
+            result.error = "File not found or empty: ${path}";
+            return result;
+        }
+
+        unsafe {
+            byte* data = (byte*) &fileData;
+            # FluxString stores chars in a fixed buffer starting at a known offset
+            # For freestanding FluxString: the chars start at byte 4 (after length int)
+            # But we need the raw bytes of the file. VFS.read returns the file content.
+            # We'll work with the string internally.
+            int fileLen = fileData.length;
+
+            if (fileLen < 64) {
+                result.error = "File too small for ELF header (${fileLen} bytes)";
+                return result;
+            }
+
+            # Parse ELF header manually from raw bytes
+            # Access the underlying character data of the FluxString
+            # Use long intermediate to avoid const-qualifier cast issues
+            long rawAddr = (long) fileData.c_str();
+            byte* raw = (byte*) rawAddr;
+
+            # Verify ELF magic: 0x7F 'E' 'L' 'F'
+            if (raw[0] != 0x7F || raw[1] != 0x45 || raw[2] != 0x4C || raw[3] != 0x46) {
+                result.error = "Invalid ELF magic";
+                return result;
+            }
+
+            # Verify 64-bit class
+            if (raw[4] != ELFCLASS64) {
+                result.error = "Not a 64-bit ELF (class=${(int)raw[4]})";
+                return result;
+            }
+
+            # Verify little-endian
+            if (raw[5] != ELFDATA2LSB) {
+                result.error = "Not little-endian ELF";
+                return result;
+            }
+
+            # Read e_type (offset 16, 2 bytes)
+            int* typePtr = (int*)(raw + 16);
+            int elfType = (*typePtr) & 0xFFFF;
+            if (elfType != ET_EXEC && elfType != ET_DYN) {
+                result.error = "Unsupported ELF type (${elfType}), expected ET_EXEC or ET_DYN";
+                return result;
+            }
+
+            # Read e_machine (offset 18, 2 bytes)
+            int* machPtr = (int*)(raw + 18);
+            int machine = (*machPtr) & 0xFFFF;
+            if (machine != EM_X86_64) {
+                result.error = "Unsupported architecture (${machine}), expected x86_64";
+                return result;
+            }
+
+            # Read e_entry (offset 24, 8 bytes)
+            long* entryPtr = (long*)(raw + 24);
+            result.entryPoint = *entryPtr;
+
+            # Read e_phoff (offset 32, 8 bytes)
+            long* phoffPtr = (long*)(raw + 32);
+            long phoff = *phoffPtr;
+
+            # Read e_phentsize (offset 54, 2 bytes)
+            int* phentsizePtr = (int*)(raw + 54);
+            int phentsize = (*phentsizePtr) & 0xFFFF;
+
+            # Read e_phnum (offset 56, 2 bytes)
+            int* phnumPtr = (int*)(raw + 56);
+            int phnum = (*phnumPtr) & 0xFFFF;
+
+            if (phentsize < 56) {
+                result.error = "Program header too small (${phentsize} < 56)";
+                return result;
+            }
+
+            # Process each program header
+            for (int i = 0; i < phnum; i++) {
+                long phdrOffset = phoff + (long)(i * phentsize);
+
+                if (phdrOffset + 56 > (long) fileLen) {
+                    result.error = "Program header ${i} extends past file end";
+                    return result;
+                }
+
+                byte* ph = raw + phdrOffset;
+
+                # Read p_type (offset 0, 4 bytes)
+                int* pTypePtr = (int*)(ph + 0);
+                int pType = *pTypePtr;
+
+                if (pType != PT_LOAD) {
+                    continue;  # Skip non-LOAD segments
+                }
+
+                # Read p_flags (offset 4, 4 bytes)
+                int* pFlagsPtr = (int*)(ph + 4);
+                int pFlags = *pFlagsPtr;
+
+                # Read p_offset (offset 8, 8 bytes)
+                long* pOffsetPtr = (long*)(ph + 8);
+                long pOffset = *pOffsetPtr;
+
+                # Read p_vaddr (offset 16, 8 bytes)
+                long* pVaddrPtr = (long*)(ph + 16);
+                long pVaddr = *pVaddrPtr;
+
+                # Read p_filesz (offset 32, 8 bytes)
+                long* pFileszPtr = (long*)(ph + 32);
+                long pFilesz = *pFileszPtr;
+
+                # Read p_memsz (offset 40, 8 bytes)
+                long* pMemszPtr = (long*)(ph + 40);
+                long pMemsz = *pMemszPtr;
+
+                if (pFilesz > pMemsz) {
+                    result.error = "Segment ${i}: filesz > memsz";
+                    return result;
+                }
+
+                # Determine page flags for mapping
+                int pageFlags = PAGE_PRESENT;
+                if (pFlags & PF_W) {
+                    pageFlags = pageFlags | PAGE_WRITABLE;
+                }
+                if (userMode) {
+                    pageFlags = pageFlags | PAGE_USER;
+                }
+
+                # Map and load the segment page by page
+                long segEnd = pVaddr + pMemsz;
+                long pageStart = pVaddr & ~0xFFF;        # Align down to page boundary
+                long pageEnd = (segEnd + 0xFFF) & ~0xFFF; # Align up to page boundary
+
+                for (long page = pageStart; page < pageEnd; page += 4096) {
+                    # Allocate a physical frame
+                    long frame = MemoryManager.allocFrame();
+
+                    # Zero the frame first (for BSS region)
+                    byte* framePtr = (byte*) frame;
+                    for (int z = 0; z < 4096; z++) {
+                        framePtr[z] = 0;
+                    }
+
+                    # Copy file data into this page
+                    long copyStart = page;
+                    if (copyStart < pVaddr) {
+                        copyStart = pVaddr;
+                    }
+                    long copyEnd = page + 4096;
+                    if (copyEnd > pVaddr + pFilesz) {
+                        copyEnd = pVaddr + pFilesz;
+                    }
+
+                    if (copyEnd > copyStart) {
+                        long fileOffset = pOffset + (copyStart - pVaddr);
+                        long frameOffset = copyStart - page;
+                        long count = copyEnd - copyStart;
+
+                        if (fileOffset + count <= (long) fileLen) {
+                            byte* src = raw + fileOffset;
+                            byte* dst = framePtr + frameOffset;
+                            for (long b = 0; b < count; b++) {
+                                dst[b] = src[b];
+                            }
+                        }
+                    }
+
+                    # Map the virtual page to the physical frame
+                    MemoryManager.mapPage(page, frame, pageFlags);
+                }
+
+                # Update address range tracking
+                if (pVaddr < result.lowestAddr) {
+                    result.lowestAddr = pVaddr;
+                }
+                if (segEnd > result.highestAddr) {
+                    result.highestAddr = segEnd;
+                }
+
+                result.segmentsLoaded++;
+            }
+        }
+
+        if (result.segmentsLoaded == 0) {
+            result.error = "No PT_LOAD segments found in ELF";
+            return result;
+        }
+
+        result.success = true;
+        return result;
+    }
+
+    # ========================================================================
+    # Set up a user-mode stack
+    #
+    # Allocates physical frames and maps them at the conventional user
+    # stack address (just below 128TB). Returns the initial RSP value
+    # (top of the stack).
+    # ========================================================================
+    public static func setupUserStack() -> long {
+        int stackPages = (int)(USER_STACK_SIZE / 4096);
+        long stackBottom = USER_STACK_TOP - USER_STACK_SIZE;
+
+        for (int i = 0; i < stackPages; i++) {
+            long page = stackBottom + (long)(i * 4096);
+            long frame = MemoryManager.allocFrame();
+
+            # Zero the stack frame
+            unsafe {
+                byte* p = (byte*) frame;
+                for (int z = 0; z < 4096; z++) {
+                    p[z] = 0;
+                }
+            }
+
+            # Map with user + writable permissions
+            MemoryManager.mapPage(page, frame, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+        }
+
+        return USER_STACK_TOP;
+    }
+
+    # ========================================================================
+    # Set up a kernel-mode stack for Ring 0 ELF execution
+    #
+    # Allocates a 64KB stack from the kernel heap.
+    # Returns the stack top (highest address).
+    # ========================================================================
+    public static func setupKernelStack() -> long {
+        int stackSize = 65536;  # 64KB
+        long stackBase = MemoryManager.kmalloc(stackSize);
+        return stackBase + (long) stackSize;
+    }
+
+    # ========================================================================
+    # Load and execute an ELF binary (convenience wrapper)
+    #
+    # Parameters:
+    #   path     — VFS path to the ELF binary
+    #   trusted  — true  = run in Ring 0 (no isolation, full kernel access)
+    #              false = run in Ring 3 (isolated, syscalls only)
+    #
+    # Returns: exit code (0 = success, -1 = load error)
+    # ========================================================================
+    public static func execute(string path, bool trusted) -> int {
+        Console.log("[exec] Loading ELF: ${path}");
+
+        # Load the ELF into memory
+        bool userMode = !trusted;
+        ElfLoadResult elf = load(path, userMode);
+
+        if (!elf.success) {
+            Console.log("[exec] FAILED: ${elf.error}");
+            return -1;
+        }
+
+        Console.log("[exec] Loaded ${elf.segmentsLoaded} segments, entry=0x${longToHex(elf.entryPoint)}");
+
+        if (trusted) {
+            # Ring 0 execution — allocate a kernel stack and call directly
+            long stack = setupKernelStack();
+            Console.log("[exec] Ring 0 execution at 0x${longToHex(elf.entryPoint)}");
+
+            unsafe {
+                # call_elf_ring0 is defined in boot.S
+                # Signature: call_elf_ring0(entry, stack, arg)
+                # The ELF entry point receives 0 as its argument
+                asm("call call_elf_ring0" : : "D"(elf.entryPoint), "S"(stack), "d"(0));
+            }
+
+            return 0;
+        } else {
+            # Ring 3 execution — set up user stack and jump via IRETQ
+            long userStack = setupUserStack();
+            Console.log("[exec] Ring 3 execution at 0x${longToHex(elf.entryPoint)}");
+
+            unsafe {
+                # jump_to_usermode is defined in boot.S
+                # Signature: jump_to_usermode(entry, userStack)
+                # This does NOT return (iretq switches to user mode)
+                asm("call jump_to_usermode" : : "D"(elf.entryPoint), "S"(userStack));
+            }
+
+            # Should not reach here for Ring 3 (user process runs until exit syscall)
+            return 0;
+        }
+    }
+}
+
+# ============================================================================
+# Helper: Convert a long to a hex string (for logging)
+# ============================================================================
+func longToHex(long value) -> string {
+    string hexChars = "0123456789ABCDEF";
+    string result = "";
+    for (int i = 15; i >= 0; i--) {
+        int nibble = (int)((value >> (i * 4)) & 0xF);
+        string ch = "${hexChars.charAt(nibble)}";
+        result = result + ch;
+    }
+    return result;
+}

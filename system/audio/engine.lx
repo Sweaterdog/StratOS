@@ -1,0 +1,287 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// AudioEngine — PC Speaker + AC97 audio driver for StratOS
+// system/audio/engine.lx
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+import "kernel/drivers/timer.lx";
+
+# ---- PC Speaker Constants ----
+int PIT_CHANNEL2   = 0x42;
+int PIT_COMMAND    = 0x43;
+int SPEAKER_PORT   = 0x61;
+int PIT_FREQUENCY  = 1193182;
+
+# ---- AC97 Constants ----
+int AC97_NABM_BAR  = 0x0000;
+int AC97_NAMBAR    = 0x0000;
+int AC97_RESET     = 0x00;
+int AC97_MASTER    = 0x02;
+int AC97_PCM_OUT   = 0x18;
+int AC97_PCM_RATE  = 0x2C;
+
+# ---- Audio State ----
+bool audioInitialized = false;
+bool ac97Available    = false;
+int  masterVolume     = 80;
+
+# ---- Sound Definitions ----
+struct SoundNote {
+    int frequency;
+    int durationMs;
+}
+
+# Boot chime: A warm ascending arpeggio
+list<SoundNote> bootChime = [];
+
+export class AudioEngine {
+    # Initialize the audio subsystem
+    public static func init() -> void {
+        if (audioInitialized) {
+            return;
+        }
+
+        # Try AC97 first, fall back to PC speaker
+        ac97Available = probeAC97();
+
+        if (ac97Available) {
+            initAC97();
+        }
+
+        # Build boot chime sequence
+        bootChime = [
+            { frequency: 523, durationMs: 80 },   # C5
+            { frequency: 659, durationMs: 80 },   # E5
+            { frequency: 784, durationMs: 80 },   # G5
+            { frequency: 1047, durationMs: 200 }   # C6 (held)
+        ];
+
+        audioInitialized = true;
+    }
+
+    # Play the boot chime
+    public static func playBootChime() -> void {
+        if (!audioInitialized) {
+            return;
+        }
+
+        for (int i = 0; i < bootChime.length; i++) {
+            speakerTone(bootChime[i].frequency, bootChime[i].durationMs);
+            speakerOff();
+            Timer.sleep(20);  # Brief gap between notes
+        }
+    }
+
+    # Play a single tone (frequency in Hz, duration in ms)
+    public static func playTone(int freq, int durationMs) -> void {
+        if (!audioInitialized) {
+            return;
+        }
+
+        if (ac97Available) {
+            playToneAC97(freq, durationMs);
+        } else {
+            speakerTone(freq, durationMs);
+            speakerOff();
+        }
+    }
+
+    # Play a sequence of notes
+    public static func playSequence(list<SoundNote> notes) -> void {
+        for (int i = 0; i < notes.length; i++) {
+            playTone(notes[i].frequency, notes[i].durationMs);
+            Timer.sleep(10);
+        }
+    }
+
+    # Play system event sounds
+    public static func playEvent(string eventName) -> void {
+        switch (eventName) {
+            case "click":
+                playTone(800, 15);
+                break;
+            case "error":
+                playTone(200, 100);
+                Timer.sleep(50);
+                playTone(150, 150);
+                break;
+            case "notification":
+                playTone(880, 60);
+                Timer.sleep(30);
+                playTone(1100, 80);
+                break;
+            case "login":
+                playTone(440, 80);
+                Timer.sleep(40);
+                playTone(554, 80);
+                Timer.sleep(40);
+                playTone(659, 120);
+                break;
+            case "logout":
+                playTone(659, 80);
+                Timer.sleep(40);
+                playTone(554, 80);
+                Timer.sleep(40);
+                playTone(440, 120);
+                break;
+            case "window_open":
+                playTone(600, 30);
+                Timer.sleep(15);
+                playTone(800, 40);
+                break;
+            case "window_close":
+                playTone(800, 30);
+                Timer.sleep(15);
+                playTone(600, 40);
+                break;
+            default:
+                break;
+        }
+    }
+
+    # Set master volume (0 - 100)
+    public static func setVolume(int volume) -> void {
+        if (volume < 0) { volume = 0; }
+        if (volume > 100) { volume = 100; }
+        masterVolume = volume;
+
+        if (ac97Available) {
+            # AC97 volume register: 0 = max, 63 = mute (inverted)
+            int regVal = 63 - (volume * 63 / 100);
+            int stereoVal = (regVal << 8) | regVal;  # Same for L and R
+            ac97WriteMixer(AC97_MASTER, stereoVal);
+        }
+    }
+
+    # Get current volume
+    public static func getVolume() -> int {
+        return masterVolume;
+    }
+
+    # Mute / unmute
+    public static func mute() -> void {
+        if (ac97Available) {
+            ac97WriteMixer(AC97_MASTER, 0x8000);  # Mute bit
+        }
+        speakerOff();
+    }
+
+    public static func unmute() -> void {
+        setVolume(masterVolume);
+    }
+
+    # Shutdown audio
+    public static func shutdown() -> void {
+        speakerOff();
+        if (ac97Available) {
+            ac97WriteMixer(AC97_MASTER, 0x8000);  # Mute
+        }
+        audioInitialized = false;
+    }
+
+    # ---- PC Speaker Functions ----
+
+    # Turn on the PC speaker at a given frequency
+    private static func speakerTone(int frequency, int durationMs) -> void {
+        if (frequency <= 0) { return; }
+
+        int divisor = PIT_FREQUENCY / frequency;
+
+        unsafe {
+            # Configure PIT channel 2 for square wave
+            outb(PIT_COMMAND, 0xB6);  # Channel 2, mode 3, lo/hi byte
+            outb(PIT_CHANNEL2, (byte)(divisor & 0xFF));
+            outb(PIT_CHANNEL2, (byte)((divisor >> 8) & 0xFF));
+
+            # Enable speaker
+            byte spkState = inb(SPEAKER_PORT);
+            outb(SPEAKER_PORT, spkState | 0x03);
+        }
+
+        Timer.sleep(durationMs);
+    }
+
+    # Turn off the PC speaker
+    private static func speakerOff() -> void {
+        unsafe {
+            byte spkState = inb(SPEAKER_PORT);
+            outb(SPEAKER_PORT, spkState & 0xFC);
+        }
+    }
+
+    # ---- AC97 Functions ----
+
+    # Probe for AC97 device on PCI bus
+    private static func probeAC97() -> bool {
+        # Scan PCI bus for AC97 audio controller (class 0x0401)
+        for (int bus = 0; bus < 256; bus++) {
+            for (int device = 0; device < 32; device++) {
+                int vendorId = pciRead(bus, device, 0, 0x00) & 0xFFFF;
+                if (vendorId == 0xFFFF) { continue; }
+
+                int classCode = (pciRead(bus, device, 0, 0x08) >> 16) & 0xFFFF;
+                if (classCode == 0x0401) {
+                    # Found AC97 controller
+                    AC97_NAMBAR = pciRead(bus, device, 0, 0x10) & 0xFFFE;
+                    AC97_NABM_BAR = pciRead(bus, device, 0, 0x14) & 0xFFFE;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    # Initialize AC97 controller
+    private static func initAC97() -> void {
+        # Reset codec
+        ac97WriteMixer(AC97_RESET, 0x0000);
+        Timer.sleep(100);
+
+        # Set default sample rate (44100 Hz)
+        ac97WriteMixer(AC97_PCM_RATE, 44100);
+
+        # Set PCM output volume
+        ac97WriteMixer(AC97_PCM_OUT, 0x0808);  # Mid volume L+R
+
+        # Set master volume
+        setVolume(masterVolume);
+    }
+
+    # Write to AC97 mixer register
+    private static func ac97WriteMixer(int reg, int value) -> void {
+        unsafe {
+            outw(AC97_NAMBAR + reg, (word) value);
+        }
+    }
+
+    # Read from AC97 mixer register
+    private static func ac97ReadMixer(int reg) -> int {
+        int val = 0;
+        unsafe {
+            val = (int) inw(AC97_NAMBAR + reg);
+        }
+        return val;
+    }
+
+    # Play a tone via AC97 (generates a sine wave buffer)
+    private static func playToneAC97(int freq, int durationMs) -> void {
+        # For simplicity, fall back to PC speaker for single tones
+        # Full AC97 PCM playback requires DMA buffer setup
+        speakerTone(freq, durationMs);
+        speakerOff();
+    }
+
+    # ---- PCI Helpers ----
+
+    # Read a 32-bit value from PCI config space
+    private static func pciRead(int bus, int device, int function, int offset) -> int {
+        int address = 0x80000000 | (bus << 16) | (device << 11) | (function << 8) | (offset & 0xFC);
+        int val = 0;
+        unsafe {
+            outd(0xCF8, address);
+            val = ind(0xCFC);
+        }
+        return val;
+    }
+}

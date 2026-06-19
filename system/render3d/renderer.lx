@@ -1,0 +1,675 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Software 3D Renderer — fixed-point math, triangle rasterizer, z-buffer
+// system/render3d/renderer.lx
+//
+// Provides a complete software 3D pipeline for StratOS:
+//   - 3D vector and 4x4 matrix math (using int fixed-point, 10-bit fraction)
+//   - Perspective projection, camera (lookAt)
+//   - Flat-shaded triangle rasterizer with z-buffer
+//   - Back-face culling
+//   - Directional lighting
+//   - Per-window render target (writes to framebuffer region)
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+
+# ============================================================================
+# Fixed-point scale:  1.0  ==  FP_ONE  ==  1024
+# We use 10 fractional bits so multiply/divide stay within int range.
+# ============================================================================
+int FP_SHIFT = 10;
+int FP_ONE   = 1024;
+int FP_HALF  = 512;
+
+# ── Depth buffer (1024*768 = 786432 entries) ────────────────────────────────
+# Stored as fixed-point ints.  Larger = farther.  Init to max int.
+long zbufAddr = 0;
+int zbufW = 0;
+int zbufH = 0;
+
+# ── Projection parameters ──────────────────────────────────────────────────
+int projFov    = 60;      # Field of view in degrees
+int projNear   = 100;     # 0.1 in fixed-point (* FP_ONE)
+int projFar    = 102400;  # 100.0 in fixed-point
+
+# ── Camera ──────────────────────────────────────────────────────────────────
+int camX = 0;  int camY = 0;  int camZ = 0;
+int camTX = 0; int camTY = 0; int camTZ = 0;   # look-at target
+int camUX = 0; int camUY = FP_ONE; int camUZ = 0;   # up vector
+
+# ── Light direction (normalised, fixed-point) ──────────────────────────────
+int lightX = 0;
+int lightY = 0;
+int lightZ = 0;
+
+# ── Current viewport region ────────────────────────────────────────────────
+int vpX = 0; int vpY = 0; int vpW = 0; int vpH = 0;
+
+# Transform output (file-scope to avoid struct returns)
+int trOutX = 0;
+int trOutY = 0;
+int trOutZ = 0;
+
+# ── Model-View-Projection matrix (4x4, row-major, fixed-point) ─────────────
+# m[row][col] stored as m_rc  (flattened to 16 ints)
+int mvp00 = 0; int mvp01 = 0; int mvp02 = 0; int mvp03 = 0;
+int mvp10 = 0; int mvp11 = 0; int mvp12 = 0; int mvp13 = 0;
+int mvp20 = 0; int mvp21 = 0; int mvp22 = 0; int mvp23 = 0;
+int mvp30 = 0; int mvp31 = 0; int mvp32 = 0; int mvp33 = 0;
+
+# ── View matrix ────────────────────────────────────────────────────────────
+int v00 = 0; int v01 = 0; int v02 = 0; int v03 = 0;
+int v10 = 0; int v11 = 0; int v12 = 0; int v13 = 0;
+int v20 = 0; int v21 = 0; int v22 = 0; int v23 = 0;
+int v30 = 0; int v31 = 0; int v32 = 0; int v33 = 0;
+
+# ── Projection matrix ──────────────────────────────────────────────────────
+int p00 = 0; int p01 = 0; int p02 = 0; int p03 = 0;
+int p10 = 0; int p11 = 0; int p12 = 0; int p13 = 0;
+int p20 = 0; int p21 = 0; int p22 = 0; int p23 = 0;
+int p30 = 0; int p31 = 0; int p32 = 0; int p33 = 0;
+
+# ── Model matrix ───────────────────────────────────────────────────────────
+int md00 = 0; int md01 = 0; int md02 = 0; int md03 = 0;
+int md10 = 0; int md11 = 0; int md12 = 0; int md13 = 0;
+int md20 = 0; int md21 = 0; int md22 = 0; int md23 = 0;
+int md30 = 0; int md31 = 0; int md32 = 0; int md33 = 0;
+
+# ── Temporary result matrix (for multiply) ─────────────────────────────────
+int t00 = 0; int t01 = 0; int t02 = 0; int t03 = 0;
+int t10 = 0; int t11 = 0; int t12 = 0; int t13 = 0;
+int t20 = 0; int t21 = 0; int t22 = 0; int t23 = 0;
+int t30 = 0; int t31 = 0; int t32 = 0; int t33 = 0;
+
+# ── Sine lookup table (0..90 degrees, fixed-point * FP_ONE) ────────────────
+# Pre-computed sin values for 0..90 in increments of 1 degree.
+# sin(d) * 1024, rounded.
+int sin0  = 0;    int sin1  = 18;   int sin2  = 36;   int sin3  = 54;
+int sin4  = 71;   int sin5  = 89;   int sin6  = 107;  int sin7  = 125;
+int sin8  = 143;  int sin9  = 160;  int sin10 = 178;  int sin11 = 195;
+int sin12 = 213;  int sin13 = 230;  int sin14 = 247;  int sin15 = 264;
+int sin16 = 282;  int sin17 = 299;  int sin18 = 315;  int sin19 = 332;
+int sin20 = 349;  int sin21 = 365;  int sin22 = 381;  int sin23 = 397;
+int sin24 = 413;  int sin25 = 429;  int sin26 = 445;  int sin27 = 460;
+int sin28 = 476;  int sin29 = 491;  int sin30 = 512;  int sin31 = 522;
+int sin32 = 537;  int sin33 = 551;  int sin34 = 566;  int sin35 = 580;
+int sin36 = 594;  int sin37 = 608;  int sin38 = 622;  int sin39 = 636;
+int sin40 = 649;  int sin41 = 662;  int sin42 = 675;  int sin43 = 688;
+int sin44 = 700;  int sin45 = 724;  int sin46 = 724;  int sin47 = 736;
+int sin48 = 748;  int sin49 = 760;  int sin50 = 771;  int sin51 = 782;
+int sin52 = 793;  int sin53 = 804;  int sin54 = 814;  int sin55 = 824;
+int sin56 = 834;  int sin57 = 843;  int sin58 = 852;  int sin59 = 861;
+int sin60 = 887;  int sin61 = 877;  int sin62 = 885;  int sin63 = 893;
+int sin64 = 900;  int sin65 = 907;  int sin66 = 914;  int sin67 = 920;
+int sin68 = 927;  int sin69 = 932;  int sin70 = 938;  int sin71 = 943;
+int sin72 = 948;  int sin73 = 953;  int sin74 = 957;  int sin75 = 961;
+int sin76 = 964;  int sin77 = 968;  int sin78 = 971;  int sin79 = 974;
+int sin80 = 976;  int sin81 = 978;  int sin82 = 980;  int sin83 = 982;
+int sin84 = 983;  int sin85 = 984;  int sin86 = 985;  int sin87 = 985;
+int sin88 = 986;  int sin89 = 986;  int sin90 = 1024;
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+export class Renderer3D {
+
+    # Allocate z-buffer and set defaults.  Call once at boot.
+    public static func setup(int screenW, int screenH) -> void {
+        zbufW = screenW;
+        zbufH = screenH;
+
+        # Allocate z-buffer: screenW * screenH * 4 bytes (int per pixel)
+        int zbufSize = screenW * screenH * 4;
+        unsafe {
+            # Use a static array in BSS — 1024*768 = 786432 ints = ~3 MB
+            # We'll place it via a bump allocation from the heap
+            byte* zb = (byte*) flux_heap_alloc(zbufSize);
+            zbufAddr = (long) zb;
+        }
+
+        # Default light: top-left-front, normalised
+        # direction = normalize(1, -1, 1) ≈ (0.577, -0.577, 0.577)
+        lightX = 591;    # 0.577 * 1024
+        lightY = -591;
+        lightZ = 591;
+
+        setIdentityModel();
+    }
+
+    # Clear z-buffer to max depth.  Call before rendering each frame.
+    public static func clearDepth() -> void {
+        int total = zbufW * zbufH;
+        unsafe {
+            int* zb = (int*) zbufAddr;
+            for (int i = 0; i < total; i++) {
+                zb[i] = 0x7FFFFFFF;
+            }
+        }
+    }
+
+    # Set the render viewport (pixel region on screen)
+    public static func setViewport(int x, int y, int w, int h) -> void {
+        vpX = x;
+        vpY = y;
+        vpW = w;
+        vpH = h;
+    }
+
+    # ── Camera ──────────────────────────────────────────────────────────
+    public static func setCamera(int ex, int ey, int ez,
+                                  int tx, int ty, int tz) -> void {
+        camX = ex; camY = ey; camZ = ez;
+        camTX = tx; camTY = ty; camTZ = tz;
+        buildViewMatrix();
+    }
+
+    # ── Light ───────────────────────────────────────────────────────────
+    public static func setLight(int dx, int dy, int dz) -> void {
+        # Normalise the direction
+        int lenSq = fpMul(dx, dx) + fpMul(dy, dy) + fpMul(dz, dz);
+        int len = fpSqrt(lenSq);
+        if (len > 0) {
+            lightX = fpDiv(dx, len);
+            lightY = fpDiv(dy, len);
+            lightZ = fpDiv(dz, len);
+        }
+    }
+
+    # ── Model transform ────────────────────────────────────────────────
+    public static func setIdentityModel() -> void {
+        md00 = FP_ONE; md01 = 0; md02 = 0; md03 = 0;
+        md10 = 0; md11 = FP_ONE; md12 = 0; md13 = 0;
+        md20 = 0; md21 = 0; md22 = FP_ONE; md23 = 0;
+        md30 = 0; md31 = 0; md32 = 0; md33 = FP_ONE;
+    }
+
+    public static func translateModel(int tx, int ty, int tz) -> void {
+        md03 = md03 + tx;
+        md13 = md13 + ty;
+        md23 = md23 + tz;
+    }
+
+    public static func rotateModelY(int angleDeg) -> void {
+        int c = fpCos(angleDeg);
+        int s = fpSin(angleDeg);
+        # Rotate around Y: new_x = x*cos + z*sin, new_z = -x*sin + z*cos
+        int r00 = fpMul(md00, c) + fpMul(md02, s);
+        int r02 = fpMul(md00, -s) + fpMul(md02, c);
+        int r10 = fpMul(md10, c) + fpMul(md12, s);
+        int r12 = fpMul(md10, -s) + fpMul(md12, c);
+        int r20 = fpMul(md20, c) + fpMul(md22, s);
+        int r22 = fpMul(md20, -s) + fpMul(md22, c);
+        md00 = r00; md02 = r02;
+        md10 = r10; md12 = r12;
+        md20 = r20; md22 = r22;
+    }
+
+    public static func rotateModelX(int angleDeg) -> void {
+        int c = fpCos(angleDeg);
+        int s = fpSin(angleDeg);
+        int r01 = fpMul(md01, c) - fpMul(md02, s);
+        int r02b = fpMul(md01, s) + fpMul(md02, c);
+        int r11 = fpMul(md11, c) - fpMul(md12, s);
+        int r12b = fpMul(md11, s) + fpMul(md12, c);
+        int r21 = fpMul(md21, c) - fpMul(md22, s);
+        int r22b = fpMul(md21, s) + fpMul(md22, c);
+        md01 = r01; md02 = r02b;
+        md11 = r11; md12 = r12b;
+        md21 = r21; md22 = r22b;
+    }
+
+    public static func rotateModelZ(int angleDeg) -> void {
+        int c = fpCos(angleDeg);
+        int s = fpSin(angleDeg);
+        int r00 = fpMul(md00, c) - fpMul(md01, s);
+        int r01b = fpMul(md00, s) + fpMul(md01, c);
+        int r10 = fpMul(md10, c) - fpMul(md11, s);
+        int r11b = fpMul(md10, s) + fpMul(md11, c);
+        int r20 = fpMul(md20, c) - fpMul(md21, s);
+        int r21b = fpMul(md20, s) + fpMul(md21, c);
+        md00 = r00; md01 = r01b;
+        md10 = r10; md11 = r11b;
+        md20 = r20; md21 = r21b;
+    }
+
+    public static func scaleModel(int sx, int sy, int sz) -> void {
+        md00 = fpMul(md00, sx); md01 = fpMul(md01, sy); md02 = fpMul(md02, sz);
+        md10 = fpMul(md10, sx); md11 = fpMul(md11, sy); md12 = fpMul(md12, sz);
+        md20 = fpMul(md20, sx); md21 = fpMul(md21, sy); md22 = fpMul(md22, sz);
+    }
+
+    # ── Build the final MVP and render ──────────────────────────────────
+
+    # Call after setting camera + model.  Computes MVP = Proj * View * Model.
+    public static func buildMVP() -> void {
+        buildProjectionMatrix();
+        # MVP = P * V * M
+        # Step 1: T = V * M
+        matMul_VM();
+        # Step 2: MVP = P * T
+        matMul_PT();
+    }
+
+    # ── Triangle rendering ──────────────────────────────────────────────
+
+    # Draw a flat-shaded triangle.  Vertices are in model space (fixed-point).
+    # baseColor is RGBA32.
+    public static func drawTriangle(int x0, int y0, int z0,
+                                     int x1, int y1, int z1,
+                                     int x2, int y2, int z2,
+                                     color32 baseColor) -> void {
+        # Transform all three vertices through MVP
+        int sx0 = 0; int sy0 = 0; int sz0 = 0;
+        int sx1 = 0; int sy1 = 0; int sz1 = 0;
+        int sx2 = 0; int sy2 = 0; int sz2 = 0;
+        transformVertex(x0, y0, z0);
+        sx0 = trOutX; sy0 = trOutY; sz0 = trOutZ;
+        transformVertex(x1, y1, z1);
+        sx1 = trOutX; sy1 = trOutY; sz1 = trOutZ;
+        transformVertex(x2, y2, z2);
+        sx2 = trOutX; sy2 = trOutY; sz2 = trOutZ;
+
+        # Back-face culling (screen-space cross product)
+        int edgeAx = sx1 - sx0;
+        int edgeAy = sy1 - sy0;
+        int edgeBx = sx2 - sx0;
+        int edgeBy = sy2 - sy0;
+        int cross = edgeAx * edgeBy - edgeAy * edgeBx;
+        if (cross >= 0) return;  # CW or degenerate — cull
+
+        # Compute face normal for lighting (model space)
+        int e1x = x1 - x0; int e1y = y1 - y0; int e1z = z1 - z0;
+        int e2x = x2 - x0; int e2y = y2 - y0; int e2z = z2 - z0;
+        int nx = fpMul(e1y, e2z) - fpMul(e1z, e2y);
+        int ny = fpMul(e1z, e2x) - fpMul(e1x, e2z);
+        int nz = fpMul(e1x, e2y) - fpMul(e1y, e2x);
+
+        # Normalize normal
+        int nLenSq = fpMul(nx, nx) + fpMul(ny, ny) + fpMul(nz, nz);
+        int nLen = fpSqrt(nLenSq);
+        if (nLen > 0) {
+            nx = fpDiv(nx, nLen);
+            ny = fpDiv(ny, nLen);
+            nz = fpDiv(nz, nLen);
+        }
+
+        # Dot product with light direction for diffuse shading
+        int dot = fpMul(nx, lightX) + fpMul(ny, lightY) + fpMul(nz, lightZ);
+        if (dot < 0) dot = 0;
+
+        # Ambient + diffuse → brightness factor [0..FP_ONE]
+        int ambient = FP_ONE / 4;   # 0.25
+        int brightness = ambient + fpMul(FP_ONE - ambient, dot);
+        if (brightness > FP_ONE) brightness = FP_ONE;
+
+        # Shade the base color
+        int r = (baseColor >> 24) & 255;
+        int g = (baseColor >> 16) & 255;
+        int b = (baseColor >> 8) & 255;
+        r = (r * brightness) >> FP_SHIFT;
+        g = (g * brightness) >> FP_SHIFT;
+        b = (b * brightness) >> FP_SHIFT;
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
+        color32 litColor = (r << 24) | (g << 16) | (b << 8) | 0xFF;
+
+        # Rasterize with z-buffer
+        rasterizeTriangle(sx0, sy0, sz0, sx1, sy1, sz1, sx2, sy2, sz2, litColor);
+    }
+
+    # Draw a wireframe triangle (no z-buffer, no lighting).
+    public static func drawWireTriangle(int x0, int y0, int z0,
+                                         int x1, int y1, int z1,
+                                         int x2, int y2, int z2,
+                                         color32 color) -> void {
+        transformVertex(x0, y0, z0);
+        int sx0 = trOutX; int sy0 = trOutY;
+        transformVertex(x1, y1, z1);
+        int sx1 = trOutX; int sy1 = trOutY;
+        transformVertex(x2, y2, z2);
+        int sx2 = trOutX; int sy2 = trOutY;
+
+        Framebuffer.drawLine(sx0, sy0, sx1, sy1, color);
+        Framebuffer.drawLine(sx1, sy1, sx2, sy2, color);
+        Framebuffer.drawLine(sx2, sy2, sx0, sy0, color);
+    }
+
+    # Convenience: draw a quad as two triangles
+    public static func drawQuad(int x0, int y0, int z0,
+                                 int x1, int y1, int z1,
+                                 int x2, int y2, int z2,
+                                 int x3, int y3, int z3,
+                                 color32 color) -> void {
+        drawTriangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color);
+        drawTriangle(x0, y0, z0, x2, y2, z2, x3, y3, z3, color);
+    }
+}
+
+# ============================================================================
+# Internal helpers — fixed-point math
+# ============================================================================
+
+# Fixed-point multiply: (a * b) >> FP_SHIFT
+func fpMul(int a, int b) -> int {
+    long la = (long) a;
+    long lb = (long) b;
+    long result = (la * lb) >> FP_SHIFT;
+    return (int) result;
+}
+
+# Fixed-point divide: (a << FP_SHIFT) / b
+func fpDiv(int a, int b) -> int {
+    if (b == 0) return 0;
+    long la = (long) a;
+    long result = (la << FP_SHIFT) / (long) b;
+    return (int) result;
+}
+
+# Integer square root (Babylonian method)
+func fpSqrt(int x) -> int {
+    if (x <= 0) return 0;
+    int guess = x;
+    int prev = 0;
+    for (int i = 0; i < 20; i++) {
+        if (guess == 0) return 0;
+        prev = guess;
+        guess = (guess + x / guess) / 2;
+        if (guess == prev) break;
+    }
+    return guess;
+}
+
+# Sine lookup (degrees, returns fixed-point)
+func fpSin(int deg) -> int {
+    # Normalise to 0..359
+    int d = deg % 360;
+    if (d < 0) d = d + 360;
+
+    bool neg = false;
+    if (d >= 180) {
+        neg = true;
+        d = d - 180;
+    }
+    if (d > 90) {
+        d = 180 - d;
+    }
+
+    int val = getSinEntry(d);
+    if (neg) return -val;
+    return val;
+}
+
+func fpCos(int deg) -> int {
+    return fpSin(deg + 90);
+}
+
+# Lookup sin table by index (0..90)
+func getSinEntry(int d) -> int {
+    switch (d) {
+        case 0: return sin0;   case 1: return sin1;   case 2: return sin2;
+        case 3: return sin3;   case 4: return sin4;   case 5: return sin5;
+        case 6: return sin6;   case 7: return sin7;   case 8: return sin8;
+        case 9: return sin9;   case 10: return sin10;  case 11: return sin11;
+        case 12: return sin12;  case 13: return sin13;  case 14: return sin14;
+        case 15: return sin15;  case 16: return sin16;  case 17: return sin17;
+        case 18: return sin18;  case 19: return sin19;  case 20: return sin20;
+        case 21: return sin21;  case 22: return sin22;  case 23: return sin23;
+        case 24: return sin24;  case 25: return sin25;  case 26: return sin26;
+        case 27: return sin27;  case 28: return sin28;  case 29: return sin29;
+        case 30: return sin30;  case 31: return sin31;  case 32: return sin32;
+        case 33: return sin33;  case 34: return sin34;  case 35: return sin35;
+        case 36: return sin36;  case 37: return sin37;  case 38: return sin38;
+        case 39: return sin39;  case 40: return sin40;  case 41: return sin41;
+        case 42: return sin42;  case 43: return sin43;  case 44: return sin44;
+        case 45: return sin45;  case 46: return sin46;  case 47: return sin47;
+        case 48: return sin48;  case 49: return sin49;  case 50: return sin50;
+        case 51: return sin51;  case 52: return sin52;  case 53: return sin53;
+        case 54: return sin54;  case 55: return sin55;  case 56: return sin56;
+        case 57: return sin57;  case 58: return sin58;  case 59: return sin59;
+        case 60: return sin60;  case 61: return sin61;  case 62: return sin62;
+        case 63: return sin63;  case 64: return sin64;  case 65: return sin65;
+        case 66: return sin66;  case 67: return sin67;  case 68: return sin68;
+        case 69: return sin69;  case 70: return sin70;  case 71: return sin71;
+        case 72: return sin72;  case 73: return sin73;  case 74: return sin74;
+        case 75: return sin75;  case 76: return sin76;  case 77: return sin77;
+        case 78: return sin78;  case 79: return sin79;  case 80: return sin80;
+        case 81: return sin81;  case 82: return sin82;  case 83: return sin83;
+        case 84: return sin84;  case 85: return sin85;  case 86: return sin86;
+        case 87: return sin87;  case 88: return sin88;  case 89: return sin89;
+        case 90: return sin90;
+        default: return 0;
+    }
+}
+
+# ============================================================================
+# View matrix (lookAt)
+# ============================================================================
+func buildViewMatrix() -> void {
+    # Forward = normalize(target - eye)
+    int fx = camTX - camX;
+    int fy = camTY - camY;
+    int fz = camTZ - camZ;
+    int fLenSq = fpMul(fx, fx) + fpMul(fy, fy) + fpMul(fz, fz);
+    int fLen = fpSqrt(fLenSq);
+    if (fLen == 0) fLen = 1;
+    fx = fpDiv(fx, fLen);
+    fy = fpDiv(fy, fLen);
+    fz = fpDiv(fz, fLen);
+
+    # Right = normalize(forward × up)
+    int rx = fpMul(fy, camUZ) - fpMul(fz, camUY);
+    int ry = fpMul(fz, camUX) - fpMul(fx, camUZ);
+    int rz = fpMul(fx, camUY) - fpMul(fy, camUX);
+    int rLenSq = fpMul(rx, rx) + fpMul(ry, ry) + fpMul(rz, rz);
+    int rLen = fpSqrt(rLenSq);
+    if (rLen == 0) rLen = 1;
+    rx = fpDiv(rx, rLen);
+    ry = fpDiv(ry, rLen);
+    rz = fpDiv(rz, rLen);
+
+    # True up = right × forward
+    int ux = fpMul(ry, fz) - fpMul(rz, fy);
+    int uy = fpMul(rz, fx) - fpMul(rx, fz);
+    int uz = fpMul(rx, fy) - fpMul(ry, fx);
+
+    # View matrix = [R | -R·eye]
+    v00 = rx;  v01 = ry;  v02 = rz;  v03 = -(fpMul(rx, camX) + fpMul(ry, camY) + fpMul(rz, camZ));
+    v10 = ux;  v11 = uy;  v12 = uz;  v13 = -(fpMul(ux, camX) + fpMul(uy, camY) + fpMul(uz, camZ));
+    v20 = -fx; v21 = -fy; v22 = -fz; v23 = fpMul(fx, camX) + fpMul(fy, camY) + fpMul(fz, camZ);
+    v30 = 0;   v31 = 0;   v32 = 0;   v33 = FP_ONE;
+}
+
+# ============================================================================
+# Projection matrix (perspective)
+# ============================================================================
+func buildProjectionMatrix() -> void {
+    # tan(fov/2) in fixed-point
+    int halfFov = projFov / 2;
+    int tanHalf = fpDiv(fpSin(halfFov), fpCos(halfFov));
+    if (tanHalf == 0) tanHalf = 1;
+
+    int aspect = FP_ONE;   # square viewport assumption; adjust if needed
+    if (vpH > 0) {
+        aspect = fpDiv(vpW * FP_ONE / vpH, FP_ONE);    # vpW/vpH as fixed-point
+    }
+
+    int f = fpDiv(FP_ONE, tanHalf);
+
+    p00 = fpDiv(f, aspect);  p01 = 0;  p02 = 0;  p03 = 0;
+    p10 = 0;  p11 = f;  p12 = 0;  p13 = 0;
+    p20 = 0;  p21 = 0;
+    p22 = fpDiv(-(projFar + projNear), projFar - projNear);
+    p23 = fpDiv(-2 * fpMul(projFar, projNear), projFar - projNear);
+    p30 = 0;  p31 = 0;  p32 = -FP_ONE;  p33 = 0;
+}
+
+# ============================================================================
+# Matrix multiply helpers
+# ============================================================================
+
+# Compute T = V * Model  (result in t00..t33)
+func matMul_VM() -> void {
+    t00 = fpMul(v00, md00) + fpMul(v01, md10) + fpMul(v02, md20) + fpMul(v03, md30);
+    t01 = fpMul(v00, md01) + fpMul(v01, md11) + fpMul(v02, md21) + fpMul(v03, md31);
+    t02 = fpMul(v00, md02) + fpMul(v01, md12) + fpMul(v02, md22) + fpMul(v03, md32);
+    t03 = fpMul(v00, md03) + fpMul(v01, md13) + fpMul(v02, md23) + fpMul(v03, md33);
+
+    t10 = fpMul(v10, md00) + fpMul(v11, md10) + fpMul(v12, md20) + fpMul(v13, md30);
+    t11 = fpMul(v10, md01) + fpMul(v11, md11) + fpMul(v12, md21) + fpMul(v13, md31);
+    t12 = fpMul(v10, md02) + fpMul(v11, md12) + fpMul(v12, md22) + fpMul(v13, md32);
+    t13 = fpMul(v10, md03) + fpMul(v11, md13) + fpMul(v12, md23) + fpMul(v13, md33);
+
+    t20 = fpMul(v20, md00) + fpMul(v21, md10) + fpMul(v22, md20) + fpMul(v23, md30);
+    t21 = fpMul(v20, md01) + fpMul(v21, md11) + fpMul(v22, md21) + fpMul(v23, md31);
+    t22 = fpMul(v20, md02) + fpMul(v21, md12) + fpMul(v22, md22) + fpMul(v23, md32);
+    t23 = fpMul(v20, md03) + fpMul(v21, md13) + fpMul(v22, md23) + fpMul(v23, md33);
+
+    t30 = fpMul(v30, md00) + fpMul(v31, md10) + fpMul(v32, md20) + fpMul(v33, md30);
+    t31 = fpMul(v30, md01) + fpMul(v31, md11) + fpMul(v32, md21) + fpMul(v33, md31);
+    t32 = fpMul(v30, md02) + fpMul(v31, md12) + fpMul(v32, md22) + fpMul(v33, md32);
+    t33 = fpMul(v30, md03) + fpMul(v31, md13) + fpMul(v32, md23) + fpMul(v33, md33);
+}
+
+# Compute MVP = P * T  (result in mvp00..mvp33)
+func matMul_PT() -> void {
+    mvp00 = fpMul(p00, t00) + fpMul(p01, t10) + fpMul(p02, t20) + fpMul(p03, t30);
+    mvp01 = fpMul(p00, t01) + fpMul(p01, t11) + fpMul(p02, t21) + fpMul(p03, t31);
+    mvp02 = fpMul(p00, t02) + fpMul(p01, t12) + fpMul(p02, t22) + fpMul(p03, t32);
+    mvp03 = fpMul(p00, t03) + fpMul(p01, t13) + fpMul(p02, t23) + fpMul(p03, t33);
+
+    mvp10 = fpMul(p10, t00) + fpMul(p11, t10) + fpMul(p12, t20) + fpMul(p13, t30);
+    mvp11 = fpMul(p10, t01) + fpMul(p11, t11) + fpMul(p12, t21) + fpMul(p13, t31);
+    mvp12 = fpMul(p10, t02) + fpMul(p11, t12) + fpMul(p12, t22) + fpMul(p13, t32);
+    mvp13 = fpMul(p10, t03) + fpMul(p11, t13) + fpMul(p12, t23) + fpMul(p13, t33);
+
+    mvp20 = fpMul(p20, t00) + fpMul(p21, t10) + fpMul(p22, t20) + fpMul(p23, t30);
+    mvp21 = fpMul(p20, t01) + fpMul(p21, t11) + fpMul(p22, t21) + fpMul(p23, t31);
+    mvp22 = fpMul(p20, t02) + fpMul(p21, t12) + fpMul(p22, t22) + fpMul(p23, t32);
+    mvp23 = fpMul(p20, t03) + fpMul(p21, t13) + fpMul(p22, t23) + fpMul(p23, t33);
+
+    mvp30 = fpMul(p30, t00) + fpMul(p31, t10) + fpMul(p32, t20) + fpMul(p33, t30);
+    mvp31 = fpMul(p30, t01) + fpMul(p31, t11) + fpMul(p32, t21) + fpMul(p33, t31);
+    mvp32 = fpMul(p30, t02) + fpMul(p31, t12) + fpMul(p32, t22) + fpMul(p33, t32);
+    mvp33 = fpMul(p30, t03) + fpMul(p31, t13) + fpMul(p32, t23) + fpMul(p33, t33);
+}
+
+# ============================================================================
+# Transform a single vertex from model space → screen space
+# Result stored in trOutX, trOutY, trOutZ
+# ============================================================================
+func transformVertex(int vx, int vy, int vz) -> void {
+    # Clip-space coordinates
+    int cx = fpMul(mvp00, vx) + fpMul(mvp01, vy) + fpMul(mvp02, vz) + mvp03;
+    int cy = fpMul(mvp10, vx) + fpMul(mvp11, vy) + fpMul(mvp12, vz) + mvp13;
+    int cz = fpMul(mvp20, vx) + fpMul(mvp21, vy) + fpMul(mvp22, vz) + mvp23;
+    int cw = fpMul(mvp30, vx) + fpMul(mvp31, vy) + fpMul(mvp32, vz) + mvp33;
+
+    # Perspective divide
+    if (cw == 0) cw = 1;
+    int ndcX = fpDiv(cx, cw);
+    int ndcY = fpDiv(cy, cw);
+    int ndcZ = fpDiv(cz, cw);
+
+    # Viewport transform:  screen_x = (ndcX + 1) * vpW / 2 + vpX
+    trOutX = vpX + ((ndcX + FP_ONE) * vpW) / (2 * FP_ONE);
+    trOutY = vpY + ((FP_ONE - ndcY) * vpH) / (2 * FP_ONE);  # Y flipped
+    trOutZ = ndcZ;  # keep for z-buffer
+}
+
+# ============================================================================
+# Scanline triangle rasterizer with z-buffer
+# ============================================================================
+
+# Swap helper (writes to file-scope swap vars)
+int swA = 0; int swB = 0; int swC = 0;
+int swD = 0; int swE = 0; int swF = 0;
+
+func swapVert(int dummy1, int dummy2,
+              int ax, int ay, int az,
+              int bx, int by, int bz) -> void {
+    swA = bx; swB = by; swC = bz;
+    swD = ax; swE = ay; swF = az;
+}
+
+func rasterizeTriangle(int x0, int y0, int z0,
+                        int x1, int y1, int z1,
+                        int x2, int y2, int z2,
+                        color32 color) -> void {
+    # Sort by Y:  y0 <= y1 <= y2
+    if (y0 > y1) { swapVert(0, 1, x0, y0, z0, x1, y1, z1); x0 = swA; y0 = swB; z0 = swC; x1 = swD; y1 = swE; z1 = swF; }
+    if (y1 > y2) { swapVert(0, 1, x1, y1, z1, x2, y2, z2); x1 = swA; y1 = swB; z1 = swC; x2 = swD; y2 = swE; z2 = swF; }
+    if (y0 > y1) { swapVert(0, 1, x0, y0, z0, x1, y1, z1); x0 = swA; y0 = swB; z0 = swC; x1 = swD; y1 = swE; z1 = swF; }
+
+    int totalH = y2 - y0;
+    if (totalH == 0) return;
+
+    for (int scanY = y0; scanY <= y2; scanY++) {
+        # Clip to viewport
+        if (scanY < vpY) continue;
+        if (scanY >= vpY + vpH) break;
+
+        bool secondHalf = (scanY > y1) || (y1 == y0);
+        int segH = 0;
+        if (secondHalf) {
+            segH = y2 - y1;
+        } else {
+            segH = y1 - y0;
+        }
+        if (segH == 0) segH = 1;
+
+        int alpha = fpDiv((scanY - y0) * FP_ONE, totalH * FP_ONE / FP_ONE);
+        int beta = 0;
+        if (secondHalf) {
+            beta = fpDiv((scanY - y1) * FP_ONE, segH * FP_ONE / FP_ONE);
+        } else {
+            beta = fpDiv((scanY - y0) * FP_ONE, segH * FP_ONE / FP_ONE);
+        }
+
+        # Interpolate edges
+        int ax = x0 + fpMul(x2 - x0, alpha);
+        int az = z0 + fpMul(z2 - z0, alpha);
+        int bx = 0;
+        int bz = 0;
+        if (secondHalf) {
+            bx = x1 + fpMul(x2 - x1, beta);
+            bz = z1 + fpMul(z2 - z1, beta);
+        } else {
+            bx = x0 + fpMul(x1 - x0, beta);
+            bz = z0 + fpMul(z1 - z0, beta);
+        }
+
+        if (ax > bx) {
+            int tmpX = ax; ax = bx; bx = tmpX;
+            int tmpZ = az; az = bz; bz = tmpZ;
+        }
+
+        int spanW = bx - ax;
+        if (spanW == 0) spanW = 1;
+
+        for (int scanX = ax; scanX <= bx; scanX++) {
+            if (scanX < vpX) continue;
+            if (scanX >= vpX + vpW) break;
+
+            # Interpolate Z across the scanline
+            int zt = 0;
+            if (spanW > 1) {
+                zt = az + ((bz - az) * (scanX - ax)) / spanW;
+            } else {
+                zt = az;
+            }
+
+            # Z-buffer test
+            int zbIdx = scanY * zbufW + scanX;
+            unsafe {
+                int* zb = (int*) zbufAddr;
+                if (zt < zb[zbIdx]) {
+                    zb[zbIdx] = zt;
+                    Framebuffer.plotPixel(scanX, scanY, color);
+                }
+            }
+        }
+    }
+}

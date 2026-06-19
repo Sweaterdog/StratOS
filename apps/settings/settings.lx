@@ -1,0 +1,559 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Settings App — System preferences for StratOS
+// apps/settings/settings.lx
+//
+// Features:
+//   - Wallpaper selection with preview swatches
+//   - Display info + theme selection
+//   - Keyboard shortcuts reference (up to date)
+//   - Network settings (basic)
+//   - System About panel with uptime
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/windowing/desktop.lx";
+import "system/windowing/taskbar.lx";
+import "system/windowing/toast.lx";
+import "kernel/core/console.lx";
+import "kernel/drivers/e1000.lx";
+import "kernel/drivers/net.lx";
+
+# Settings state
+int settingsTab = 0;          # 0=Wallpaper, 1=Display, 2=Network, 3=Keyboard, 4=About
+int selectedWallpaper = 0;    # Index of highlighted wallpaper
+bool settingsNeedsRedraw = true;
+int SETTINGS_TAB_COUNT = 5;
+
+# Display tab state
+int selectedTheme = 0;
+
+# Network tab state (queried live from drivers)
+
+# Wallpaper names
+string wpName0 = "Void";
+string wpName1 = "Nebula";
+string wpName2 = "Aurora";
+string wpName3 = "Mountain";
+
+export class SettingsApp {
+    public static func init() -> void {
+        settingsTab = 0;
+        selectedWallpaper = 0;
+        settingsNeedsRedraw = true;
+    }
+
+    # Process a keyboard event
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        # Tab switching with number keys or Tab key
+        if (event.ascii == '1') { settingsTab = 0; settingsNeedsRedraw = true; return; }
+        if (event.ascii == '2') { settingsTab = 1; settingsNeedsRedraw = true; return; }
+        if (event.ascii == '3') { settingsTab = 2; settingsNeedsRedraw = true; return; }
+        if (event.ascii == '4') { settingsTab = 3; settingsNeedsRedraw = true; return; }
+        if (event.ascii == '5') { settingsTab = 4; settingsNeedsRedraw = true; return; }
+        if (event.scancode == 15) {
+            # Tab key
+            settingsTab = (settingsTab + 1) % SETTINGS_TAB_COUNT;
+            settingsNeedsRedraw = true;
+            return;
+        }
+
+        # Handle input based on current tab
+        if (settingsTab == 0) {
+            processWallpaperTab(event);
+        } elif (settingsTab == 1) {
+            processDisplayTab(event);
+        }
+    }
+
+    # Process keys for wallpaper tab
+    private static func processWallpaperTab(KeyEvent event) -> void {
+        if (event.scancode == KEY_UP) {
+            if (selectedWallpaper > 0) {
+                selectedWallpaper = selectedWallpaper - 1;
+                settingsNeedsRedraw = true;
+            }
+        } elif (event.scancode == KEY_DOWN) {
+            if (selectedWallpaper < 3) {
+                selectedWallpaper = selectedWallpaper + 1;
+                settingsNeedsRedraw = true;
+            }
+        } elif (event.scancode == 28) {
+            # Enter — apply wallpaper
+            Desktop.setWallpaper(selectedWallpaper);
+            settingsNeedsRedraw = true;
+        }
+    }
+
+    # Process keys for display tab
+    private static func processDisplayTab(KeyEvent event) -> void {
+        if (event.scancode == KEY_UP) {
+            if (selectedTheme > 0) {
+                selectedTheme = selectedTheme - 1;
+                settingsNeedsRedraw = true;
+            }
+        } elif (event.scancode == KEY_DOWN) {
+            if (selectedTheme < 3) {
+                selectedTheme = selectedTheme + 1;
+                settingsNeedsRedraw = true;
+            }
+        } elif (event.scancode == 28) {
+            # Enter — apply theme
+            Theme.applyTheme(selectedTheme);
+            Toast.show("Theme: " + Theme.getThemeName(), 0);
+            settingsNeedsRedraw = true;
+        }
+    }
+
+    # Process a mouse click
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int sidebarW = 140;
+
+        # Sidebar clicks — tab selection
+        if (relX < sidebarW) {
+            int clickedTab = (relY - 8) / 32;
+            if (clickedTab >= 0 && clickedTab < SETTINGS_TAB_COUNT) {
+                settingsTab = clickedTab;
+                settingsNeedsRedraw = true;
+            }
+            return;
+        }
+
+        # Content area clicks
+        if (settingsTab == 0) {
+            # Wallpaper tab
+            int contentStartY = 16;
+            int headerH = 50;
+            int itemH = 40;
+            int itemPadding = 4;
+            int clickContentY = relY - contentStartY - headerH;
+
+            if (clickContentY >= 0) {
+                int clickedItem = clickContentY / (itemH + itemPadding);
+                if (clickedItem >= 0 && clickedItem <= 3) {
+                    selectedWallpaper = clickedItem;
+                    Desktop.setWallpaper(selectedWallpaper);
+                    settingsNeedsRedraw = true;
+                }
+            }
+        } elif (settingsTab == 1) {
+            # Display tab — theme selection area starts at y+160
+            int contentStartY = 16;
+            int themeAreaY = contentStartY + 160;
+            int itemH = 36;
+            int itemPadding = 4;
+            int clickContentY = relY - themeAreaY;
+
+            if (clickContentY >= 0) {
+                int clickedItem = clickContentY / (itemH + itemPadding);
+                if (clickedItem >= 0 && clickedItem <= 3) {
+                    selectedTheme = clickedItem;
+                    Theme.applyTheme(selectedTheme);
+                    Toast.show("Theme: " + Theme.getThemeName(), 0);
+                    settingsNeedsRedraw = true;
+                }
+            }
+
+            # Taskbar position toggle — starts after 4 theme items + gap
+            int tbAreaY = themeAreaY + (itemH + itemPadding) * 4 + 40;
+            int tbClickY = relY - tbAreaY;
+            if (tbClickY >= 0 && tbClickY < 32) {
+                # Top option clicked
+                if (!Taskbar.isAtTop()) {
+                    Taskbar.togglePosition();
+                    Framebuffer.invalidateWallpaper();
+                    Toast.show("Taskbar: Top", 0);
+                    settingsNeedsRedraw = true;
+                }
+            } elif (tbClickY >= 36 && tbClickY < 68) {
+                # Bottom option clicked
+                if (Taskbar.isAtTop()) {
+                    Taskbar.togglePosition();
+                    Framebuffer.invalidateWallpaper();
+                    Toast.show("Taskbar: Bottom", 0);
+                    settingsNeedsRedraw = true;
+                }
+            }
+        }
+    }
+
+    # Draw the settings window content
+    public static func draw(int x, int y, int w, int h) -> void {
+        # Background
+        color32 bg = 0x0D1117FF;
+        Framebuffer.fillRect(x, y, w, h, bg);
+
+        # Sidebar (tab list)
+        int sidebarW = 140;
+        Framebuffer.fillRect(x, y, sidebarW, h, 0x151B23FF);
+
+        # Tab items
+        drawTabItem(x, y + 8, sidebarW, "Wallpaper", 0, settingsTab == 0);
+        drawTabItem(x, y + 40, sidebarW, "Display", 1, settingsTab == 1);
+        drawTabItem(x, y + 72, sidebarW, "Network", 2, settingsTab == 2);
+        drawTabItem(x, y + 104, sidebarW, "Keyboard", 3, settingsTab == 3);
+        drawTabItem(x, y + 136, sidebarW, "About", 4, settingsTab == 4);
+
+        # Separator line
+        Framebuffer.drawVLine(x + sidebarW, y, h, 0x30363DFF);
+
+        # Content area
+        int contentX = x + sidebarW + 16;
+        int contentY = y + 16;
+        int contentW = w - sidebarW - 32;
+        int contentH = h - 32;
+
+        if (settingsTab == 0) {
+            drawWallpaperTab(contentX, contentY, contentW, contentH);
+        } elif (settingsTab == 1) {
+            drawDisplayTab(contentX, contentY, contentW, contentH);
+        } elif (settingsTab == 2) {
+            drawNetworkTab(contentX, contentY, contentW, contentH);
+        } elif (settingsTab == 3) {
+            drawKeyboardTab(contentX, contentY, contentW, contentH);
+        } elif (settingsTab == 4) {
+            drawAboutTab(contentX, contentY, contentW, contentH);
+        }
+    }
+
+    # Draw a tab item in the sidebar
+    private static func drawTabItem(int x, int y, int w, string label, int tabIdx, bool active) -> void {
+        if (active) {
+            Framebuffer.fillRect(x + 4, y, w - 8, 28, 0x21262DFF);
+            # Active indicator bar
+            Framebuffer.fillRect(x, y + 4, 3, 20, Theme.textAccent);
+        }
+        color32 textColor = active ? 0xE6EDF3FF : 0x8B949EFF;
+        TextRender.drawText(label, x + 16, y + 6, textColor);
+    }
+
+    # Draw wallpaper selection tab
+    private static func drawWallpaperTab(int x, int y, int w, int h) -> void {
+        # Header
+        TextRender.drawText("Choose Wallpaper", x, y, 0xE6EDF3FF);
+        TextRender.drawText("Use arrow keys and Enter to select", x, y + 20, 0x8B949EFF);
+
+        int itemY = y + 50;
+        int itemH = 40;
+        int itemPadding = 4;
+
+        # Draw wallpaper options
+        drawWallpaperOption(x, itemY, w, itemH, wpName0, 0, selectedWallpaper == 0);
+        drawWallpaperOption(x, itemY + itemH + itemPadding, w, itemH, wpName1, 1, selectedWallpaper == 1);
+        drawWallpaperOption(x, itemY + (itemH + itemPadding) * 2, w, itemH, wpName2, 2, selectedWallpaper == 2);
+        drawWallpaperOption(x, itemY + (itemH + itemPadding) * 3, w, itemH, wpName3, 3, selectedWallpaper == 3);
+
+        # Hint text
+        int hintY = itemY + (itemH + itemPadding) * 4 + 16;
+        TextRender.drawText("Press Enter to apply", x, hintY, 0x58A6FFFF);
+        TextRender.drawText("Ctrl+W from desktop to cycle", x, hintY + 20, 0x484F58FF);
+    }
+
+    # Draw a wallpaper selection item
+    private static func drawWallpaperOption(int x, int y, int w, int h, string name, int idx, bool selected) -> void {
+        # Background
+        color32 bg = selected ? 0x1F6FEBFF : 0x161B22FF;
+        Framebuffer.fillRoundedRect(x, y, w, h, 4, bg);
+
+        # Wallpaper preview swatch (small colored rectangle)
+        color32 swatchColor = getWallpaperSwatchColor(idx);
+        Framebuffer.fillRoundedRect(x + 8, y + 6, 50, h - 12, 3, swatchColor);
+
+        # Name
+        color32 textColor = selected ? 0xFFFFFFFF : 0xC9D1D9FF;
+        TextRender.drawText(name, x + 68, y + (h - 16) / 2, textColor);
+
+        # Selection indicator
+        if (selected) {
+            Framebuffer.fillCircle(x + w - 20, y + h / 2, 4, 0xFFFFFFFF);
+        } else {
+            Framebuffer.drawCircle(x + w - 20, y + h / 2, 4, 0x484F58FF);
+        }
+    }
+
+    # Get a representative color for each wallpaper
+    private static func getWallpaperSwatchColor(int idx) -> color32 {
+        switch (idx) {
+            case 0: return 0x0A0E1AFF;   # Void — deep dark
+            case 1: return 0x2D1B4EFF;   # Nebula — purple
+            case 2: return 0x0A2A1BFF;   # Aurora — dark green
+            case 3: return 0x1A2030FF;   # Mountain — blue-gray
+            default: return 0x1A1F2BFF;
+        }
+    }
+
+    # Draw display settings tab
+    private static func drawDisplayTab(int x, int y, int w, int h) -> void {
+        TextRender.drawText("Display Settings", x, y, 0xE6EDF3FF);
+
+        int lineY = y + 30;
+        int lineH = 22;
+
+        TextRender.drawText("Resolution:     1024 x 768", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Color Depth:    32-bit (ARGB)", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Renderer:       Double-buffered", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("VGA Mode:       Linear Framebuffer", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Font:           8x16 Bitmap", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Resolution set via GRUB boot config.", x, lineY, 0x484F58FF);
+        lineY = lineY + lineH + 8;
+
+        # Theme section
+        TextRender.drawText("Theme (click or arrows + Enter)", x, lineY, 0xE6EDF3FF);
+        lineY = lineY + 28;
+
+        int themeItemH = 36;
+        int themeItemPad = 4;
+
+        drawThemeOption(x, lineY, w, themeItemH, "Cosmic Dark", 0, selectedTheme == 0, 0x0A0E1AFF);
+        drawThemeOption(x, lineY + themeItemH + themeItemPad, w, themeItemH, "Arctic Light", 1, selectedTheme == 1, 0xDDE4ECFF);
+        drawThemeOption(x, lineY + (themeItemH + themeItemPad) * 2, w, themeItemH, "Ocean Blue", 2, selectedTheme == 2, 0x0A1929FF);
+        drawThemeOption(x, lineY + (themeItemH + themeItemPad) * 3, w, themeItemH, "Forest Green", 3, selectedTheme == 3, 0x0A1A0EFF);
+
+        # Taskbar position toggle
+        lineY = lineY + (themeItemH + themeItemPad) * 4 + 12;
+        TextRender.drawText("Taskbar Position", x, lineY, 0xE6EDF3FF);
+        lineY = lineY + 28;
+
+        # Top option
+        bool topSel = Taskbar.isAtTop();
+        color32 topBg = topSel ? 0x1F6FEBFF : 0x161B22FF;
+        color32 topTxt = topSel ? 0xFFFFFFFF : 0xC9D1D9FF;
+        Framebuffer.fillRoundedRect(x, lineY, w, 32, 4, topBg);
+        TextRender.drawText("Top", x + 14, lineY + 8, topTxt);
+        if (topSel) {
+            Framebuffer.fillCircle(x + w - 20, lineY + 16, 4, 0xFFFFFFFF);
+        } else {
+            Framebuffer.drawCircle(x + w - 20, lineY + 16, 4, 0x484F58FF);
+        }
+
+        # Bottom option
+        bool botSel = !Taskbar.isAtTop();
+        color32 botBg = botSel ? 0x1F6FEBFF : 0x161B22FF;
+        color32 botTxt = botSel ? 0xFFFFFFFF : 0xC9D1D9FF;
+        Framebuffer.fillRoundedRect(x, lineY + 36, w, 32, 4, botBg);
+        TextRender.drawText("Bottom", x + 14, lineY + 44, botTxt);
+        if (botSel) {
+            Framebuffer.fillCircle(x + w - 20, lineY + 52, 4, 0xFFFFFFFF);
+        } else {
+            Framebuffer.drawCircle(x + w - 20, lineY + 52, 4, 0x484F58FF);
+        }
+    }
+
+    # Draw a theme selection item
+    private static func drawThemeOption(int x, int y, int w, int h, string name, int idx, bool selected, color32 swatch) -> void {
+        color32 bg = selected ? 0x1F6FEBFF : 0x161B22FF;
+        Framebuffer.fillRoundedRect(x, y, w, h, 4, bg);
+
+        # Color swatch
+        Framebuffer.fillRoundedRect(x + 8, y + 6, 40, h - 12, 3, swatch);
+
+        # Name
+        color32 textColor = selected ? 0xFFFFFFFF : 0xC9D1D9FF;
+        TextRender.drawText(name, x + 58, y + (h - 16) / 2, textColor);
+
+        # Radio button
+        if (selected) {
+            Framebuffer.fillCircle(x + w - 20, y + h / 2, 4, 0xFFFFFFFF);
+        } else {
+            Framebuffer.drawCircle(x + w - 20, y + h / 2, 4, 0x484F58FF);
+        }
+    }
+
+    # Draw network settings tab — queries real E1000 / Net state
+    private static func drawNetworkTab(int x, int y, int w, int h) -> void {
+        TextRender.drawText("Network Settings", x, y, 0xE6EDF3FF);
+
+        int lineY = y + 40;
+        int lineH = 24;
+
+        bool hasAdapter = E1000.isPresent();
+        bool hasCfg     = Net.isConfigured();
+
+        # ── Status card ──────────────────────────────────────────
+        Framebuffer.fillRoundedRect(x, lineY, w, 80, 6, 0x161B22FF);
+        Framebuffer.drawRoundedRect(x, lineY, w, 80, 6, 0x30363DFF);
+
+        if (hasAdapter && hasCfg) {
+            # Green dot — connected
+            Framebuffer.fillCircle(x + 20, lineY + 20, 6, 0x3FB950FF);
+            TextRender.drawText("Status: Connected", x + 36, lineY + 12, 0x3FB950FF);
+            TextRender.drawText("Intel e1000 (PCI) — active", x + 36, lineY + 34, 0xC9D1D9FF);
+            TextRender.drawText("Network stack online", x + 36, lineY + 54, 0x8B949EFF);
+        } elif (hasAdapter) {
+            # Yellow dot — adapter present but no IP yet
+            Framebuffer.fillCircle(x + 20, lineY + 20, 6, 0xD29922FF);
+            TextRender.drawText("Status: No IP address", x + 36, lineY + 12, 0xD29922FF);
+            TextRender.drawText("Intel e1000 (PCI) — link up, awaiting DHCP", x + 36, lineY + 34, 0xC9D1D9FF);
+            TextRender.drawText("Try 'dhcp' in the shell", x + 36, lineY + 54, 0x8B949EFF);
+        } else {
+            # Red dot — no adapter
+            Framebuffer.fillCircle(x + 20, lineY + 20, 6, 0xF85149FF);
+            TextRender.drawText("Status: Disconnected", x + 36, lineY + 12, 0xF85149FF);
+            TextRender.drawText("No network adapter detected", x + 36, lineY + 34, 0x8B949EFF);
+            TextRender.drawText("StratOS is running in offline mode", x + 36, lineY + 54, 0x484F58FF);
+        }
+
+        lineY = lineY + 100;
+
+        # ── Network information ──────────────────────────────────
+        TextRender.drawText("Network Information", x, lineY, 0xE6EDF3FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Hostname:       stratos", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+
+        if (hasCfg) {
+            string ipStr = Net.getIPString();
+            TextRender.drawText("IP Address:     ${ipStr}", x, lineY, 0xC9D1D9FF);
+        } else {
+            TextRender.drawText("IP Address:     — not configured —", x, lineY, 0x8B949EFF);
+        }
+        lineY = lineY + lineH;
+
+        if (hasCfg) {
+            string dnsStr = Net.getDNSString();
+            TextRender.drawText("DNS Server:     ${dnsStr}", x, lineY, 0xC9D1D9FF);
+        } else {
+            TextRender.drawText("DNS Server:     — not configured —", x, lineY, 0x8B949EFF);
+        }
+        lineY = lineY + lineH;
+
+        if (hasCfg) {
+            string gwStr = Net.getGatewayString();
+            TextRender.drawText("Gateway:        ${gwStr}", x, lineY, 0xC9D1D9FF);
+        } else {
+            TextRender.drawText("Gateway:        — not configured —", x, lineY, 0x8B949EFF);
+        }
+        lineY = lineY + lineH;
+
+        if (hasAdapter) {
+            int m0 = E1000.getMac(0);
+            int m1 = E1000.getMac(1);
+            int m2 = E1000.getMac(2);
+            int m3 = E1000.getMac(3);
+            int m4 = E1000.getMac(4);
+            int m5 = E1000.getMac(5);
+            string macStr = "${m0}:${m1}:${m2}:${m3}:${m4}:${m5}";
+            TextRender.drawText("MAC Address:    ${macStr}", x, lineY, 0xC9D1D9FF);
+        } else {
+            TextRender.drawText("MAC Address:    —", x, lineY, 0x8B949EFF);
+        }
+
+        lineY = lineY + lineH + 16;
+
+        # ── Adapter list ─────────────────────────────────────────
+        TextRender.drawText("Network Adapters", x, lineY, 0xE6EDF3FF);
+        lineY = lineY + lineH;
+
+        if (hasAdapter) {
+            Framebuffer.fillCircle(x + 6, lineY + 6, 5, 0x3FB950FF);
+            TextRender.drawText("Intel e1000 (PCI)       — Active", x + 20, lineY, 0xC9D1D9FF);
+        } else {
+            Framebuffer.fillCircle(x + 6, lineY + 6, 5, 0x484F58FF);
+            TextRender.drawText("Intel e1000 (PCI)       — Not detected", x + 20, lineY, 0x8B949EFF);
+        }
+        lineY = lineY + lineH;
+
+        # Future adapters — not yet implemented
+        Framebuffer.fillCircle(x + 6, lineY + 6, 5, 0x484F58FF);
+        TextRender.drawText("RTL8139 (PCI)           — Not supported yet", x + 20, lineY, 0x484F58FF);
+        lineY = lineY + lineH;
+        Framebuffer.fillCircle(x + 6, lineY + 6, 5, 0x484F58FF);
+        TextRender.drawText("VirtIO-net (QEMU)       — Not supported yet", x + 20, lineY, 0x484F58FF);
+    }
+
+    # Draw keyboard shortcuts tab
+    private static func drawKeyboardTab(int x, int y, int w, int h) -> void {
+        TextRender.drawText("Keyboard Shortcuts", x, y, 0xE6EDF3FF);
+
+        int lineY = y + 35;
+        int lineH = 20;
+        int keyX = x;
+        int descX = x + 160;
+
+        # Desktop
+        TextRender.drawText("Desktop", keyX, lineY, 0x58A6FFFF);
+        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+T", "New terminal");        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+Q", "Close window");        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+W", "Cycle wallpaper");     lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+B", "Cycle theme");         lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+D", "Show Desktop");        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+/", "Shortcuts overlay");   lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+P", "Screenshot");          lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+F4", "Toggle taskbar pos"); lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+N", "Notification panel");  lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Super", "App launcher");         lineY = lineY + lineH;
+
+        # Window Mgmt
+        lineY = lineY + 4;
+        TextRender.drawText("Windows", keyX, lineY, 0x58A6FFFF);
+        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Alt+Tab", "Cycle windows");      lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Alt+F4", "Close window");        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Alt+Left/Right", "Snap L/R");    lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Alt+Up/Down", "Max / Restore");  lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+G", "Auto-tile grid");      lineY = lineY + lineH;
+
+        # System
+        lineY = lineY + 4;
+        TextRender.drawText("System", keyX, lineY, 0x58A6FFFF);
+        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+F1", "Lock screen");        lineY = lineY + lineH;
+        drawKbRow(keyX, descX, lineY, "Ctrl+F3", "Switch to TTY");
+    }
+
+    private static func drawKbRow(int keyX, int descX, int y, string key, string desc) -> void {
+        Framebuffer.fillRoundedRect(keyX, y, 140, 18, 3, 0x21262DFF);
+        int keyW = key.length * 8;
+        TextRender.drawText(key, keyX + (140 - keyW) / 2, y + 1, 0x58A6FFFF);
+        TextRender.drawText(desc, descX, y + 1, 0xC9D1D9FF);
+    }
+
+    # Draw about/system info tab
+    private static func drawAboutTab(int x, int y, int w, int h) -> void {
+        # Header
+        TextRender.drawText("About StratOS", x, y, 0xE6EDF3FF);
+
+        int lineY = y + 30;
+        int lineH = 22;
+
+        TextRender.drawText("Version:    0.1.0 Cosmic Edition", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Kernel:     Flux AOT Kernel", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Arch:       x86_64", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Memory:     256 MB", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Display:    1024x768x32bpp", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+        TextRender.drawText("Compositor: Stellar", x, lineY, 0xC9D1D9FF);
+        lineY = lineY + lineH;
+
+        # Uptime
+        int uptimeSec = int(Timer.getTicks() / 100);
+        int uptimeMin = uptimeSec / 60;
+        int uptimeHr = uptimeMin / 60;
+        int dispMin = uptimeMin % 60;
+        int dispSec = uptimeSec % 60;
+        string uptimeStr = "Uptime:     ${uptimeHr}h ${dispMin}m ${dispSec}s";
+        lineY = lineY + lineH;
+        TextRender.drawText(uptimeStr, x, lineY, 0xC9D1D9FF);
+
+        # Credits
+        lineY = lineY + lineH * 2;
+        TextRender.drawText("Built with Flux Language", x, lineY, 0x58A6FFFF);
+        lineY = lineY + lineH;
+        TextRender.drawText("github.com/flux-lang", x, lineY, 0x484F58FF);
+    }
+}

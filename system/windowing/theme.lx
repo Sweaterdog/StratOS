@@ -1,0 +1,270 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Theme — Clean Cosmic visual theme for StratOS
+// system/windowing/theme.lx
+//
+// All colors, dimensions, and visual constants for the UI.
+// ============================================================================
+
+export class Theme {
+    # ----- Dimensions -----
+    public static int TITLEBAR_HEIGHT = 32;
+    public static int BORDER_WIDTH = 1;
+    public static int CORNER_RADIUS = 6;
+    public static int BUTTON_RADIUS = 6;
+
+    # ----- Desktop -----
+    public static color32 desktopBgTop = 0x0A0E1AFF;       # Deep void (top)
+    public static color32 desktopBgBottom = 0x0E1024FF;     # Slightly lighter (bottom)
+    public static color32 starDim = 0xFFFFFF40;             # Dim star
+    public static color32 starBright = 0xFFFFFFCC;          # Bright star
+
+    # ----- Window -----
+    public static color32 windowBg = 0x161B22FF;            # Dark charcoal
+    public static color32 windowBorderActive = 0x5B8CFF60;  # Cosmic blue glow
+    public static color32 windowBorderInactive = 0x30363DFF; # Muted border
+
+    # ----- Title Bar -----
+    public static color32 titleBarActive = 0x1C2333FF;      # Dark navy
+    public static color32 titleBarInactive = 0x161B22FF;    # Darker navy
+    public static color32 titleTextActive = 0xC8D0E0FF;     # Silver-blue
+    public static color32 titleTextInactive = 0x6B7280FF;   # Muted gray
+
+    # ----- Window Controls -----
+    public static color32 closeButton = 0xFF5252FF;         # Red
+    public static color32 maximizeButton = 0x69F0AEFF;      # Green
+    public static color32 minimizeButton = 0xFFB74DFF;      # Amber
+
+    # ----- Taskbar -----
+    public static color32 taskbarBg = 0x0D1117E0;           # Near-black, slight transparency
+    public static color32 taskbarBorder = 0x30363D80;       # Subtle top border
+    public static color32 taskbarText = 0xC8D0E0FF;         # Silver
+    public static color32 taskbarActiveApp = 0x5B8CFF40;    # Blue highlight for active app
+    public static color32 taskbarHoverApp = 0xC8D0E020;     # Subtle hover
+    public static color32 taskbarClock = 0xC8D0E0FF;        # Clock text
+
+    # ----- Text Colors -----
+    public static color32 textPrimary = 0xC8D0E0FF;         # Primary text
+    public static color32 textSecondary = 0x8B949EFF;       # Secondary text
+    public static color32 textMuted = 0x6B7280FF;           # Muted/disabled text
+    public static color32 textAccent = 0x5B8CFFFF;          # Links, accents
+    public static color32 textSuccess = 0x69F0AEFF;         # Success messages
+    public static color32 textWarning = 0xFFB74DFF;         # Warnings
+    public static color32 textError = 0xFF5252FF;           # Errors
+
+    # ----- Interactive Elements -----
+    public static color32 buttonBg = 0x21262DFF;            # Button background
+    public static color32 buttonBgHover = 0x30363DFF;       # Button hover
+    public static color32 buttonBgActive = 0x5B8CFFFF;     # Active/primary button
+    public static color32 buttonText = 0xC8D0E0FF;          # Button text
+    public static color32 inputBg = 0x0D1117FF;             # Input field background
+    public static color32 inputBorder = 0x30363DFF;         # Input border
+    public static color32 inputBorderFocus = 0x5B8CFFFF;   # Input focused border
+    public static color32 selectionBg = 0x5B8CFF40;         # Text selection
+
+    # ----- Scrollbar -----
+    public static color32 scrollbarTrack = 0x161B22FF;
+    public static color32 scrollbarThumb = 0x30363DFF;
+    public static color32 scrollbarThumbHover = 0x484F58FF;
+
+    # ----- Menu / Dropdown -----
+    public static color32 menuBg = 0x161B22F0;              # Menu background
+    public static color32 menuBorder = 0x30363DFF;          # Menu border
+    public static color32 menuItemHover = 0x5B8CFF30;       # Menu item hover
+    public static color32 menuSeparator = 0x30363DFF;       # Divider line
+
+    # ----- Notifications -----
+    public static color32 notificationBg = 0x1C2333F0;
+    public static color32 notificationBorder = 0x5B8CFF60;
+
+    # ----- Theme management -----
+    public static int currentTheme = 0;     # 0=Cosmic, 1=Arctic, 2=Ocean, 3=Forest
+    public static int THEME_COUNT  = 4;
+
+    # Initialize theme (can be extended for custom themes)
+    public static func init() -> void {
+        # Default theme is already set above (Cosmic Dark)
+        currentTheme = 0;
+    }
+
+    # Cycle to next theme
+    public static func cycle() -> void {
+        currentTheme = currentTheme + 1;
+        if (currentTheme >= THEME_COUNT) currentTheme = 0;
+        applyTheme(currentTheme);
+    }
+
+    # Get the name of the current theme
+    public static func getThemeName() -> string {
+        if (currentTheme == 0) return "Cosmic Dark";
+        if (currentTheme == 1) return "Arctic Light";
+        if (currentTheme == 2) return "Ocean Blue";
+        if (currentTheme == 3) return "Forest Green";
+        return "Unknown";
+    }
+
+    # Apply a specific theme by index
+    public static func applyTheme(int idx) -> void {
+        currentTheme = idx;
+
+        if (idx == 0) {
+            # ── Cosmic Dark (default) ─────────────────────────────────
+            desktopBgTop       = 0x0A0E1AFF;
+            desktopBgBottom    = 0x0E1024FF;
+            starDim            = 0xFFFFFF40;
+            starBright         = 0xFFFFFFCC;
+            windowBg           = 0x161B22FF;
+            windowBorderActive = 0x5B8CFF60;
+            windowBorderInactive = 0x30363DFF;
+            titleBarActive     = 0x1C2333FF;
+            titleBarInactive   = 0x161B22FF;
+            titleTextActive    = 0xC8D0E0FF;
+            titleTextInactive  = 0x6B7280FF;
+            taskbarBg          = 0x0D1117E0;
+            taskbarBorder      = 0x30363D80;
+            taskbarText        = 0xC8D0E0FF;
+            taskbarActiveApp   = 0x5B8CFF40;
+            taskbarClock       = 0xC8D0E0FF;
+            textPrimary        = 0xC8D0E0FF;
+            textSecondary      = 0x8B949EFF;
+            textMuted          = 0x6B7280FF;
+            textAccent         = 0x5B8CFFFF;
+            textSuccess        = 0x69F0AEFF;
+            textWarning        = 0xFFB74DFF;
+            textError          = 0xFF5252FF;
+            buttonBg           = 0x21262DFF;
+            buttonBgHover      = 0x30363DFF;
+            inputBg            = 0x0D1117FF;
+            inputBorder        = 0x30363DFF;
+            menuBg             = 0x161B22F0;
+            menuBorder         = 0x30363DFF;
+        } elif (idx == 1) {
+            # ── Arctic Light ──────────────────────────────────────────
+            desktopBgTop       = 0xD8E4F0FF;
+            desktopBgBottom    = 0xC0D0E0FF;
+            starDim            = 0x00000020;
+            starBright         = 0x00000060;
+            windowBg           = 0xF0F3F6FF;
+            windowBorderActive = 0x4A90D960;
+            windowBorderInactive = 0xCCD6E0FF;
+            titleBarActive     = 0xE8ECF0FF;
+            titleBarInactive   = 0xF0F3F6FF;
+            titleTextActive    = 0x24292FFF;
+            titleTextInactive  = 0x8B949EFF;
+            taskbarBg          = 0xE8ECF0E0;
+            taskbarBorder      = 0xCCD6E080;
+            taskbarText        = 0x24292FFF;
+            taskbarActiveApp   = 0x4A90D940;
+            taskbarClock       = 0x24292FFF;
+            textPrimary        = 0x24292FFF;
+            textSecondary      = 0x57606AFF;
+            textMuted          = 0x8B949EFF;
+            textAccent         = 0x0969DAFF;
+            textSuccess        = 0x1A7F37FF;
+            textWarning        = 0xBF8700FF;
+            textError          = 0xCF222EFF;
+            buttonBg           = 0xE0E4E8FF;
+            buttonBgHover      = 0xCCD6E0FF;
+            inputBg            = 0xFFFFFFFF;
+            inputBorder        = 0xCCD6E0FF;
+            menuBg             = 0xF0F3F6F0;
+            menuBorder         = 0xCCD6E0FF;
+        } elif (idx == 2) {
+            # ── Ocean Blue ────────────────────────────────────────────
+            desktopBgTop       = 0x041228FF;
+            desktopBgBottom    = 0x0A1E3CFF;
+            starDim            = 0xFFFFFF30;
+            starBright         = 0xFFFFFF90;
+            windowBg           = 0x0C2340FF;
+            windowBorderActive = 0x2196F360;
+            windowBorderInactive = 0x1A3050FF;
+            titleBarActive     = 0x0E2C4EFF;
+            titleBarInactive   = 0x0C2340FF;
+            titleTextActive    = 0xB0D4F1FF;
+            titleTextInactive  = 0x5C7A9AFF;
+            taskbarBg          = 0x061428E0;
+            taskbarBorder      = 0x1A305080;
+            taskbarText        = 0xB0D4F1FF;
+            taskbarActiveApp   = 0x2196F340;
+            taskbarClock       = 0xB0D4F1FF;
+            textPrimary        = 0xB0D4F1FF;
+            textSecondary      = 0x7AA4C8FF;
+            textMuted          = 0x5C7A9AFF;
+            textAccent         = 0x42A5F5FF;
+            textSuccess        = 0x66BB6AFF;
+            textWarning        = 0xFFA726FF;
+            textError          = 0xEF5350FF;
+            buttonBg           = 0x0E2C4EFF;
+            buttonBgHover      = 0x14385CFF;
+            inputBg            = 0x061A30FF;
+            inputBorder        = 0x1A3050FF;
+            menuBg             = 0x0C2340F0;
+            menuBorder         = 0x1A3050FF;
+        } elif (idx == 3) {
+            # ── Forest Green ──────────────────────────────────────────
+            desktopBgTop       = 0x0A1A0AFF;
+            desktopBgBottom    = 0x0E240EFF;
+            starDim            = 0xFFFFFF30;
+            starBright         = 0xFFFFFFB0;
+            windowBg           = 0x162216FF;
+            windowBorderActive = 0x4CAF5060;
+            windowBorderInactive = 0x2D3D2DFF;
+            titleBarActive     = 0x1C2E1CFF;
+            titleBarInactive   = 0x162216FF;
+            titleTextActive    = 0xC8E0C8FF;
+            titleTextInactive  = 0x6B8A6BFF;
+            taskbarBg          = 0x0D170DE0;
+            taskbarBorder      = 0x2D3D2D80;
+            taskbarText        = 0xC8E0C8FF;
+            taskbarActiveApp   = 0x4CAF5040;
+            taskbarClock       = 0xC8E0C8FF;
+            textPrimary        = 0xC8E0C8FF;
+            textSecondary      = 0x8BAA8BFF;
+            textMuted          = 0x6B8A6BFF;
+            textAccent         = 0x66BB6AFF;
+            textSuccess        = 0x81C784FF;
+            textWarning        = 0xFFB74DFF;
+            textError          = 0xE57373FF;
+            buttonBg           = 0x1C2E1CFF;
+            buttonBgHover      = 0x2D3D2DFF;
+            inputBg            = 0x0D170DFF;
+            inputBorder        = 0x2D3D2DFF;
+            menuBg             = 0x162216F0;
+            menuBorder         = 0x2D3D2DFF;
+        }
+    }
+
+    # Get a color with modified alpha
+    public static func withAlpha(color32 color, int alpha) -> color32 {
+        int rgb = ((int) color) & 0xFFFFFF00;
+        return (color32)(rgb | (alpha & 0xFF));
+    }
+
+    # Lighten a color by a percentage (0.0-1.0)
+    public static func lighten(color32 color, float amount) -> color32 {
+        int r = ((int) color >> 24) & 0xFF;
+        int g = ((int) color >> 16) & 0xFF;
+        int b = ((int) color >> 8) & 0xFF;
+        int a = ((int) color) & 0xFF;
+
+        r = math.min(255, (int)(r + (255 - r) * amount));
+        g = math.min(255, (int)(g + (255 - g) * amount));
+        b = math.min(255, (int)(b + (255 - b) * amount));
+
+        return (color32)((r << 24) | (g << 16) | (b << 8) | a);
+    }
+
+    # Darken a color by a percentage (0.0-1.0)
+    public static func darken(color32 color, float amount) -> color32 {
+        int r = ((int) color >> 24) & 0xFF;
+        int g = ((int) color >> 16) & 0xFF;
+        int b = ((int) color >> 8) & 0xFF;
+        int a = ((int) color) & 0xFF;
+
+        r = (int)(r * (1.0 - amount));
+        g = (int)(g * (1.0 - amount));
+        b = (int)(b * (1.0 - amount));
+
+        return (color32)((r << 24) | (g << 16) | (b << 8) | a);
+    }
+}

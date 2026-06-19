@@ -1,0 +1,554 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Terminal Application — In-window shell emulator
+// apps/terminal/terminal.lx
+//
+// Provides a terminal window with:
+//   - Text buffer with scrolling
+//   - Command prompt and input line
+//   - Shell command execution with output capture
+//   - Cursor blinking
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/core/console.lx";
+import "system/shell/shell.lx";
+import "apps/lib/textrender.lx";
+
+# Terminal dimensions (in characters)
+int TERM_MAX_COLS = 96;
+int TERM_MAX_ROWS = 30;
+int TERM_MAX_LINES = 256;      # Scroll-back history
+
+# Terminal colors (set by applyTheme)
+color32 TERM_BG       = 0x0D1117FF;
+color32 TERM_FG       = 0xC9D1D9FF;
+color32 TERM_PROMPT   = 0x58A6FFFF;
+color32 TERM_DIR      = 0x7EE787FF;
+color32 TERM_CURSOR   = 0xFFFFFFFF;
+int TERM_THEME_COUNT  = 6;
+
+export class TerminalApp {
+    # ========================================================================
+    # Per-instance state (stored in arrays indexed by terminal ID)
+    # ========================================================================
+
+    # Since Flux AOT doesn't support per-instance objects easily in this
+    # kernel context, we use a simple approach: each terminal gets a
+    # global text buffer and state. For multiple terminals, we index by ID.
+
+    # We support up to 4 simultaneous terminals
+    # Each terminal has its own line buffer and state
+
+    # Active terminal being rendered (set before draw/input calls)
+    static int activeTermId = 0;
+
+    # Terminal text lines (shared ring buffer — each terminal gets a slice)
+    # For simplicity, terminal 0 uses these globals directly.
+    # Additional terminals would need array-of-arrays (future work).
+
+    static list<string> lines;         # Output lines
+    static string inputLine = "";       # Current input line
+    static int inputCursor = 0;         # Cursor position in input
+    static int scrollOffset = 0;        # Scroll position
+    static bool needsRedraw = true;     # Dirty flag
+
+    # Command history
+    static list<string> history;        # Past commands
+    static int historyIdx = -1;         # Current history browse index (-1 = not browsing)
+    static string savedInput = "";      # Saved input before browsing history
+
+    # Color theme index (0 = GitHub Dark)
+    static int termTheme = 0;
+
+    # Initialize a terminal
+    public static func init() -> void {
+        lines.clear();
+        history.clear();
+        inputLine = "";
+        inputCursor = 0;
+        scrollOffset = 0;
+        needsRedraw = true;
+        historyIdx = -1;
+        savedInput = "";
+        termTheme = 0;
+        applyTheme();
+
+        # Welcome message
+        lines.add("  StratOS Terminal v0.1.0");
+        lines.add("  Type 'help' for available commands.");
+        lines.add("  Ctrl+T to cycle color themes.");
+        lines.add("");
+    }
+
+    # Process a keystroke (called by compositor when this terminal is focused)
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+
+        needsRedraw = true;
+
+        # Enter — execute command
+        if (event.scancode == 28) {
+            # Add prompt + input to display
+            string prompt = getPrompt();
+            lines.add(prompt + inputLine);
+
+            # Execute the command
+            if (inputLine.trim().length > 0) {
+                string cmd = inputLine;
+
+                # Save to history
+                history.add(cmd);
+                historyIdx = -1;
+                savedInput = "";
+
+                inputLine = "";
+                inputCursor = 0;
+
+                # Capture the output from the shell
+                Console.beginCapture();
+                Shell.executeCommand(cmd);
+                string output = Console.endCapture();
+
+                # Split output into lines and add to buffer
+                appendOutput(output);
+            } else {
+                inputLine = "";
+                inputCursor = 0;
+            }
+
+            # Auto-scroll to bottom
+            scrollOffset = 0;
+            trimLines();
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            if (inputCursor > 0 && inputLine.length > 0) {
+                inputLine = inputLine.substring(0, inputCursor - 1) + inputLine.substring(inputCursor, inputLine.length);
+                inputCursor--;
+            }
+            return;
+        }
+
+        # Delete
+        if (event.scancode == 83) {
+            if (inputCursor < inputLine.length) {
+                inputLine = inputLine.substring(0, inputCursor) + inputLine.substring(inputCursor + 1, inputLine.length);
+            }
+            return;
+        }
+
+        # Arrow Up — browse command history (older)
+        if (event.scancode == 72) {
+            if (history.length > 0) {
+                if (historyIdx == -1) {
+                    # Start browsing — save current input
+                    savedInput = inputLine;
+                    historyIdx = history.length - 1;
+                } elif (historyIdx > 0) {
+                    historyIdx = historyIdx - 1;
+                }
+                inputLine = history[historyIdx];
+                inputCursor = inputLine.length;
+            }
+            return;
+        }
+
+        # Arrow Down — browse command history (newer)
+        if (event.scancode == 80) {
+            if (historyIdx != -1) {
+                if (historyIdx < history.length - 1) {
+                    historyIdx = historyIdx + 1;
+                    inputLine = history[historyIdx];
+                } else {
+                    # Restore saved input
+                    historyIdx = -1;
+                    inputLine = savedInput;
+                }
+                inputCursor = inputLine.length;
+            }
+            return;
+        }
+
+        # Arrow Left
+        if (event.scancode == 75) {
+            if (inputCursor > 0) inputCursor--;
+            return;
+        }
+
+        # Arrow Right
+        if (event.scancode == 77) {
+            if (inputCursor < inputLine.length) inputCursor++;
+            return;
+        }
+
+        # Home
+        if (event.scancode == 71) {
+            inputCursor = 0;
+            return;
+        }
+
+        # End
+        if (event.scancode == 79) {
+            inputCursor = inputLine.length;
+            return;
+        }
+
+        # Page Up — scroll up
+        if (event.scancode == 73) {
+            scrollOffset += 10;
+            int maxScroll = lines.length;
+            if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+            return;
+        }
+
+        # Page Down — scroll down
+        if (event.scancode == 81) {
+            scrollOffset -= 10;
+            if (scrollOffset < 0) scrollOffset = 0;
+            return;
+        }
+
+        # Tab — path completion
+        if (event.scancode == 15) {
+            tabComplete();
+            return;
+        }
+
+        # Ctrl+T — cycle color theme
+        if (event.ctrl && event.ascii == 't') {
+            termTheme = termTheme + 1;
+            if (termTheme >= TERM_THEME_COUNT) {
+                termTheme = 0;
+            }
+            applyTheme();
+            string themeName = getThemeName();
+            lines.add("  Theme: " + themeName);
+            return;
+        }
+
+        # Ctrl+L — clear
+        if (event.ctrl && event.ascii == 'l') {
+            lines.clear();
+            scrollOffset = 0;
+            return;
+        }
+
+        # Ctrl+C — cancel current input
+        if (event.ctrl && event.ascii == 'c') {
+            lines.add(getPrompt() + inputLine + "^C");
+            inputLine = "";
+            inputCursor = 0;
+            return;
+        }
+
+        # Regular character
+        if (event.ascii >= 32 && event.ascii < 127) {
+            string ch = (string) event.ascii;
+            inputLine = inputLine.substring(0, inputCursor) + ch + inputLine.substring(inputCursor, inputLine.length);
+            inputCursor++;
+            return;
+        }
+    }
+
+    # Process a mouse click in the content area
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+        int rows = contentH / charH;
+        if (rows < 2) return;
+
+        # Click on the input line row — position cursor
+        int inputRowY = (rows - 1) * charH;
+        if (relY >= inputRowY) {
+            string prompt = getPrompt();
+            int promptPixelW = prompt.length * charW + 4;
+            int clickCol = (relX - promptPixelW) / charW;
+            if (clickCol < 0) clickCol = 0;
+            if (clickCol > inputLine.length) clickCol = inputLine.length;
+            inputCursor = clickCol;
+            needsRedraw = true;
+        }
+    }
+
+    # Draw the terminal contents into a window's content area
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = TextRender.getCharWidth();
+        int charH = TextRender.getCharHeight();
+        int cols = w / charW;
+        int rows = h / charH;
+        if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
+        if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
+        if (rows < 2) return;
+
+        # Fill background
+        Framebuffer.fillRect(x, y, w, h, TERM_BG);
+
+        # Calculate visible lines
+        int displayRows = rows - 1;  # Reserve last row for input
+        int totalLines = lines.length;
+        int startLine = totalLines - displayRows - scrollOffset;
+        if (startLine < 0) startLine = 0;
+
+        # Draw output lines
+        for (int i = 0; i < displayRows; i++) {
+            int lineIdx = startLine + i;
+            if (lineIdx >= 0 && lineIdx < totalLines) {
+                string line = lines[lineIdx];
+                # Truncate to window width
+                if (line.length > cols) {
+                    line = line.substring(0, cols);
+                }
+                int py = y + i * charH;
+                TextRender.drawString(line, x + 4, py, TERM_FG, TERM_BG);
+            }
+        }
+
+        # Draw input line (prompt + current input)
+        int inputY = y + displayRows * charH;
+        string prompt = getPrompt();
+        string fullInput = prompt + inputLine;
+        if (fullInput.length > cols) {
+            fullInput = fullInput.substring(0, cols);
+        }
+
+        # Draw prompt in prompt color
+        TextRender.drawString(prompt, x + 4, inputY, TERM_PROMPT, TERM_BG);
+
+        # Draw input text in default color
+        int inputStartX = x + 4 + prompt.length * charW;
+        TextRender.drawString(inputLine, inputStartX, inputY, TERM_FG, TERM_BG);
+
+        # Draw cursor (blinking block)
+        int cursorPixelX = inputStartX + inputCursor * charW;
+        Framebuffer.fillRect(cursorPixelX, inputY, charW, charH, TERM_CURSOR);
+
+        # Draw character under cursor in inverse
+        if (inputCursor < inputLine.length) {
+            char cursorChar = inputLine.charAt(inputCursor);
+            TextRender.drawChar(cursorChar, cursorPixelX, inputY, TERM_BG, TERM_CURSOR);
+        }
+
+        needsRedraw = false;
+    }
+
+    # ========================================================================
+    # Internal helpers
+    # ========================================================================
+
+    # Apply the current color theme to terminal color variables
+    private static func applyTheme() -> void {
+        switch (termTheme) {
+            case 0:
+                # GitHub Dark
+                TERM_BG     = 0x0D1117FF;
+                TERM_FG     = 0xC9D1D9FF;
+                TERM_PROMPT = 0x58A6FFFF;
+                TERM_DIR    = 0x7EE787FF;
+                TERM_CURSOR = 0xFFFFFFFF;
+                break;
+            case 1:
+                # Light
+                TERM_BG     = 0xF6F8FAFF;
+                TERM_FG     = 0x24292EFF;
+                TERM_PROMPT = 0x0366D6FF;
+                TERM_DIR    = 0x22863AFF;
+                TERM_CURSOR = 0x24292EFF;
+                break;
+            case 2:
+                # Solarized Dark
+                TERM_BG     = 0x002B36FF;
+                TERM_FG     = 0x839496FF;
+                TERM_PROMPT = 0x268BD2FF;
+                TERM_DIR    = 0x859900FF;
+                TERM_CURSOR = 0x93A1A1FF;
+                break;
+            case 3:
+                # Dracula
+                TERM_BG     = 0x282A36FF;
+                TERM_FG     = 0xF8F8F2FF;
+                TERM_PROMPT = 0xBD93F9FF;
+                TERM_DIR    = 0x50FA7BFF;
+                TERM_CURSOR = 0xF8F8F2FF;
+                break;
+            case 4:
+                # Nord
+                TERM_BG     = 0x2E3440FF;
+                TERM_FG     = 0xD8DEE9FF;
+                TERM_PROMPT = 0x88C0D0FF;
+                TERM_DIR    = 0xA3BE8CFF;
+                TERM_CURSOR = 0xECEFF4FF;
+                break;
+            case 5:
+                # Matrix
+                TERM_BG     = 0x000000FF;
+                TERM_FG     = 0x00FF00FF;
+                TERM_PROMPT = 0x00CC00FF;
+                TERM_DIR    = 0x33FF33FF;
+                TERM_CURSOR = 0x00FF00FF;
+                break;
+            default:
+                break;
+        }
+    }
+
+    # Get the human-readable name for the current theme
+    private static func getThemeName() -> string {
+        switch (termTheme) {
+            case 0: return "GitHub Dark";
+            case 1: return "Light";
+            case 2: return "Solarized Dark";
+            case 3: return "Dracula";
+            case 4: return "Nord";
+            case 5: return "Matrix";
+            default: return "Unknown";
+        }
+    }
+
+    # Build the shell prompt string
+    private static func getPrompt() -> string {
+        string user = Shell.getEnv("USER");
+        string host = Shell.getEnv("HOSTNAME");
+        string dir = Shell.getCurrentDir();
+
+        # Shorten home directory
+        string home = Shell.getEnv("HOME");
+        if (dir.startsWith(home)) {
+            dir = "~" + dir.substring(home.length, dir.length);
+        }
+
+        return user + "@" + host + " " + dir + " $ ";
+    }
+
+    # Append multi-line output text to the line buffer
+    # Tab completion for paths
+    private static func tabComplete() -> void {
+        # Extract the last "word" from inputLine (after last space)
+        string partial = inputLine;
+        string prefix = "";
+        int lastSpace = -1;
+        for (int i = inputLine.length - 1; i >= 0; i--) {
+            if (inputLine.charAt(i) == ' ') {
+                lastSpace = i;
+                break;
+            }
+        }
+        if (lastSpace >= 0) {
+            prefix = inputLine.substring(0, lastSpace + 1);
+            partial = inputLine.substring(lastSpace + 1, inputLine.length);
+        }
+
+        if (partial.length == 0) return;
+
+        # Split partial into directory path and filename prefix
+        string dirPath = Shell.getCurrentDir();
+        string filePrefix = partial;
+
+        int lastSlash = -1;
+        for (int i = partial.length - 1; i >= 0; i--) {
+            if (partial.charAt(i) == '/') {
+                lastSlash = i;
+                break;
+            }
+        }
+        if (lastSlash >= 0) {
+            string pathPart = partial.substring(0, lastSlash);
+            filePrefix = partial.substring(lastSlash + 1, partial.length);
+            if (pathPart.charAt(0) == '/') {
+                dirPath = pathPart;
+            } else {
+                if (dirPath == "/") {
+                    dirPath = "/" + pathPart;
+                } else {
+                    dirPath = dirPath + "/" + pathPart;
+                }
+            }
+        }
+
+        # List directory and find matches
+        list<FileInfo> entries = VFS.listDir(dirPath);
+        string match = "";
+        int matchCount = 0;
+        for (int i = 0; i < entries.length; i++) {
+            if (entries[i].name.startsWith(filePrefix)) {
+                match = entries[i].name;
+                matchCount = matchCount + 1;
+            }
+        }
+
+        if (matchCount == 1) {
+            # Single match — complete it
+            string completed = "";
+            if (lastSlash >= 0) {
+                completed = partial.substring(0, lastSlash + 1) + match;
+            } else {
+                completed = match;
+            }
+            # Check if it's a directory — add trailing slash
+            string fullMatch = dirPath;
+            if (dirPath == "/") {
+                fullMatch = "/" + match;
+            } else {
+                fullMatch = dirPath + "/" + match;
+            }
+            if (VFS.isDirectory(fullMatch)) {
+                completed = completed + "/";
+            }
+            inputLine = prefix + completed;
+            inputCursor = inputLine.length;
+        } elif (matchCount > 1) {
+            # Multiple matches — show them
+            lines.add(getPrompt() + inputLine);
+            string listing = "";
+            for (int i = 0; i < entries.length; i++) {
+                if (entries[i].name.startsWith(filePrefix)) {
+                    if (listing.length > 0) {
+                        listing = listing + "  ";
+                    }
+                    listing = listing + entries[i].name;
+                }
+            }
+            lines.add(listing);
+        }
+    }
+
+    private static func appendOutput(string output) -> void {
+        if (output.length == 0) return;
+
+        # Split on newlines
+        string current = "";
+        for (int i = 0; i < output.length; i++) {
+            char c = output.charAt(i);
+            if (c == '\n') {
+                lines.add(current);
+                current = "";
+            } else {
+                current += (string) c;
+            }
+        }
+        # Add remaining text if any
+        if (current.length > 0) {
+            lines.add(current);
+        }
+    }
+
+    # Trim line buffer to max history
+    private static func trimLines() -> void {
+        while (lines.length > TERM_MAX_LINES) {
+            lines.removeAt(0);
+        }
+    }
+
+    # Check if terminal needs redrawing
+    public static func isDirty() -> bool {
+        return needsRedraw;
+    }
+
+    # Get the current directory (for shell integration) 
+    public static func getCurrentDir() -> string {
+        return Shell.getCurrentDir();
+    }
+}

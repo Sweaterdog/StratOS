@@ -1,0 +1,1121 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Text Editor — Minimal text editing for StratOS
+// apps/editor/editor.lx
+//
+// Features:
+//   - Multi-line text editing with cursor navigation
+//   - Line numbers and gutter
+//   - File open/save via VFS
+//   - Command mode (Ctrl+S save, Ctrl+N new, Ctrl+G goto)
+//   - Auto-indent on Enter
+//   - Status bar with file info
+//   - Mouse click to position cursor
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/keyboard.lx";
+import "kernel/drivers/timer.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+import "system/fs/vfs.lx";
+
+# Editor state
+list<string> editorLines = [];
+int edCursorRow = 0;
+int edCursorCol = 0;
+int edScrollY = 0;
+int edScrollX = 0;
+string edCurrentFile = "";
+bool edModified = false;
+bool edDirty = true;
+
+# Undo system
+# Type: 0 = single line edit, 1 = line was inserted, 2 = line was removed/merged
+struct EditorUndoEntry {
+    int undoType;
+    int row;
+    string oldContent;
+    string oldContent2;
+    int oldCurRow;
+    int oldCurCol;
+}
+list<EditorUndoEntry> edUndoStack;
+int ED_MAX_UNDO = 50;
+
+# Command bar state
+bool edCmdMode = false;
+string edCmdBuffer = "";
+string edStatusMsg = "";
+int edStatusTimer = 0;
+
+# Find state
+bool edFindMode = false;
+string edFindQuery = "";
+int edFindMatchRow = -1;
+int edFindMatchCol = -1;
+int edFindStartRow = 0;   # Where to start searching from
+
+# Layout
+int ED_GUTTER_W    = 40;
+int ED_STATUSBAR_H = 20;
+int ED_CHAR_W      = 8;
+int ED_CHAR_H      = 16;
+int ED_MENUBAR_H   = 24;
+
+# Menu bar state
+int edMenuOpen = -1;    # -1 = none, 0 = File, 1 = Edit, 2 = View
+int ED_MENU_FILE_ITEMS = 5;   # New, Open, Save, Save As, Close
+int ED_MENU_EDIT_ITEMS = 4;   # Undo, Find, Go to Line, Select All (placeholder)
+int ED_MENU_VIEW_ITEMS = 2;   # Toggle Line Numbers (placeholder), Word Wrap (placeholder)
+int ED_MENU_ITEM_W = 180;
+int ED_MENU_ITEM_H = 24;
+
+export class EditorApp {
+    # Initialize the editor
+    public static func init() -> void {
+        editorLines.clear();
+        editorLines.add("");
+        edUndoStack.clear();
+        edCursorRow = 0;
+        edCursorCol = 0;
+        edScrollY = 0;
+        edScrollX = 0;
+        edCurrentFile = "";
+        edModified = false;
+        edDirty = true;
+        edCmdMode = false;
+        edCmdBuffer = "";
+        edStatusMsg = "New file — Ctrl+S to save, Ctrl+O to open";
+        edStatusTimer = 300;
+    }
+
+    # Process a keyboard event from the compositor
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+        edDirty = true;
+
+        # Close menu dropdown on any key (including Escape)
+        if (edMenuOpen >= 0) {
+            edMenuOpen = -1;
+            if (event.scancode == 1) return;  # Escape just closes menu
+        }
+
+        # Command mode input
+        if (edCmdMode) {
+            handleCmdInput(event);
+            return;
+        }
+
+        # Find mode input
+        if (edFindMode) {
+            handleFindInput(event);
+            return;
+        }
+
+        # Ctrl shortcuts
+        if (event.ctrl) {
+            if (event.ascii == 's') {
+                saveFile();
+                return;
+            }
+            if (event.ascii == 'n') {
+                init();
+                return;
+            }
+            if (event.ascii == 'o') {
+                edCmdMode = true;
+                edCmdBuffer = "open ";
+                return;
+            }
+            if (event.ascii == 'g') {
+                edCmdMode = true;
+                edCmdBuffer = "goto ";
+                return;
+            }
+            if (event.ascii == 'f') {
+                edFindMode = true;
+                edFindQuery = "";
+                edFindMatchRow = -1;
+                edFindMatchCol = -1;
+                edFindStartRow = edCursorRow;
+                return;
+            }
+            if (event.ascii == 'l') {
+                # Ctrl+L — clear status
+                edStatusMsg = "";
+                return;
+            }
+            if (event.ascii == 'z') {
+                # Ctrl+Z — undo
+                performUndo();
+                return;
+            }
+            return;
+        }
+
+        # Navigation keys
+        if (event.scancode == KEY_UP) {
+            moveCursor(0, -1);
+            return;
+        }
+        if (event.scancode == KEY_DOWN) {
+            moveCursor(0, 1);
+            return;
+        }
+        if (event.scancode == KEY_LEFT) {
+            moveCursor(-1, 0);
+            return;
+        }
+        if (event.scancode == KEY_RIGHT) {
+            moveCursor(1, 0);
+            return;
+        }
+        if (event.scancode == 71) {
+            # Home
+            edCursorCol = 0;
+            return;
+        }
+        if (event.scancode == 79) {
+            # End
+            edCursorCol = editorLines[edCursorRow].length;
+            return;
+        }
+        if (event.scancode == 73) {
+            # Page Up
+            moveCursor(0, -20);
+            return;
+        }
+        if (event.scancode == 81) {
+            # Page Down
+            moveCursor(0, 20);
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            handleBackspace();
+            return;
+        }
+
+        # Delete
+        if (event.scancode == 83) {
+            handleDelete();
+            return;
+        }
+
+        # Enter
+        if (event.scancode == 28) {
+            handleEnter();
+            return;
+        }
+
+        # Tab — insert 4 spaces
+        if (event.scancode == 15) {
+            insertText("    ");
+            return;
+        }
+
+        # Regular printable character
+        if (event.ascii >= 32 && event.ascii < 127) {
+            insertChar(event.ascii);
+            return;
+        }
+    }
+
+    # Process a mouse click in the content area
+    public static func processClick(int relX, int relY, int contentW, int contentH) -> void {
+        edDirty = true;
+
+        # ── Menu bar click ──────────────────────────────────────────────
+        if (relY < ED_MENUBAR_H) {
+            if (relX >= 8 && relX < 48) {
+                # "File" label area
+                if (edMenuOpen == 0) {
+                    edMenuOpen = -1;
+                } else {
+                    edMenuOpen = 0;
+                }
+            } elif (relX >= 48 && relX < 96) {
+                # "Edit" label area
+                if (edMenuOpen == 1) {
+                    edMenuOpen = -1;
+                } else {
+                    edMenuOpen = 1;
+                }
+            } elif (relX >= 96 && relX < 148) {
+                # "View" label area
+                if (edMenuOpen == 2) {
+                    edMenuOpen = -1;
+                } else {
+                    edMenuOpen = 2;
+                }
+            } else {
+                edMenuOpen = -1;
+            }
+            return;
+        }
+
+        # ── Dropdown menu click ─────────────────────────────────────────
+        if (edMenuOpen >= 0) {
+            int dropX = 8;
+            if (edMenuOpen == 1) dropX = 52;
+            if (edMenuOpen == 2) dropX = 100;
+
+            int dropItems = ED_MENU_FILE_ITEMS;
+            if (edMenuOpen == 1) dropItems = ED_MENU_EDIT_ITEMS;
+            if (edMenuOpen == 2) dropItems = ED_MENU_VIEW_ITEMS;
+
+            int dropH = dropItems * ED_MENU_ITEM_H;
+            int dropY = ED_MENUBAR_H;
+
+            if (relX >= dropX && relX < dropX + ED_MENU_ITEM_W &&
+                relY >= dropY && relY < dropY + dropH) {
+                int clickedItem = (relY - dropY) / ED_MENU_ITEM_H;
+                handleMenuAction(edMenuOpen, clickedItem);
+            }
+            edMenuOpen = -1;
+            return;
+        }
+
+        # Don't handle clicks in status bar
+        if (relY >= contentH - ED_STATUSBAR_H) return;
+
+        # Compute clicked row/col from content coordinates (offset by menu bar)
+        int edRelY = relY - ED_MENUBAR_H;
+        int clickRow = edRelY / ED_CHAR_H + edScrollY;
+        int clickCol = (relX - ED_GUTTER_W) / ED_CHAR_W + edScrollX;
+
+        if (clickCol < 0) clickCol = 0;
+        if (clickRow < 0) clickRow = 0;
+        if (clickRow >= editorLines.length) clickRow = editorLines.length - 1;
+        if (clickCol > editorLines[clickRow].length) clickCol = editorLines[clickRow].length;
+
+        edCursorRow = clickRow;
+        edCursorCol = clickCol;
+    }
+
+    # Draw the editor UI
+    public static func draw(int x, int y, int w, int h) -> void {
+        int charW = ED_CHAR_W;
+        int charH = ED_CHAR_H;
+
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        # ── Menu bar ──────────────────────────────────────────────────────
+        Framebuffer.fillRect(x, y, w, ED_MENUBAR_H, 0x161B22FF);
+        Framebuffer.drawHLine(x, y + ED_MENUBAR_H - 1, w, 0x30363DFF);
+
+        # Menu labels
+        int mFileX = x + 12;
+        int mEditX = x + 56;
+        int mViewX = x + 104;
+        color32 mFileColor = 0xC9D1D9FF;
+        color32 mEditColor = 0xC9D1D9FF;
+        color32 mViewColor = 0xC9D1D9FF;
+        if (edMenuOpen == 0) mFileColor = Theme.textAccent;
+        if (edMenuOpen == 1) mEditColor = Theme.textAccent;
+        if (edMenuOpen == 2) mViewColor = Theme.textAccent;
+        TextRender.drawText("File", mFileX, y + 4, mFileColor);
+        TextRender.drawText("Edit", mEditX, y + 4, mEditColor);
+        TextRender.drawText("View", mViewX, y + 4, mViewColor);
+
+        # Content area starts below menu bar
+        int editorY = y + ED_MENUBAR_H;
+        int editorH = h - ED_MENUBAR_H;
+
+        int editH = editorH - ED_STATUSBAR_H;
+        int visibleLines = editH / charH;
+        int visibleCols = (w - ED_GUTTER_W) / charW;
+
+        # Ensure cursor is visible
+        ensureCursorVisible(visibleLines, visibleCols);
+
+        # Gutter (line numbers)
+        Framebuffer.fillRect(x, editorY, ED_GUTTER_W, editH, 0x0A0E1AFF);
+        Framebuffer.drawVLine(x + ED_GUTTER_W - 1, editorY, editH, 0x1A2332FF);
+
+        for (int i = 0; i < visibleLines; i++) {
+            int lineNum = edScrollY + i;
+            if (lineNum >= editorLines.length) break;
+
+            int lineY = editorY + i * charH;
+
+            # Highlight current line
+            if (lineNum == edCursorRow) {
+                Framebuffer.fillRect(x + ED_GUTTER_W, lineY, w - ED_GUTTER_W, charH, 0x1A2332FF);
+            }
+
+            # Line number
+            color32 numColor = 0x4A5568FF;
+            if (lineNum == edCursorRow) {
+                numColor = 0xC8D0E0FF;
+            }
+            string numStr = "${lineNum + 1}";
+            int numX = x + ED_GUTTER_W - 8 - numStr.length * charW;
+            TextRender.drawText(numStr, numX, lineY, numColor);
+
+            # Line content with syntax highlighting
+            string line = editorLines[lineNum];
+            int textX = x + ED_GUTTER_W + 4;
+            
+            # Show the visible portion of the line with highlighting
+            if (edScrollX < line.length) {
+                int endCol = edScrollX + visibleCols;
+                if (endCol > line.length) endCol = line.length;
+                drawSyntaxLine(line, edScrollX, endCol, textX, lineY);
+            }
+
+            # Highlight search match on this line
+            if (edFindMode && edFindMatchRow == lineNum && edFindMatchCol >= 0) {
+                int hlCol = edFindMatchCol - edScrollX;
+                if (hlCol >= 0 && hlCol + edFindQuery.length <= visibleCols) {
+                    int hlX = textX + hlCol * charW;
+                    Framebuffer.fillRect(hlX, lineY, edFindQuery.length * charW, charH, 0x58A6FF40);
+                }
+            }
+        }
+
+        # Draw cursor (blinking block)
+        if (edCursorRow >= edScrollY && edCursorRow < edScrollY + visibleLines) {
+            int cursorDisplayRow = edCursorRow - edScrollY;
+            int cursorDisplayCol = edCursorCol - edScrollX;
+
+            if (cursorDisplayCol >= 0 && cursorDisplayCol < visibleCols) {
+                int cx = x + ED_GUTTER_W + 4 + cursorDisplayCol * charW;
+                int cy = editorY + cursorDisplayRow * charH;
+
+                # Blink every 500ms
+                int blink = (Timer.getTicks() / 50) % 2;
+                if (blink == 0) {
+                    Framebuffer.fillRect(cx, cy, 2, charH, Theme.textAccent);
+                }
+            }
+        }
+
+        # Command bar (when in command mode)
+        if (edCmdMode) {
+            int cmdY = editorY + editH - charH;
+            Framebuffer.fillRect(x, cmdY, w, charH, 0x1A1A2EFF);
+            Framebuffer.drawRect(x, cmdY, w, charH, Theme.textAccent);
+            string cmdDisplay = ": " + edCmdBuffer;
+            TextRender.drawText(cmdDisplay, x + 4, cmdY + 2, 0xFFFFFFFF);
+        }
+
+        # Status bar
+        int statusY = y + h - ED_STATUSBAR_H;
+        Framebuffer.fillRect(x, statusY, w, ED_STATUSBAR_H, 0x101824FF);
+        Framebuffer.drawHLine(x, statusY, w, 0x1A2332FF);
+
+        # Left: filename + modified indicator
+        string fileLabel = "untitled";
+        if (edCurrentFile != "") {
+            fileLabel = edCurrentFile;
+        }
+        if (edModified) fileLabel = fileLabel + " [modified]";
+        TextRender.drawText(fileLabel, x + 8, statusY + 2, 0x8B949EFF);
+
+        # Right: cursor position
+        string posStr = "Ln ${edCursorRow + 1}, Col ${edCursorCol + 1}";
+        int posW = posStr.length * charW;
+        TextRender.drawText(posStr, x + w - posW - 8, statusY + 2, 0x8B949EFF);
+
+        # Status message (temporary)
+        if (edStatusMsg != "" && edStatusTimer > 0) {
+            edStatusTimer = edStatusTimer - 1;
+            int msgW = edStatusMsg.length * charW;
+            int msgX = x + w / 2 - msgW / 2;
+            TextRender.drawText(edStatusMsg, msgX, statusY + 2, Theme.textAccent);
+        }
+
+        # Find bar (drawn above status bar when active)
+        if (edFindMode) {
+            int findBarY = statusY - 24;
+            Framebuffer.fillRect(x, findBarY, w, 24, 0x1A2332FF);
+            Framebuffer.drawHLine(x, findBarY, w, 0x30363DFF);
+            TextRender.drawText("Find: ", x + 8, findBarY + 4, 0x8B949EFF);
+            Framebuffer.fillRect(x + 56, findBarY + 2, w - 120, 20, 0x0D1117FF);
+            TextRender.drawText(edFindQuery + "_", x + 60, findBarY + 4, 0xE6EDF3FF);
+            TextRender.drawText("Enter=Next  Esc=Close", x + w - 176, findBarY + 4, 0x484F58FF);
+        }
+
+        # ── Dropdown menu overlay ─────────────────────────────────────────
+        if (edMenuOpen >= 0) {
+            int dropX = x + 8;
+            if (edMenuOpen == 1) dropX = x + 52;
+            if (edMenuOpen == 2) dropX = x + 100;
+
+            int dropItems = ED_MENU_FILE_ITEMS;
+            if (edMenuOpen == 1) dropItems = ED_MENU_EDIT_ITEMS;
+            if (edMenuOpen == 2) dropItems = ED_MENU_VIEW_ITEMS;
+
+            int dropH = dropItems * ED_MENU_ITEM_H;
+            int dropY = y + ED_MENUBAR_H;
+
+            # Shadow
+            Framebuffer.fillRect(dropX + 3, dropY + 3, ED_MENU_ITEM_W, dropH, 0x00000060);
+            # Background
+            Framebuffer.fillRect(dropX, dropY, ED_MENU_ITEM_W, dropH, 0x21262DFF);
+            Framebuffer.drawRect(dropX, dropY, ED_MENU_ITEM_W, dropH, 0x30363DFF);
+
+            for (int mi = 0; mi < dropItems; mi++) {
+                int miy = dropY + mi * ED_MENU_ITEM_H;
+                string miLabel = "";
+                string miShort = "";
+
+                if (edMenuOpen == 0) {
+                    # File menu
+                    if (mi == 0) { miLabel = "New";       miShort = "Ctrl+N"; }
+                    if (mi == 1) { miLabel = "Open...";   miShort = "Ctrl+O"; }
+                    if (mi == 2) { miLabel = "Save";      miShort = "Ctrl+S"; }
+                    if (mi == 3) { miLabel = "Save As..."; miShort = ""; }
+                    if (mi == 4) { miLabel = "Close";     miShort = ""; }
+                } elif (edMenuOpen == 1) {
+                    # Edit menu
+                    if (mi == 0) { miLabel = "Undo";      miShort = "Ctrl+Z"; }
+                    if (mi == 1) { miLabel = "Find...";   miShort = "Ctrl+F"; }
+                    if (mi == 2) { miLabel = "Go to Line"; miShort = "Ctrl+G"; }
+                    if (mi == 3) { miLabel = "Clear Status"; miShort = "Ctrl+L"; }
+                } elif (edMenuOpen == 2) {
+                    # View menu
+                    if (mi == 0) { miLabel = "Scroll Up";   miShort = "PgUp"; }
+                    if (mi == 1) { miLabel = "Scroll Down"; miShort = "PgDn"; }
+                }
+
+                # Separator between Save As and Close in file menu
+                if (edMenuOpen == 0 && mi == 4) {
+                    Framebuffer.drawHLine(dropX + 8, miy, ED_MENU_ITEM_W - 16, 0x30363DFF);
+                }
+
+                TextRender.drawText("  " + miLabel, dropX + 4, miy + 4, 0xC9D1D9FF);
+                if (miShort != "") {
+                    int shortW = miShort.length * charW;
+                    TextRender.drawText(miShort, dropX + ED_MENU_ITEM_W - shortW - 12, miy + 4, 0x6B7280FF);
+                }
+            }
+        }
+
+        edDirty = false;
+    }
+
+    # ========================================================================
+    # Internal — Undo system
+    # ========================================================================
+
+    # Push an undo entry before making an edit
+    # type 0 = single line edit, 1 = line about to be split (Enter), 2 = line about to be merged
+    private static func pushUndo(int undoType, int row, string content, string content2) -> void {
+        EditorUndoEntry entry = {
+            undoType: undoType,
+            row: row,
+            oldContent: content,
+            oldContent2: content2,
+            oldCurRow: edCursorRow,
+            oldCurCol: edCursorCol
+        };
+        edUndoStack.add(entry);
+        # Limit stack size
+        while (edUndoStack.length > ED_MAX_UNDO) {
+            edUndoStack.removeAt(0);
+        }
+    }
+
+    # Perform undo — restore previous state
+    private static func performUndo() -> void {
+        if (edUndoStack.length == 0) {
+            edStatusMsg = "Nothing to undo";
+            edStatusTimer = 150;
+            return;
+        }
+
+        int idx = edUndoStack.length - 1;
+        int uType = edUndoStack[idx].undoType;
+        int uRow = edUndoStack[idx].row;
+        string uContent = edUndoStack[idx].oldContent;
+        string uContent2 = edUndoStack[idx].oldContent2;
+        int uCurRow = edUndoStack[idx].oldCurRow;
+        int uCurCol = edUndoStack[idx].oldCurCol;
+        edUndoStack.removeAt(idx);
+
+        if (uType == 0) {
+            # Single line edit — restore line content
+            editorLines[uRow] = uContent;
+        } elif (uType == 1) {
+            # Enter was pressed (line was split) — merge back
+            # The split created row+1, so remove it and restore original line
+            editorLines[uRow] = uContent;
+            if (uRow + 1 < editorLines.length) {
+                editorLines.removeAt(uRow + 1);
+            }
+        } elif (uType == 2) {
+            # Lines were merged — restore both lines
+            editorLines[uRow] = uContent;
+            editorLines.insertAt(uRow + 1, uContent2);
+        }
+
+        # Restore cursor
+        edCursorRow = uCurRow;
+        edCursorCol = uCurCol;
+        edModified = true;
+        edDirty = true;
+        edStatusMsg = "Undo";
+        edStatusTimer = 80;
+    }
+
+    # ========================================================================
+    # Internal — Editing operations
+    # ========================================================================
+
+    private static func insertChar(char c) -> void {
+        pushUndo(0, edCursorRow, editorLines[edCursorRow], "");
+        string line = editorLines[edCursorRow];
+        string before = line.substring(0, edCursorCol);
+        string after = line.substring(edCursorCol, line.length);
+        editorLines[edCursorRow] = before + (string) c + after;
+        edCursorCol = edCursorCol + 1;
+        edModified = true;
+    }
+
+    private static func insertText(string text) -> void {
+        for (int i = 0; i < text.length; i++) {
+            insertChar(text.charAt(i));
+        }
+    }
+
+    private static func handleBackspace() -> void {
+        if (edCursorCol > 0) {
+            pushUndo(0, edCursorRow, editorLines[edCursorRow], "");
+            string line = editorLines[edCursorRow];
+            editorLines[edCursorRow] = line.substring(0, edCursorCol - 1) + line.substring(edCursorCol, line.length);
+            edCursorCol = edCursorCol - 1;
+            edModified = true;
+        } elif (edCursorRow > 0) {
+            # Merge with previous line — save both lines
+            pushUndo(2, edCursorRow - 1, editorLines[edCursorRow - 1], editorLines[edCursorRow]);
+            edCursorCol = editorLines[edCursorRow - 1].length;
+            editorLines[edCursorRow - 1] = editorLines[edCursorRow - 1] + editorLines[edCursorRow];
+            editorLines.removeAt(edCursorRow);
+            edCursorRow = edCursorRow - 1;
+            edModified = true;
+        }
+    }
+
+    private static func handleDelete() -> void {
+        string line = editorLines[edCursorRow];
+        if (edCursorCol < line.length) {
+            pushUndo(0, edCursorRow, editorLines[edCursorRow], "");
+            editorLines[edCursorRow] = line.substring(0, edCursorCol) + line.substring(edCursorCol + 1, line.length);
+            edModified = true;
+        } elif (edCursorRow < editorLines.length - 1) {
+            pushUndo(2, edCursorRow, editorLines[edCursorRow], editorLines[edCursorRow + 1]);
+            editorLines[edCursorRow] = editorLines[edCursorRow] + editorLines[edCursorRow + 1];
+            editorLines.removeAt(edCursorRow + 1);
+            edModified = true;
+        }
+    }
+
+    private static func handleEnter() -> void {
+        pushUndo(1, edCursorRow, editorLines[edCursorRow], "");
+        string line = editorLines[edCursorRow];
+        string before = line.substring(0, edCursorCol);
+        string after = line.substring(edCursorCol, line.length);
+
+        # Auto-indent: copy leading whitespace
+        string indent = "";
+        for (int i = 0; i < before.length; i++) {
+            if (before.charAt(i) == ' ') {
+                indent = indent + " ";
+            } else {
+                break;
+            }
+        }
+
+        editorLines[edCursorRow] = before;
+        editorLines.insertAt(edCursorRow + 1, indent + after);
+        edCursorRow = edCursorRow + 1;
+        edCursorCol = indent.length;
+        edModified = true;
+    }
+
+    private static func moveCursor(int dx, int dy) -> void {
+        edCursorRow = edCursorRow + dy;
+        if (edCursorRow < 0) edCursorRow = 0;
+        if (edCursorRow >= editorLines.length) edCursorRow = editorLines.length - 1;
+
+        edCursorCol = edCursorCol + dx;
+        if (edCursorCol < 0) {
+            if (edCursorRow > 0) {
+                edCursorRow = edCursorRow - 1;
+                edCursorCol = editorLines[edCursorRow].length;
+            } else {
+                edCursorCol = 0;
+            }
+        }
+        if (edCursorCol > editorLines[edCursorRow].length) {
+            if (edCursorRow < editorLines.length - 1) {
+                edCursorRow = edCursorRow + 1;
+                edCursorCol = 0;
+            } else {
+                edCursorCol = editorLines[edCursorRow].length;
+            }
+        }
+    }
+
+    private static func ensureCursorVisible(int visibleLines, int visibleCols) -> void {
+        if (edCursorRow < edScrollY) {
+            edScrollY = edCursorRow;
+        }
+        if (edCursorRow >= edScrollY + visibleLines) {
+            edScrollY = edCursorRow - visibleLines + 1;
+        }
+        if (edCursorCol < edScrollX) {
+            edScrollX = edCursorCol;
+        }
+        if (edCursorCol >= edScrollX + visibleCols) {
+            edScrollX = edCursorCol - visibleCols + 1;
+        }
+    }
+
+    # ========================================================================
+    # Internal — File I/O
+    # ========================================================================
+
+    public static func openFile(string path) -> void {
+        string content = VFS.read(path);
+        editorLines.clear();
+
+        # Split content by newlines
+        string current = "";
+        for (int i = 0; i < content.length; i++) {
+            char c = content.charAt(i);
+            if (c == '\n') {
+                editorLines.add(current);
+                current = "";
+            } else {
+                current = current + (string) c;
+            }
+        }
+        editorLines.add(current);  # Add last line
+
+        if (editorLines.length == 0) {
+            editorLines.add("");
+        }
+
+        edCurrentFile = path;
+        edCursorRow = 0;
+        edCursorCol = 0;
+        edScrollY = 0;
+        edScrollX = 0;
+        edModified = false;
+        edStatusMsg = "Opened: " + path;
+        edStatusTimer = 200;
+    }
+
+    private static func saveFile() -> void {
+        if (edCurrentFile == "") {
+            edCmdMode = true;
+            edCmdBuffer = "save ";
+            return;
+        }
+
+        string content = "";
+        for (int i = 0; i < editorLines.length; i++) {
+            content = content + editorLines[i];
+            if (i < editorLines.length - 1) {
+                content = content + "\n";
+            }
+        }
+
+        VFS.write(edCurrentFile, content);
+        edModified = false;
+        edStatusMsg = "Saved: " + edCurrentFile;
+        edStatusTimer = 200;
+    }
+
+    # ========================================================================
+    # Internal — Command mode
+    # ========================================================================
+
+    private static func handleCmdInput(KeyEvent event) -> void {
+        # Escape — cancel
+        if (event.scancode == 1) {
+            edCmdMode = false;
+            edCmdBuffer = "";
+            return;
+        }
+
+        # Enter — execute command
+        if (event.scancode == 28) {
+            executeCmd(edCmdBuffer);
+            edCmdMode = false;
+            edCmdBuffer = "";
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            if (edCmdBuffer.length > 0) {
+                edCmdBuffer = edCmdBuffer.substring(0, edCmdBuffer.length - 1);
+            }
+            return;
+        }
+
+        # Printable character
+        if (event.ascii >= 32 && event.ascii < 127) {
+            edCmdBuffer = edCmdBuffer + (string) event.ascii;
+        }
+    }
+
+    private static func executeCmd(string cmd) -> void {
+        if (cmd.startsWith("open ")) {
+            string path = cmd.substring(5, cmd.length);
+            openFile(path);
+        } elif (cmd.startsWith("save ")) {
+            string path = cmd.substring(5, cmd.length);
+            edCurrentFile = path;
+            saveFile();
+        } elif (cmd.startsWith("goto ")) {
+            string lineStr = cmd.substring(5, cmd.length);
+            int targetLine = parseInt(lineStr);
+            if (targetLine > 0 && targetLine <= editorLines.length) {
+                edCursorRow = targetLine - 1;
+                edCursorCol = 0;
+            }
+        } elif (cmd == "save" || cmd == "w") {
+            saveFile();
+        } elif (cmd == "new" || cmd == "n") {
+            init();
+        }
+    }
+
+    # ========================================================================
+    # Internal — Menu bar actions
+    # ========================================================================
+
+    private static func handleMenuAction(int menu, int item) -> void {
+        if (menu == 0) {
+            # File menu
+            if (item == 0) {
+                # New
+                init();
+            } elif (item == 1) {
+                # Open — enter command mode with "open " prefix
+                edCmdMode = true;
+                edCmdBuffer = "open ";
+            } elif (item == 2) {
+                # Save
+                saveFile();
+            } elif (item == 3) {
+                # Save As — enter command mode with "save " prefix
+                edCmdMode = true;
+                edCmdBuffer = "save ";
+            } elif (item == 4) {
+                # Close — reset to empty file
+                init();
+            }
+        } elif (menu == 1) {
+            # Edit menu
+            if (item == 0) {
+                # Undo
+                performUndo();
+            } elif (item == 1) {
+                # Find
+                edFindMode = true;
+                edFindQuery = "";
+                edFindMatchRow = -1;
+                edFindMatchCol = -1;
+                edFindStartRow = edCursorRow;
+            } elif (item == 2) {
+                # Go to Line
+                edCmdMode = true;
+                edCmdBuffer = "goto ";
+            } elif (item == 3) {
+                # Clear Status
+                edStatusMsg = "";
+            }
+        } elif (menu == 2) {
+            # View menu
+            if (item == 0) {
+                # Scroll Up
+                moveCursor(0, -20);
+            } elif (item == 1) {
+                # Scroll Down
+                moveCursor(0, 20);
+            }
+        }
+        edDirty = true;
+    }
+
+    # ========================================================================
+    # Internal — Syntax highlighting
+    # ========================================================================
+
+    # Syntax colors
+    static color32 SYN_DEFAULT  = 0xE2E8F0FF;   # Normal text
+    static color32 SYN_KEYWORD  = 0xFFA657FF;   # Keywords (orange)
+    static color32 SYN_TYPE     = 0x79C0FFFF;   # Types (light blue)
+    static color32 SYN_STRING   = 0xA5D6FFFF;   # String literals (sky blue)
+    static color32 SYN_NUMBER   = 0xD2A8FFFF;   # Numbers (purple)
+    static color32 SYN_COMMENT  = 0x6B7280FF;   # Comments (gray)
+    static color32 SYN_FUNC     = 0x7EE787FF;   # Function names (green)
+    static color32 SYN_OPERATOR = 0xFF7B72FF;   # Operators (red)
+
+    private static func drawSyntaxLine(string line, int startCol, int endCol, int px, int py) -> void {
+        int charW = ED_CHAR_W;
+
+        # Quick check: is this a comment line?
+        bool inComment = false;
+        int commentStart = line.length;
+        for (int i = 0; i < line.length; i++) {
+            char c = line.charAt(i);
+            if (c == '#') {
+                commentStart = i;
+                break;
+            }
+            if (c == '/' && i + 1 < line.length && line.charAt(i + 1) == '/') {
+                commentStart = i;
+                break;
+            }
+            if (c == '"') {
+                # Skip past string to avoid false comment detection
+                i = i + 1;
+                while (i < line.length && line.charAt(i) != '"') {
+                    i = i + 1;
+                }
+            }
+        }
+
+        # Render each character in the visible range
+        bool inString = false;
+        # Determine if we're inside a string at startCol by scanning from beginning
+        for (int i = 0; i < startCol; i++) {
+            if (i >= commentStart) break;
+            if (line.charAt(i) == '"') {
+                inString = !inString;
+            }
+        }
+
+        int col = startCol;
+        while (col < endCol) {
+            char c = line.charAt(col);
+            int drawX = px + (col - startCol) * charW;
+
+            # Comment
+            if (col >= commentStart) {
+                TextRender.drawChar(c, drawX, py, SYN_COMMENT, 0x00000000);
+                col = col + 1;
+                continue;
+            }
+
+            # String literal
+            if (c == '"') {
+                TextRender.drawChar(c, drawX, py, SYN_STRING, 0x00000000);
+                inString = !inString;
+                col = col + 1;
+                continue;
+            }
+            if (inString) {
+                TextRender.drawChar(c, drawX, py, SYN_STRING, 0x00000000);
+                col = col + 1;
+                continue;
+            }
+
+            # Number
+            if (c >= '0' && c <= '9') {
+                TextRender.drawChar(c, drawX, py, SYN_NUMBER, 0x00000000);
+                col = col + 1;
+                continue;
+            }
+
+            # Operator characters
+            if (c == '+' || c == '-' || c == '*' || c == '/' || c == '=' || c == '<' || c == '>' || c == '!' || c == '&' || c == '|') {
+                TextRender.drawChar(c, drawX, py, SYN_OPERATOR, 0x00000000);
+                col = col + 1;
+                continue;
+            }
+
+            # Identifier / keyword — collect word
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+                int wordStart = col;
+                while (col < endCol && col < line.length) {
+                    char wc = line.charAt(col);
+                    if ((wc >= 'a' && wc <= 'z') || (wc >= 'A' && wc <= 'Z') || (wc >= '0' && wc <= '9') || wc == '_') {
+                        col = col + 1;
+                    } else {
+                        break;
+                    }
+                }
+                string word = line.substring(wordStart, col);
+
+                # Determine word color
+                color32 wordColor = SYN_DEFAULT;
+                if (isKeyword(word)) {
+                    wordColor = SYN_KEYWORD;
+                } elif (isTypeName(word)) {
+                    wordColor = SYN_TYPE;
+                } elif (col < line.length && line.charAt(col) == '(') {
+                    wordColor = SYN_FUNC;
+                }
+
+                # Draw each character of the word
+                for (int wi = wordStart; wi < col && wi < endCol; wi++) {
+                    int wx = px + (wi - startCol) * charW;
+                    TextRender.drawChar(line.charAt(wi), wx, py, wordColor, 0x00000000);
+                }
+                continue;
+            }
+
+            # Default character
+            TextRender.drawChar(c, drawX, py, SYN_DEFAULT, 0x00000000);
+            col = col + 1;
+        }
+    }
+
+    private static func isKeyword(string w) -> bool {
+        if (w == "if") return true;
+        if (w == "else") return true;
+        if (w == "elif") return true;
+        if (w == "for") return true;
+        if (w == "while") return true;
+        if (w == "return") return true;
+        if (w == "func") return true;
+        if (w == "class") return true;
+        if (w == "import") return true;
+        if (w == "export") return true;
+        if (w == "static") return true;
+        if (w == "public") return true;
+        if (w == "private") return true;
+        if (w == "switch") return true;
+        if (w == "case") return true;
+        if (w == "break") return true;
+        if (w == "default") return true;
+        if (w == "true") return true;
+        if (w == "false") return true;
+        if (w == "null") return true;
+        if (w == "new") return true;
+        if (w == "const") return true;
+        if (w == "continue") return true;
+        if (w == "unsafe") return true;
+        return false;
+    }
+
+    private static func isTypeName(string w) -> bool {
+        if (w == "int") return true;
+        if (w == "float") return true;
+        if (w == "double") return true;
+        if (w == "string") return true;
+        if (w == "bool") return true;
+        if (w == "char") return true;
+        if (w == "void") return true;
+        if (w == "long") return true;
+        if (w == "byte") return true;
+        if (w == "list") return true;
+        if (w == "color32") return true;
+        if (w == "FileInfo") return true;
+        if (w == "KeyEvent") return true;
+        return false;
+    }
+
+    private static func parseInt(string s) -> int {
+        int result = 0;
+        for (int i = 0; i < s.length; i++) {
+            char c = s.charAt(i);
+            if (c >= '0' && c <= '9') {
+                result = result * 10 + (int(c) - 48);
+            }
+        }
+        return result;
+    }
+
+    # ========================================================================
+    # Internal — Find mode
+    # ========================================================================
+
+    private static func handleFindInput(KeyEvent event) -> void {
+        # Escape — close find bar
+        if (event.scancode == 1) {
+            edFindMode = false;
+            edFindQuery = "";
+            edFindMatchRow = -1;
+            edFindMatchCol = -1;
+            return;
+        }
+
+        # Enter — find next occurrence
+        if (event.scancode == 28) {
+            if (edFindQuery.length > 0) {
+                findNext();
+            }
+            return;
+        }
+
+        # Backspace
+        if (event.scancode == 14) {
+            if (edFindQuery.length > 0) {
+                edFindQuery = edFindQuery.substring(0, edFindQuery.length - 1);
+                if (edFindQuery.length > 0) {
+                    edFindStartRow = edCursorRow;
+                    findNext();
+                } else {
+                    edFindMatchRow = -1;
+                    edFindMatchCol = -1;
+                }
+            }
+            return;
+        }
+
+        # Printable character
+        if (event.ascii >= 32 && event.ascii < 127) {
+            edFindQuery = edFindQuery + "${event.ascii}";
+            edFindStartRow = edCursorRow;
+            findNext();
+        }
+    }
+
+    private static func findNext() -> void {
+        int qLen = edFindQuery.length;
+        if (qLen == 0) return;
+
+        # Search from current start row forward, wrapping around
+        for (int offset = 0; offset < editorLines.length; offset++) {
+            int row = (edFindStartRow + offset) % editorLines.length;
+            string line = editorLines[row];
+
+            int startCol = 0;
+            # If on the starting row and we already have a match there, search after it
+            if (row == edFindMatchRow && offset == 0 && edFindMatchCol >= 0) {
+                startCol = edFindMatchCol + 1;
+            }
+
+            # Linear search for substring match
+            for (int col = startCol; col <= line.length - qLen; col++) {
+                bool matches = true;
+                for (int k = 0; k < qLen; k++) {
+                    if (line.charAt(col + k) != edFindQuery.charAt(k)) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    edFindMatchRow = row;
+                    edFindMatchCol = col;
+                    edCursorRow = row;
+                    edCursorCol = col;
+                    # Ensure visible
+                    if (edCursorRow < edScrollY) edScrollY = edCursorRow;
+                    if (edCursorRow >= edScrollY + 30) edScrollY = edCursorRow - 15;
+                    edFindStartRow = row;
+                    edStatusMsg = "Found at line ${row + 1}";
+                    edStatusTimer = 100;
+                    return;
+                }
+            }
+        }
+
+        edStatusMsg = "Not found: " + edFindQuery;
+        edStatusTimer = 100;
+        edFindMatchRow = -1;
+        edFindMatchCol = -1;
+    }
+}

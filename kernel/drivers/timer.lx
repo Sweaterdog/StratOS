@@ -1,0 +1,185 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Timer Driver — Programmable Interval Timer (PIT) / HPET
+// kernel/drivers/timer.lx
+// ============================================================================
+
+import "kernel/interrupts/idt.lx";
+import "kernel/core/scheduler.lx";
+
+int PIT_CHANNEL0 = 0x40;
+int PIT_CMD = 0x43;
+int TIMER_IRQ = 0;
+
+# System tick counter
+long systemTicks = 0;
+int timerFrequency = 0;
+
+# Timer callback
+func timerCallback = null;
+
+export class Timer {
+    # Initialize PIT at the given frequency (Hz)
+    public static func init(int frequency) -> void {
+        timerFrequency = frequency;
+        systemTicks = 0;
+
+        # Calculate PIT divisor
+        # PIT base frequency is 1.193182 MHz
+        int divisor = 1193182 / frequency;
+
+        # Register IRQ0 handler (vector 32 after PIC remap)
+        IDT.registerHandler(32, timerInterruptHandler);
+
+        unsafe {
+            # Set PIT to rate generator mode (mode 2)
+            outb(PIT_CMD, 0x36);  # Channel 0, lobyte/hibyte, mode 2
+
+            # Send divisor
+            outb(PIT_CHANNEL0, (byte)(divisor & 0xFF));         # Low byte
+            outb(PIT_CHANNEL0, (byte)((divisor >> 8) & 0xFF));  # High byte
+
+            # Enable timer IRQ
+            byte mask = inb(PIC1_DATA);
+            mask = mask & ~(1 << TIMER_IRQ);  # Clear bit 0
+            outb(PIC1_DATA, mask);
+        }
+    }
+
+    # Get elapsed time since boot in milliseconds
+    public static func getElapsedMs() -> long {
+        if (timerFrequency == 0) return 0;
+        return (systemTicks * 1000) / timerFrequency;
+    }
+
+    # Get elapsed time in seconds
+    public static func getElapsedSec() -> float {
+        return (float) getElapsedMs() / 1000.0;
+    }
+
+    # Get raw tick count
+    public static func getTicks() -> long {
+        return systemTicks;
+    }
+
+    # Get timer frequency
+    public static func getFrequency() -> int {
+        return timerFrequency;
+    }
+
+    # Sleep for the given number of milliseconds (busy-wait)
+    public static func sleep(int ms) -> void {
+        long target = getElapsedMs() + ms;
+        while (getElapsedMs() < target) {
+            # Halt CPU until next interrupt — saves power and reduces QEMU load
+            unsafe {
+                asm("hlt");
+            }
+        }
+    }
+
+    # Register a callback for timer ticks
+    public static func onTick(func callback) -> void {
+        timerCallback = callback;
+    }
+
+    # ====================================================================
+    # CMOS RTC — Read real-time clock from hardware
+    # ====================================================================
+
+    # Read a CMOS register (BCD → binary)
+    private static func readCMOS(int reg) -> int {
+        unsafe {
+            outb(0x70, (byte) reg);
+        }
+        int raw = 0;
+        unsafe {
+            raw = (int) inb(0x71);
+        }
+        # BCD to binary conversion
+        int hi = (raw >> 4) & 0x0F;
+        int lo = raw & 0x0F;
+        return hi * 10 + lo;
+    }
+
+    # Get current RTC hours (0-23)
+    public static func getRtcHours() -> int {
+        return readCMOS(0x04);
+    }
+
+    # Get current RTC minutes (0-59)
+    public static func getRtcMinutes() -> int {
+        return readCMOS(0x02);
+    }
+
+    # Get current RTC seconds (0-59)
+    public static func getRtcSeconds() -> int {
+        return readCMOS(0x00);
+    }
+
+    # Get current RTC day of month (1-31)
+    public static func getRtcDay() -> int {
+        return readCMOS(0x07);
+    }
+
+    # Get current RTC month (1-12)
+    public static func getRtcMonth() -> int {
+        return readCMOS(0x08);
+    }
+
+    # Get current RTC year (two-digit, e.g. 25 for 2025)
+    public static func getRtcYear() -> int {
+        return readCMOS(0x09);
+    }
+
+    # Get month name string
+    public static func getMonthName(int month) -> string {
+        switch (month) {
+            case 1:  return "January";
+            case 2:  return "February";
+            case 3:  return "March";
+            case 4:  return "April";
+            case 5:  return "May";
+            case 6:  return "June";
+            case 7:  return "July";
+            case 8:  return "August";
+            case 9:  return "September";
+            case 10: return "October";
+            case 11: return "November";
+            case 12: return "December";
+            default: return "Unknown";
+        }
+    }
+
+    # Get day-of-week name (1=Sunday..7=Saturday in CMOS register 6)
+    public static func getRtcDayOfWeek() -> string {
+        int dow = readCMOS(0x06);
+        switch (dow) {
+            case 1: return "Sunday";
+            case 2: return "Monday";
+            case 3: return "Tuesday";
+            case 4: return "Wednesday";
+            case 5: return "Thursday";
+            case 6: return "Friday";
+            case 7: return "Saturday";
+            default: return "Unknown";
+        }
+    }
+}
+
+# ============================================================================
+# Timer Interrupt Handler (IRQ0 → Vector 32)
+# ============================================================================
+func timerInterruptHandler(int vector, long errorCode) -> void {
+    systemTicks++;
+
+    # Call scheduler tick (process switching)
+    Scheduler.tick();
+
+    # Call user callback if registered
+    if (timerCallback != null) {
+        timerCallback();
+    }
+
+    # Note: EOI is sent by isr_dispatch after this handler returns
+}

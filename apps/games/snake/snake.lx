@@ -1,0 +1,385 @@
+// DOCTYPE {AOT}
+// ============================================================================
+// Snake Game — Classic snake game for StratOS
+// apps/games/snake.lx
+//
+// Controls:
+//   Arrow keys — change direction
+//   Space      — start / restart
+//   Escape     — quit to desktop
+// ============================================================================
+
+import "kernel/drivers/framebuffer.lx";
+import "kernel/drivers/timer.lx";
+import "kernel/drivers/keyboard.lx";
+import "apps/lib/textrender.lx";
+import "system/windowing/theme.lx";
+
+# Game constants
+int GRID_COLS = 30;
+int GRID_ROWS = 20;
+int MAX_SNAKE = 600;   # Max snake length
+
+# Game state
+int snakeDir = 1;       # 0=up, 1=right, 2=down, 3=left
+int snakeLen = 3;
+int foodX = 15;
+int foodY = 10;
+int snakeScore = 0;
+bool snakeAlive = false;
+bool snakeStarted = false;
+int snakeTickCounter = 0;
+int SNAKE_SPEED = 8;   # Ticks per move (lower = faster)
+
+# Snake body — parallel arrays for x, y
+int snakeX0 = 5; int snakeY0 = 10;
+int snakeX1 = 4; int snakeY1 = 10;
+int snakeX2 = 3; int snakeY2 = 10;
+# Remaining slots initialized to -1
+int snakeX3 = -1; int snakeY3 = -1; int snakeX4 = -1; int snakeY4 = -1;
+int snakeX5 = -1; int snakeY5 = -1; int snakeX6 = -1; int snakeY6 = -1;
+int snakeX7 = -1; int snakeY7 = -1; int snakeX8 = -1; int snakeY8 = -1;
+int snakeX9 = -1; int snakeY9 = -1; int snakeX10 = -1; int snakeY10 = -1;
+int snakeX11 = -1; int snakeY11 = -1; int snakeX12 = -1; int snakeY12 = -1;
+int snakeX13 = -1; int snakeY13 = -1; int snakeX14 = -1; int snakeY14 = -1;
+int snakeX15 = -1; int snakeY15 = -1; int snakeX16 = -1; int snakeY16 = -1;
+int snakeX17 = -1; int snakeY17 = -1; int snakeX18 = -1; int snakeY18 = -1;
+int snakeX19 = -1; int snakeY19 = -1; int snakeX20 = -1; int snakeY20 = -1;
+int snakeX21 = -1; int snakeY21 = -1; int snakeX22 = -1; int snakeY22 = -1;
+int snakeX23 = -1; int snakeY23 = -1; int snakeX24 = -1; int snakeY24 = -1;
+int snakeX25 = -1; int snakeY25 = -1; int snakeX26 = -1; int snakeY26 = -1;
+int snakeX27 = -1; int snakeY27 = -1; int snakeX28 = -1; int snakeY28 = -1;
+int snakeX29 = -1; int snakeY29 = -1; int snakeX30 = -1; int snakeY30 = -1;
+int snakeX31 = -1; int snakeY31 = -1; int snakeX32 = -1; int snakeY32 = -1;
+int snakeX33 = -1; int snakeY33 = -1; int snakeX34 = -1; int snakeY34 = -1;
+int snakeX35 = -1; int snakeY35 = -1; int snakeX36 = -1; int snakeY36 = -1;
+int snakeX37 = -1; int snakeY37 = -1; int snakeX38 = -1; int snakeY38 = -1;
+int snakeX39 = -1; int snakeY39 = -1; int snakeX40 = -1; int snakeY40 = -1;
+int snakeX41 = -1; int snakeY41 = -1; int snakeX42 = -1; int snakeY42 = -1;
+int snakeX43 = -1; int snakeY43 = -1; int snakeX44 = -1; int snakeY44 = -1;
+int snakeX45 = -1; int snakeY45 = -1; int snakeX46 = -1; int snakeY46 = -1;
+int snakeX47 = -1; int snakeY47 = -1; int snakeX48 = -1; int snakeY48 = -1;
+int snakeX49 = -1; int snakeY49 = -1;
+
+# Snake body accessors via switch — avoids list overhead
+func getSnakeX(int i) -> int {
+    switch (i) {
+        case 0: return snakeX0; case 1: return snakeX1; case 2: return snakeX2;
+        case 3: return snakeX3; case 4: return snakeX4; case 5: return snakeX5;
+        case 6: return snakeX6; case 7: return snakeX7; case 8: return snakeX8;
+        case 9: return snakeX9; case 10: return snakeX10; case 11: return snakeX11;
+        case 12: return snakeX12; case 13: return snakeX13; case 14: return snakeX14;
+        case 15: return snakeX15; case 16: return snakeX16; case 17: return snakeX17;
+        case 18: return snakeX18; case 19: return snakeX19; case 20: return snakeX20;
+        case 21: return snakeX21; case 22: return snakeX22; case 23: return snakeX23;
+        case 24: return snakeX24; case 25: return snakeX25; case 26: return snakeX26;
+        case 27: return snakeX27; case 28: return snakeX28; case 29: return snakeX29;
+        case 30: return snakeX30; case 31: return snakeX31; case 32: return snakeX32;
+        case 33: return snakeX33; case 34: return snakeX34; case 35: return snakeX35;
+        case 36: return snakeX36; case 37: return snakeX37; case 38: return snakeX38;
+        case 39: return snakeX39; case 40: return snakeX40; case 41: return snakeX41;
+        case 42: return snakeX42; case 43: return snakeX43; case 44: return snakeX44;
+        case 45: return snakeX45; case 46: return snakeX46; case 47: return snakeX47;
+        case 48: return snakeX48; case 49: return snakeX49;
+        default: return -1;
+    }
+}
+
+func getSnakeY(int i) -> int {
+    switch (i) {
+        case 0: return snakeY0; case 1: return snakeY1; case 2: return snakeY2;
+        case 3: return snakeY3; case 4: return snakeY4; case 5: return snakeY5;
+        case 6: return snakeY6; case 7: return snakeY7; case 8: return snakeY8;
+        case 9: return snakeY9; case 10: return snakeY10; case 11: return snakeY11;
+        case 12: return snakeY12; case 13: return snakeY13; case 14: return snakeY14;
+        case 15: return snakeY15; case 16: return snakeY16; case 17: return snakeY17;
+        case 18: return snakeY18; case 19: return snakeY19; case 20: return snakeY20;
+        case 21: return snakeY21; case 22: return snakeY22; case 23: return snakeY23;
+        case 24: return snakeY24; case 25: return snakeY25; case 26: return snakeY26;
+        case 27: return snakeY27; case 28: return snakeY28; case 29: return snakeY29;
+        case 30: return snakeY30; case 31: return snakeY31; case 32: return snakeY32;
+        case 33: return snakeY33; case 34: return snakeY34; case 35: return snakeY35;
+        case 36: return snakeY36; case 37: return snakeY37; case 38: return snakeY38;
+        case 39: return snakeY39; case 40: return snakeY40; case 41: return snakeY41;
+        case 42: return snakeY42; case 43: return snakeY43; case 44: return snakeY44;
+        case 45: return snakeY45; case 46: return snakeY46; case 47: return snakeY47;
+        case 48: return snakeY48; case 49: return snakeY49;
+        default: return -1;
+    }
+}
+
+func setSnakeX(int i, int val) -> void {
+    switch (i) {
+        case 0: snakeX0 = val; break; case 1: snakeX1 = val; break; case 2: snakeX2 = val; break;
+        case 3: snakeX3 = val; break; case 4: snakeX4 = val; break; case 5: snakeX5 = val; break;
+        case 6: snakeX6 = val; break; case 7: snakeX7 = val; break; case 8: snakeX8 = val; break;
+        case 9: snakeX9 = val; break; case 10: snakeX10 = val; break; case 11: snakeX11 = val; break;
+        case 12: snakeX12 = val; break; case 13: snakeX13 = val; break; case 14: snakeX14 = val; break;
+        case 15: snakeX15 = val; break; case 16: snakeX16 = val; break; case 17: snakeX17 = val; break;
+        case 18: snakeX18 = val; break; case 19: snakeX19 = val; break; case 20: snakeX20 = val; break;
+        case 21: snakeX21 = val; break; case 22: snakeX22 = val; break; case 23: snakeX23 = val; break;
+        case 24: snakeX24 = val; break; case 25: snakeX25 = val; break; case 26: snakeX26 = val; break;
+        case 27: snakeX27 = val; break; case 28: snakeX28 = val; break; case 29: snakeX29 = val; break;
+        case 30: snakeX30 = val; break; case 31: snakeX31 = val; break; case 32: snakeX32 = val; break;
+        case 33: snakeX33 = val; break; case 34: snakeX34 = val; break; case 35: snakeX35 = val; break;
+        case 36: snakeX36 = val; break; case 37: snakeX37 = val; break; case 38: snakeX38 = val; break;
+        case 39: snakeX39 = val; break; case 40: snakeX40 = val; break; case 41: snakeX41 = val; break;
+        case 42: snakeX42 = val; break; case 43: snakeX43 = val; break; case 44: snakeX44 = val; break;
+        case 45: snakeX45 = val; break; case 46: snakeX46 = val; break; case 47: snakeX47 = val; break;
+        case 48: snakeX48 = val; break; case 49: snakeX49 = val; break;
+    }
+}
+
+func setSnakeY(int i, int val) -> void {
+    switch (i) {
+        case 0: snakeY0 = val; break; case 1: snakeY1 = val; break; case 2: snakeY2 = val; break;
+        case 3: snakeY3 = val; break; case 4: snakeY4 = val; break; case 5: snakeY5 = val; break;
+        case 6: snakeY6 = val; break; case 7: snakeY7 = val; break; case 8: snakeY8 = val; break;
+        case 9: snakeY9 = val; break; case 10: snakeY10 = val; break; case 11: snakeY11 = val; break;
+        case 12: snakeY12 = val; break; case 13: snakeY13 = val; break; case 14: snakeY14 = val; break;
+        case 15: snakeY15 = val; break; case 16: snakeY16 = val; break; case 17: snakeY17 = val; break;
+        case 18: snakeY18 = val; break; case 19: snakeY19 = val; break; case 20: snakeY20 = val; break;
+        case 21: snakeY21 = val; break; case 22: snakeY22 = val; break; case 23: snakeY23 = val; break;
+        case 24: snakeY24 = val; break; case 25: snakeY25 = val; break; case 26: snakeY26 = val; break;
+        case 27: snakeY27 = val; break; case 28: snakeY28 = val; break; case 29: snakeY29 = val; break;
+        case 30: snakeY30 = val; break; case 31: snakeY31 = val; break; case 32: snakeY32 = val; break;
+        case 33: snakeY33 = val; break; case 34: snakeY34 = val; break; case 35: snakeY35 = val; break;
+        case 36: snakeY36 = val; break; case 37: snakeY37 = val; break; case 38: snakeY38 = val; break;
+        case 39: snakeY39 = val; break; case 40: snakeY40 = val; break; case 41: snakeY41 = val; break;
+        case 42: snakeY42 = val; break; case 43: snakeY43 = val; break; case 44: snakeY44 = val; break;
+        case 45: snakeY45 = val; break; case 46: snakeY46 = val; break; case 47: snakeY47 = val; break;
+        case 48: snakeY48 = val; break; case 49: snakeY49 = val; break;
+    }
+}
+
+# Place food at a pseudo-random position (avoids snake body)
+func placeFood() -> void {
+    int ticks = Timer.getTicks();
+    foodX = ((ticks * 7 + 13) % (GRID_COLS - 2)) + 1;
+    foodY = ((ticks * 11 + 7) % (GRID_ROWS - 2)) + 1;
+}
+
+# Reset game state
+func resetSnakeGame() -> void {
+    snakeLen = 3;
+    snakeDir = 1;
+    snakeScore = 0;
+    snakeAlive = true;
+    snakeStarted = true;
+    snakeTickCounter = 0;
+
+    setSnakeX(0, 5); setSnakeY(0, 10);
+    setSnakeX(1, 4); setSnakeY(1, 10);
+    setSnakeX(2, 3); setSnakeY(2, 10);
+    for (int i = 3; i < 50; i++) {
+        setSnakeX(i, -1);
+        setSnakeY(i, -1);
+    }
+
+    placeFood();
+}
+
+# Move the snake one step
+func stepSnake() -> void {
+    if (!snakeAlive) return;
+
+    # Get head position
+    int headX = getSnakeX(0);
+    int headY = getSnakeY(0);
+
+    # Compute new head
+    int newX = headX;
+    int newY = headY;
+    if (snakeDir == 0) { newY = headY - 1; }
+    elif (snakeDir == 1) { newX = headX + 1; }
+    elif (snakeDir == 2) { newY = headY + 1; }
+    elif (snakeDir == 3) { newX = headX - 1; }
+
+    # Wall collision
+    if (newX < 0 || newX >= GRID_COLS || newY < 0 || newY >= GRID_ROWS) {
+        snakeAlive = false;
+        return;
+    }
+
+    # Self collision
+    for (int i = 0; i < snakeLen; i++) {
+        if (getSnakeX(i) == newX && getSnakeY(i) == newY) {
+            snakeAlive = false;
+            return;
+        }
+    }
+
+    # Check food
+    bool ate = (newX == foodX && newY == foodY);
+
+    # Shift body backward (tail end drops off unless we ate)
+    int limit = snakeLen;
+    if (ate) {
+        limit = snakeLen;
+        if (snakeLen < 50) {
+            snakeLen = snakeLen + 1;
+        }
+    }
+
+    # Shift from tail to head
+    for (int i = limit - 1; i >= 1; i--) {
+        setSnakeX(i, getSnakeX(i - 1));
+        setSnakeY(i, getSnakeY(i - 1));
+    }
+
+    # Place new head
+    setSnakeX(0, newX);
+    setSnakeY(0, newY);
+
+    if (ate) {
+        snakeScore = snakeScore + 10;
+        placeFood();
+        # Speed up slightly
+        if (SNAKE_SPEED > 3 && snakeScore % 50 == 0) {
+            SNAKE_SPEED = SNAKE_SPEED - 1;
+        }
+    }
+}
+
+export class SnakeApp {
+    public static func init() -> void {
+        snakeStarted = false;
+        snakeAlive = false;
+    }
+
+    # Process keyboard input
+    public static func processKey(KeyEvent event) -> void {
+        if (!event.pressed) return;
+        int scancode = event.scancode;
+        char ascii = event.ascii;
+        # Arrow keys: up=72, down=80, left=75, right=77
+        if (scancode == 72 && snakeDir != 2) { snakeDir = 0; }
+        elif (scancode == 80 && snakeDir != 0) { snakeDir = 2; }
+        elif (scancode == 75 && snakeDir != 1) { snakeDir = 3; }
+        elif (scancode == 77 && snakeDir != 3) { snakeDir = 1; }
+        elif (ascii == ' ') {
+            # Space to start/restart
+            if (!snakeStarted || !snakeAlive) {
+                resetSnakeGame();
+            }
+        }
+    }
+
+    # Process click (unused — game is keyboard only)
+    public static func processClick(int relX, int relY, int w, int h) -> void {
+        if (!snakeStarted || !snakeAlive) {
+            resetSnakeGame();
+        }
+    }
+
+    # Draw the game inside its window
+    public static func draw(int x, int y, int w, int h) -> void {
+        # Background
+        Framebuffer.fillRect(x, y, w, h, 0x0D1117FF);
+
+        if (!snakeStarted) {
+            # Title screen
+            drawTitleScreen(x, y, w, h);
+            return;
+        }
+
+        # Compute cell size
+        int cellW = w / GRID_COLS;
+        int cellH = (h - 30) / GRID_ROWS;   # Reserve 30px for HUD
+        if (cellW > cellH) { cellW = cellH; }
+        elif (cellH > cellW) { cellH = cellW; }
+
+        int gridPixW = cellW * GRID_COLS;
+        int gridPixH = cellH * GRID_ROWS;
+        int gridX = x + (w - gridPixW) / 2;
+        int gridY = y + 28;
+
+        # Grid border
+        Framebuffer.drawRect(gridX - 1, gridY - 1, gridPixW + 2, gridPixH + 2, 0x30363DFF);
+
+        # Grid background
+        Framebuffer.fillRect(gridX, gridY, gridPixW, gridPixH, 0x161B22FF);
+
+        # Draw food
+        int fx = gridX + foodX * cellW + 1;
+        int fy = gridY + foodY * cellH + 1;
+        Framebuffer.fillRect(fx, fy, cellW - 2, cellH - 2, 0xFF4444FF);
+
+        # Draw snake
+        for (int i = 0; i < snakeLen; i++) {
+            int sx = getSnakeX(i);
+            int sy = getSnakeY(i);
+            if (sx < 0) continue;
+
+            int px = gridX + sx * cellW + 1;
+            int py = gridY + sy * cellH + 1;
+
+            if (i == 0) {
+                # Head — brighter
+                Framebuffer.fillRect(px, py, cellW - 2, cellH - 2, 0x58FF58FF);
+            } else {
+                # Body
+                Framebuffer.fillRect(px, py, cellW - 2, cellH - 2, 0x3DAA3DFF);
+            }
+        }
+
+        # HUD — score at top
+        string scoreStr = "Score: ${snakeScore}";
+        TextRender.drawText(scoreStr, x + 8, y + 6, 0xE6EDF3FF);
+
+        string lenStr = "Length: ${snakeLen}";
+        TextRender.drawText(lenStr, x + w - 120, y + 6, 0x8B949EFF);
+
+        # Game over overlay
+        if (!snakeAlive) {
+            # Semi-transparent overlay
+            int ovX = gridX + gridPixW / 2 - 100;
+            int ovY = gridY + gridPixH / 2 - 40;
+            Framebuffer.fillRoundedRect(ovX, ovY, 200, 80, 8, 0x0D1117E0);
+            Framebuffer.drawRoundedRect(ovX, ovY, 200, 80, 8, 0xFF4444FF);
+
+            TextRender.drawText("GAME OVER", ovX + 56, ovY + 12, 0xFF6666FF);
+            string finalStr = "Score: ${snakeScore}";
+            int fW = finalStr.length * 8;
+            TextRender.drawText(finalStr, ovX + (200 - fW) / 2, ovY + 34, 0xE6EDF3FF);
+            TextRender.drawText("Space to restart", ovX + 28, ovY + 56, 0x6B7280FF);
+        }
+
+        # Tick game logic
+        snakeTickCounter = snakeTickCounter + 1;
+        if (snakeTickCounter >= SNAKE_SPEED && snakeAlive) {
+            snakeTickCounter = 0;
+            stepSnake();
+        }
+    }
+
+    # Draw the title/start screen
+    private static func drawTitleScreen(int x, int y, int w, int h) -> void {
+        # Title
+        string title = "SNAKE";
+        int titleW = title.length * 8 * 3;
+        int titleX = x + (w - titleW) / 2;
+        int titleY = y + h / 3;
+
+        # Draw large title (3x scale via fillRect characters)
+        TextRender.drawText("S N A K E", x + (w - 72) / 2, titleY, 0x58FF58FF);
+
+        # Decorative snake preview
+        int previewY = titleY + 40;
+        int previewX = x + w / 2 - 60;
+        Framebuffer.fillRect(previewX,       previewY, 14, 14, 0x58FF58FF);
+        Framebuffer.fillRect(previewX + 16,  previewY, 14, 14, 0x50EE50FF);
+        Framebuffer.fillRect(previewX + 32,  previewY, 14, 14, 0x48DD48FF);
+        Framebuffer.fillRect(previewX + 48,  previewY, 14, 14, 0x40CC40FF);
+        Framebuffer.fillRect(previewX + 64,  previewY, 14, 14, 0x38BB38FF);
+        Framebuffer.fillRect(previewX + 80,  previewY, 14, 14, 0x30AA30FF);
+        Framebuffer.fillRect(previewX + 96,  previewY, 14, 14, 0x289928FF);
+        Framebuffer.fillRect(previewX + 112, previewY, 14, 14, 0x208820FF);
+
+        # Instructions
+        int instY = titleY + 80;
+        TextRender.drawText("Arrow Keys - Move", x + (w - 136) / 2, instY, 0x8B949EFF);
+        TextRender.drawText("Space - Start", x + (w - 104) / 2, instY + 22, 0x8B949EFF);
+        TextRender.drawText("Eat the red food!", x + (w - 136) / 2, instY + 48, 0xFF6666FF);
+    }
+}
